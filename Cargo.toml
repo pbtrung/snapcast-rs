@@ -7,8 +7,8 @@ version = "0.999.3"
 edition = "2024"
 rust-version = "1.94.1"
 license = "GPL-3.0-only"
-repository = "https://github.com/metaneutrons/snapcast-rs"
-authors = ["Fabian Schmieder"]
+repository = "https://github.com/pbtrung/snapcast-rs"
+authors = ["Trung Pham"]
 
 [workspace.dependencies]
 # Internal
