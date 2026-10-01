@@ -1,6 +1,7 @@
 //! Client session management — binary protocol server for snapclients.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -242,11 +243,11 @@ impl SessionServer {
                     let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(10));
                     let sock = socket2::SockRef::from(&stream);
                     sock.set_tcp_keepalive(&ka).ok();
-                    self.spawn_client(stream, peer.to_string(), &chunk_rx, &event_tx);
+                    self.spawn_client(stream, peer, "tcp", &chunk_rx, &event_tx);
                 }
                 client = incoming.recv(), if incoming_open => match client {
                     Some(client) => {
-                        self.spawn_client(client.transport, client.peer, &chunk_rx, &event_tx);
+                        self.spawn_client(client.transport, client.peer, "external", &chunk_rx, &event_tx);
                     }
                     None => incoming_open = false,
                 },
@@ -257,18 +258,19 @@ impl SessionServer {
     fn spawn_client<S>(
         &self,
         stream: S,
-        peer: String,
+        peer: SocketAddr,
+        transport: &'static str,
         chunk_rx: &broadcast::Sender<WireChunkData>,
         event_tx: &mpsc::Sender<ServerEvent>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        tracing::info!(%peer, "Client connecting");
+        tracing::info!(%peer, transport, "Client connecting");
         let chunk_sub = chunk_rx.subscribe();
         let ctx = Arc::clone(&self.ctx);
         let event_tx = event_tx.clone();
         tokio::spawn(async move {
-            let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
+            let result = handle_client(stream, peer, chunk_sub, &ctx, event_tx).await;
             if let Err(e) = result {
                 tracing::debug!(%peer, error = %e, "Client session ended");
             }
@@ -279,13 +281,14 @@ impl SessionServer {
 /// A client connection accepted by the embedder on a non-TCP transport.
 pub(crate) struct IncomingClient {
     pub transport: Box<dyn crate::ClientTransport>,
-    pub peer: String,
+    pub peer: SocketAddr,
 }
 
 // ── Client handler ────────────────────────────────────────────
 
 async fn handle_client<S>(
     stream: S,
+    peer: SocketAddr,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     ctx: &SessionContext,
     event_tx: mpsc::Sender<ServerEvent>,
@@ -330,10 +333,12 @@ where
     // Register in state + build initial routing
     let initial_stream_id;
     let initial_routing;
+    let joins_new_group;
     let client_settings;
     {
         let mut s = ctx.shared_state.lock().await;
         let c = s.get_or_create_client(&client_id, &hello.host_name, &hello.mac);
+        c.update_from_hello(&hello, &peer.ip().to_string());
         c.connected = true;
         client_settings = ServerSettings {
             buffer_ms: ctx.buffer_ms,
@@ -341,6 +346,7 @@ where
             volume: c.config.volume.percent,
             muted: c.config.volume.muted,
         };
+        joins_new_group = !s.groups.iter().any(|g| g.clients.contains(&client_id));
         s.group_for_client(&client_id, &ctx.default_stream);
 
         initial_routing =
@@ -358,6 +364,12 @@ where
         .await
         .insert(client_id.clone(), routing_tx);
 
+    // A client outside any group changes the topology. C++ snapserver
+    // announces that with Server.OnUpdate, and control clients such as
+    // Snapweb need it before Client.OnConnect to know about the client.
+    if joins_new_group {
+        let _ = event_tx.send(ServerEvent::ServerUpdated).await;
+    }
     let _ = event_tx
         .send(ServerEvent::ClientConnected {
             id: client_id.clone(),
@@ -413,6 +425,7 @@ where
         let mut s = ctx.shared_state.lock().await;
         if let Some(c) = s.clients.get_mut(&client_id) {
             c.connected = false;
+            c.touch();
         }
     }
     let _ = event_tx
@@ -492,13 +505,12 @@ where
                 let msg = msg?;
                 match msg.payload {
                     MessagePayload::Time(_t) => {
+                        if let Some(c) = ctx.shared_state.lock().await.clients.get_mut(&client_id) {
+                            c.touch();
+                        }
                         // latency = server_received - client_sent (c2s one-way estimate)
                         let latency = msg.base.received - msg.base.sent;
-                        let frame = serialize_msg(
-                            MessageType::Time,
-                            &MessagePayload::Time(Time { latency }),
-                            msg.base.id,
-                        )?;
+                        let frame = serialize_time_reply(latency, msg.base.id, msg.base.received)?;
                         write_frame(&mut writer, &frame).await.context("write time")?;
                     }
                     MessagePayload::ClientInfo(info) => {
@@ -635,6 +647,21 @@ fn serialize_msg(
         size: 0,
     };
     factory::serialize(&mut base, payload).map_err(|e| anyhow::anyhow!("serialize: {e}"))
+}
+
+/// Time reply: like C++ snapserver, `received` carries when the request
+/// arrived and `sent` when the reply goes out.
+fn serialize_time_reply(latency: Timeval, refers_to: u16, received: Timeval) -> Result<Vec<u8>> {
+    let mut base = BaseMessage {
+        msg_type: MessageType::Time,
+        id: 0,
+        refers_to,
+        sent: now_timeval(),
+        received,
+        size: 0,
+    };
+    factory::serialize(&mut base, &MessagePayload::Time(Time { latency }))
+        .map_err(|e| anyhow::anyhow!("serialize: {e}"))
 }
 
 async fn send_msg<W: AsyncWrite + Unpin>(

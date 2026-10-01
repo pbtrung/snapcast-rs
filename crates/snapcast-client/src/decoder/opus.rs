@@ -13,7 +13,7 @@ use snapcast_proto::message::codec_header::CodecHeader;
 
 use crate::decoder::Decoder;
 
-const OPUS_ID: u32 = 0x4F50_5553;
+use snapcast_proto::OPUS_HEADER_ID as OPUS_ID;
 const MAX_FRAME_SIZE: usize = 2880;
 
 /// Parse the Opus pseudo header.

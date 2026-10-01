@@ -73,3 +73,9 @@ pub const CODEC_PCM: &str = "pcm";
 pub const CODEC_FLAC: &str = "flac";
 /// Opus codec name.
 pub const CODEC_OPUS: &str = "opus";
+/// Magic at the start of the Opus codec header ("OPUS" as a little-endian u32).
+///
+/// The header is C++ snapserver's 12-byte pseudo header: this ID, then the
+/// sample rate (u32), bits per sample (u16) and channel count (u16), all
+/// little-endian. Snapweb and C++ snapclient only accept this form.
+pub const OPUS_HEADER_ID: u32 = 0x4F50_5553;

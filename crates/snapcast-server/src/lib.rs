@@ -481,7 +481,8 @@ pub struct ClientAcceptor {
 }
 
 impl ClientAcceptor {
-    /// Serve a streaming client over `transport`. `peer` is used for logging.
+    /// Serve a streaming client over `transport`. `peer` is the remote
+    /// address, reported as the client's IP in the server status.
     ///
     /// # Errors
     /// Fails if the server has stopped (or was never started with
@@ -489,12 +490,12 @@ impl ClientAcceptor {
     pub async fn accept(
         &self,
         transport: impl ClientTransport,
-        peer: impl Into<String>,
+        peer: std::net::SocketAddr,
     ) -> anyhow::Result<()> {
         self.tx
             .send(session::IncomingClient {
                 transport: Box::new(transport),
-                peer: peer.into(),
+                peer,
             })
             .await
             .map_err(|_| anyhow::anyhow!("server is not running"))

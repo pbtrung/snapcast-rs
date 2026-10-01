@@ -99,11 +99,7 @@ async fn stream_ws_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         let transport = crate::ws_transport::WsTransport::new(socket);
-        if let Err(e) = app
-            .client_acceptor
-            .accept(transport, format!("ws://{peer}"))
-            .await
-        {
+        if let Err(e) = app.client_acceptor.accept(transport, peer).await {
             tracing::warn!(%peer, error = %e, "Dropping WebSocket stream client");
         }
     })

@@ -49,6 +49,58 @@ pub struct Client {
     pub connected: bool,
     /// Client configuration.
     pub config: ClientConfig,
+    /// IP address of the last connection.
+    #[serde(default)]
+    pub ip: String,
+    /// Operating system reported in Hello.
+    #[serde(default)]
+    pub os: String,
+    /// CPU architecture reported in Hello.
+    #[serde(default)]
+    pub arch: String,
+    /// Instance number reported in Hello.
+    #[serde(default)]
+    pub instance: u32,
+    /// Client software name reported in Hello (e.g. "Snapclient").
+    #[serde(default)]
+    pub client_name: String,
+    /// Client software version reported in Hello.
+    #[serde(default)]
+    pub version: String,
+    /// Binary protocol version reported in Hello.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Wall-clock time the client was last seen (Hello, time sync, disconnect).
+    #[serde(default)]
+    pub last_seen: crate::status::LastSeen,
+}
+
+impl Client {
+    /// Record the details a client reports in its Hello and the address it
+    /// connected from.
+    pub fn update_from_hello(&mut self, hello: &snapcast_proto::message::hello::Hello, ip: &str) {
+        self.host_name.clone_from(&hello.host_name);
+        self.mac.clone_from(&hello.mac);
+        self.ip = ip.to_string();
+        self.os.clone_from(&hello.os);
+        self.arch.clone_from(&hello.arch);
+        self.instance = hello.instance;
+        self.client_name.clone_from(&hello.client_name);
+        self.version.clone_from(&hello.version);
+        self.protocol_version = hello.snap_stream_protocol_version;
+        self.touch();
+    }
+
+    /// Set `last_seen` to the current wall-clock time.
+    pub fn touch(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.last_seen = crate::status::LastSeen {
+            sec: now.as_secs(),
+            usec: u64::from(now.subsec_micros()),
+        };
+    }
 }
 
 /// A group of clients sharing the same stream.
@@ -104,6 +156,14 @@ impl ServerState {
                     mac: mac.to_string(),
                     connected: false,
                     config: ClientConfig::default(),
+                    ip: String::new(),
+                    os: String::new(),
+                    arch: String::new(),
+                    instance: 0,
+                    client_name: String::new(),
+                    version: String::new(),
+                    protocol_version: 0,
+                    last_seen: Default::default(),
                 },
             );
         } else {
@@ -234,14 +294,21 @@ impl ServerState {
                                 muted: c.config.volume.muted,
                             },
                             latency: c.config.latency,
-                            ..Default::default()
+                            instance: c.instance,
                         },
                         host: status::Host {
-                            name: c.host_name.clone(),
+                            arch: c.arch.clone(),
+                            ip: c.ip.clone(),
                             mac: c.mac.clone(),
-                            ..Default::default()
+                            name: c.host_name.clone(),
+                            os: c.os.clone(),
                         },
-                        ..Default::default()
+                        snapclient: status::Snapclient {
+                            name: c.client_name.clone(),
+                            protocol_version: c.protocol_version,
+                            version: c.version.clone(),
+                        },
+                        last_seen: c.last_seen.clone(),
                     })
                     .collect();
                 status::Group {

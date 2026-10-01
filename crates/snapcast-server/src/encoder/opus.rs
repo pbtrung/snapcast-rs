@@ -97,15 +97,13 @@ impl OpusEncoder {
             "Opus encoder configured"
         );
 
-        // Build OpusHead identification header
-        let mut header = Vec::with_capacity(19);
-        header.extend_from_slice(b"OpusHead");
-        header.push(1); // version
-        header.push(format.channels() as u8);
-        header.extend_from_slice(&0u16.to_le_bytes()); // pre-skip
+        // C++ snapserver's pseudo header (see snapcast_proto::OPUS_HEADER_ID).
+        // Samples are encoded from 16-bit PCM, so 16 bits are announced.
+        let mut header = Vec::with_capacity(12);
+        header.extend_from_slice(&snapcast_proto::OPUS_HEADER_ID.to_le_bytes());
         header.extend_from_slice(&format.rate().to_le_bytes());
-        header.extend_from_slice(&0u16.to_le_bytes()); // output gain
-        header.push(0); // channel mapping family
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(&format.channels().to_le_bytes());
 
         // 20ms frame size
         let frame_size = format.rate() as usize / 50;
@@ -228,6 +226,17 @@ mod tests {
         assert!(parse_options("COMPLEXITY:11").is_err());
         assert!(parse_options("FOO:1").is_err());
         assert!(parse_options("BITRATE").is_err());
+    }
+
+    #[test]
+    fn header_is_cpp_pseudo_header() {
+        let enc = OpusEncoder::new(SampleFormat::new(48000, 24, 2), "").unwrap();
+        let h = enc.header();
+        assert_eq!(h.len(), 12);
+        assert_eq!(&h[..4], b"SUPO"); // 0x4F505553 little-endian
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 48000);
+        assert_eq!(u16::from_le_bytes(h[8..10].try_into().unwrap()), 16);
+        assert_eq!(u16::from_le_bytes(h[10..12].try_into().unwrap()), 2);
     }
 
     #[test]

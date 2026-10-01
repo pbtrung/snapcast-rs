@@ -52,7 +52,9 @@ pub struct Snapserver {
 impl Default for Snapserver {
     fn default() -> Self {
         Self {
-            name: "snapcast-rs".into(),
+            // C++ snapserver reports "Snapserver"; control clients such as
+            // Snapweb rely on it.
+            name: crate::DEFAULT_SERVER_NAME.into(),
             protocol_version: crate::PROTOCOL_VERSION,
             control_protocol_version: crate::CONTROL_PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").into(),
