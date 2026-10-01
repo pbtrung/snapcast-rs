@@ -46,6 +46,11 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 
 FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond that.
 
+Codec options go after the codec name, separated by `:`, as in C++ snapserver (`codec = ...` in the config file or `--codec`):
+
+- `flac:<0-8>`: compression level
+- `opus:BITRATE:<6000-512000>,COMPLEXITY:<0-10>`: bitrate in bits/s (default 192000) and encoder complexity
+
 ## Building
 
 Requires Rust **1.94.1+**. Install the system libraries first.
@@ -87,6 +92,7 @@ Run the checks with `make check` (fmt, clippy, tests).
 # Server
 snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"
 snapserver-rs --codec flac
+snapserver-rs --codec "opus:BITRATE:256000,COMPLEXITY:10"  # needs the opus feature
 snapserver-rs --stream-bind-address 127.0.0.1             # bind audio listener to loopback
 snapserver-rs --help
 
