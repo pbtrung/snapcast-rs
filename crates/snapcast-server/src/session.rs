@@ -11,7 +11,6 @@ use snapcast_proto::message::codec_header::CodecHeader;
 use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::message::server_settings::ServerSettings;
 use snapcast_proto::message::time::Time;
-use snapcast_proto::message::wire_chunk::WireChunk;
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
@@ -557,12 +556,35 @@ fn should_send_chunk(
 }
 
 async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, chunk: WireChunkData) -> Result<()> {
-    let wc = WireChunk {
-        timestamp: Timeval::from_usec(chunk.timestamp_usec),
-        payload: chunk.data,
-    };
-    let frame = serialize_msg(MessageType::WireChunk, &MessagePayload::WireChunk(wc), 0)?;
+    let frame = serialize_wire_chunk(&chunk)?;
     write_frame(writer, &frame).await.context("write chunk")
+}
+
+/// Serialize a wire chunk frame, copying the shared payload once.
+///
+/// Equivalent to `serialize_msg` with a `WireChunk` payload, which would copy
+/// the payload into an owned `WireChunk` and again into the frame. The frame
+/// stays contiguous because a WebSocket transport turns each write into one
+/// message.
+fn serialize_wire_chunk(chunk: &WireChunkData) -> Result<Vec<u8>> {
+    let payload_size = 8 + 4 + chunk.data.len();
+    let base = BaseMessage {
+        msg_type: MessageType::WireChunk,
+        id: 0,
+        refers_to: 0,
+        sent: now_timeval(),
+        received: Timeval::default(),
+        size: u32::try_from(payload_size).context("wire chunk too large")?,
+    };
+    let mut frame = Vec::with_capacity(BaseMessage::HEADER_SIZE + payload_size);
+    base.write_to(&mut frame)
+        .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    Timeval::from_usec(chunk.timestamp_usec)
+        .write_to(&mut frame)
+        .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    frame.extend_from_slice(&(chunk.data.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&chunk.data);
+    Ok(frame)
 }
 
 async fn write_settings<W: AsyncWrite + Unpin>(
@@ -733,7 +755,7 @@ mod tests {
         WireChunkData {
             stream_id: stream_id.to_string(),
             timestamp_usec: 0,
-            data: vec![0u8; 64],
+            data: vec![0u8; 64].into(),
         }
     }
 
@@ -743,6 +765,26 @@ mod tests {
             client_muted,
             group_muted,
         }
+    }
+
+    // ── serialize_wire_chunk ──────────────────────────────────
+
+    #[test]
+    fn wire_chunk_frame_matches_factory_serialization() {
+        let data = WireChunkData {
+            stream_id: "z1".into(),
+            timestamp_usec: 1_234_567_890,
+            data: (0..=255u8).collect::<Vec<_>>().into(),
+        };
+        let mut frame = serialize_wire_chunk(&data).unwrap();
+        let msg = factory::take_frame(&mut frame).unwrap().unwrap();
+        assert!(frame.is_empty());
+        assert_eq!(msg.base.msg_type, MessageType::WireChunk);
+        let MessagePayload::WireChunk(wc) = msg.payload else {
+            panic!("expected WireChunk, got {:?}", msg.payload);
+        };
+        assert_eq!(wc.timestamp, Timeval::from_usec(data.timestamp_usec));
+        assert_eq!(wc.payload, data.data);
     }
 
     // ── should_send_chunk ─────────────────────────────────────

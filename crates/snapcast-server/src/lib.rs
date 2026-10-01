@@ -175,8 +175,8 @@ pub struct WireChunkData {
     pub stream_id: String,
     /// Server timestamp in microseconds.
     pub timestamp_usec: i64,
-    /// Encoded audio data.
-    pub data: Vec<u8>,
+    /// Encoded audio data, shared by every session the chunk is broadcast to.
+    pub data: bytes::Bytes,
 }
 
 pub mod auth;
@@ -560,7 +560,7 @@ fn spawn_stream_encoder(
                         let _ = chunk_tx.send(WireChunkData {
                             stream_id: stream_id.clone(),
                             timestamp_usec: frame.timestamp_usec,
-                            data: encoded.data,
+                            data: encoded.data.into(),
                         });
                     }
                     Err(e) => {

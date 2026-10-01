@@ -11,6 +11,7 @@ authors.workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 subtle = { workspace = true }
 snapcast-proto = { workspace = true }
 tokio = { workspace = true }
