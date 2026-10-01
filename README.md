@@ -67,7 +67,9 @@ cargo build --release                              # default: flac + mdns
 cargo build --release --features opus,vorbis      # + native codecs
 ```
 
-The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`. Pre-built Linux x86_64 and aarch64 binaries are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page.
+The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.
+
+Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+ and the runtime libraries `libasound2` (client) and `libavahi-compat-libdnssd1` (server).
 
 Run the checks with `make check` (fmt, clippy, tests).
 
