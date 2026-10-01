@@ -1,8 +1,7 @@
-//! Opus encoder using audiopus.
+//! Opus encoder using the `opus` crate (system libopus).
 
 use anyhow::{Result, bail};
-use audiopus::coder::Encoder as OpusEnc;
-use audiopus::{Application, Bitrate, Channels, SampleRate};
+use opus::{Application, Bitrate, Channels, Encoder as OpusEnc};
 use snapcast_proto::SampleFormat;
 
 use super::{EncodedChunk, Encoder};
@@ -54,7 +53,7 @@ fn parse_options(options: &str) -> Result<OpusOptions> {
     Ok(parsed)
 }
 
-/// Opus encoder wrapping libopus via audiopus.
+/// Opus encoder wrapping libopus via the `opus` crate.
 pub struct OpusEncoder {
     format: SampleFormat,
     encoder: OpusEnc,
@@ -71,11 +70,7 @@ impl OpusEncoder {
     pub fn new(format: SampleFormat, options: &str) -> Result<Self> {
         let options = parse_options(options)?;
         let sample_rate = match format.rate() {
-            8000 => SampleRate::Hz8000,
-            12000 => SampleRate::Hz12000,
-            16000 => SampleRate::Hz16000,
-            24000 => SampleRate::Hz24000,
-            48000 => SampleRate::Hz48000,
+            r @ (8000 | 12000 | 16000 | 24000 | 48000) => r,
             r => {
                 tracing::warn!(codec = "opus", sample_rate = r, "unsupported sample rate");
                 bail!("Opus does not support sample rate {r}");
@@ -91,9 +86,9 @@ impl OpusEncoder {
         };
 
         let mut encoder = OpusEnc::new(sample_rate, channels, Application::Audio)?;
-        encoder.set_bitrate(Bitrate::BitsPerSecond(options.bitrate))?;
+        encoder.set_bitrate(Bitrate::Bits(options.bitrate))?;
         if let Some(complexity) = options.complexity {
-            encoder.set_complexity(complexity)?;
+            encoder.set_complexity(i32::from(complexity))?;
         }
         tracing::info!(
             codec = "opus",

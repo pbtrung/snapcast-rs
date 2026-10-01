@@ -26,14 +26,13 @@ anyhow = { workspace = true }
 # block at a time, so the parallel path doesn't apply. See
 # docs/flac-encoder-evaluation.md for the evaluation behind this choice.
 flacenc = { version = "0.5", default-features = false, optional = true }
-audiopus = { workspace = true, optional = true }
-audiopus_sys = { version = "0.1.8", optional = true, features = ["dynamic"] }
+opus = { workspace = true, optional = true }
 uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = ["flac"]
 flac = ["dep:flacenc"]
-opus = ["dep:audiopus", "dep:audiopus_sys"]
+opus = ["dep:opus"]
 
 [dev-dependencies]
 
