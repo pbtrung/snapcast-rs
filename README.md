@@ -54,22 +54,12 @@ Codec options go after the codec name, separated by `:`, as in C++ snapserver (`
 
 ## Building
 
-Requires Rust **1.94.1+**. Install the system libraries first.
-
-On Arch Linux:
+Requires Rust **1.94.1+**. Install the system libraries first (Arch Linux):
 
 ```bash
 sudo pacman -S base-devel pkgconf alsa-lib avahi
 # only for the optional Opus codec:
 sudo pacman -S opus
-```
-
-On Debian/Ubuntu:
-
-```bash
-sudo apt install build-essential pkg-config libasound2-dev libavahi-compat-libdnssd-dev
-# only for the optional Opus codec:
-sudo apt install libopus-dev
 ```
 
 Then build from source:
