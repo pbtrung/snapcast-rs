@@ -15,6 +15,10 @@ pub(crate) mod process;
 pub(crate) mod tcp;
 pub(crate) mod uri;
 
+/// How far a source may fall behind realtime before its timestamps are
+/// re-anchored at the current time (see [`ChunkTimestamper::resync_if_behind`]).
+const MAX_SOURCE_LAG_USEC: i64 = 200_000;
+
 /// Why [`pump_pcm`] returned.
 pub(crate) enum PumpEnd {
     /// The source ended (EOF / disconnect / process exit). The caller may
@@ -55,6 +59,14 @@ pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
         if reader.read_exact(&mut buf).await.is_err() {
             return PumpEnd::SourceEnded;
         }
+        // Audio that arrives later than realtime (late start, stall) is
+        // stamped from now on, so clients don't discard it as too old.
+        if let Some(lag) = ts.resync_if_behind(MAX_SOURCE_LAG_USEC) {
+            tracing::info!(
+                lag_ms = lag / 1000,
+                "Source behind realtime, resyncing timestamps"
+            );
+        }
         let frame = AudioFrame {
             timestamp_usec: ts.next(chunk_frames as u32),
             data: AudioData::Pcm(buf.clone()),
@@ -62,5 +74,35 @@ pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
         if tx.send(frame).await.is_err() {
             return PumpEnd::TxClosed;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// A source whose first audio arrives well after it was opened (like
+    /// ffmpeg with a lookahead filter) gets chunks stamped at arrival, not at
+    /// open time, so clients don't drop them as too old.
+    #[tokio::test]
+    async fn late_source_is_stamped_at_arrival() {
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let mut ts = ChunkTimestamper::new(48000);
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            writer.write_all(&[0u8; 960 * 4]).await.unwrap();
+            // Keep the source open so the pump waits instead of ending.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        tokio::spawn(async move { pump_pcm(&mut reader, &mut ts, 960, 960 * 4, &tx, None).await });
+
+        let frame = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let age_ms = (snapcast_server::time::now_usec() - frame.timestamp_usec) / 1000;
+        assert!(age_ms < 100, "chunk stamped {age_ms} ms in the past");
     }
 }

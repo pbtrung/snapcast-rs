@@ -34,6 +34,26 @@ impl ChunkTimestamper {
         ts
     }
 
+    /// Re-anchor at the current time if the next timestamp is more than
+    /// `max_lag_usec` in the past, i.e. the source delivered slower than
+    /// realtime (it started late, or stalled). Returns the lag in µs that was
+    /// dropped, if any.
+    ///
+    /// Without this, a source whose first audio arrives seconds after it was
+    /// opened (for example ffmpeg with a lookahead filter) would stamp every
+    /// chunk seconds in the past, and clients would discard them all as too
+    /// late to play.
+    pub fn resync_if_behind(&mut self, max_lag_usec: i64) -> Option<i64> {
+        let next = self.start_usec + (self.samples_written as i64 * 1_000_000) / self.rate as i64;
+        let lag = now_usec() - next;
+        if lag > max_lag_usec {
+            self.reset();
+            Some(lag)
+        } else {
+            None
+        }
+    }
+
     /// Reset the timestamper (e.g. on stream restart).
     pub fn reset(&mut self) {
         self.start_usec = now_usec();
@@ -44,6 +64,19 @@ impl ChunkTimestamper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resync_if_behind_reanchors_a_late_source() {
+        let mut ts = ChunkTimestamper::new(48000);
+        // On time: nothing to do.
+        assert_eq!(ts.resync_if_behind(200_000), None);
+        // Pretend the timestamper was anchored 15 s ago with no audio since.
+        ts.start_usec -= 15_000_000;
+        let lag = ts.resync_if_behind(200_000).expect("15 s behind");
+        assert!(lag >= 15_000_000);
+        // The next chunk is stamped now, not 15 s in the past.
+        assert!((now_usec() - ts.next(960)).abs() < 100_000);
+    }
 
     #[test]
     fn now_usec_is_positive_and_nondecreasing() {
