@@ -196,7 +196,10 @@ fn main() -> anyhow::Result<()> {
             // Others: 960 frames (20ms at 48kHz)
             const FLAC_BLOCK_FRAMES: usize = 1152;
             const DEFAULT_CHUNK_MS: usize = 20;
-            let chunk_frames = match codec.as_str() {
+            let codec_name = codec
+                .split_once(':')
+                .map_or(codec.as_str(), |(name, _)| name);
+            let chunk_frames = match codec_name {
                 "flac" => FLAC_BLOCK_FRAMES,
                 _ => (format.rate() as usize * DEFAULT_CHUNK_MS) / 1000, // 20ms
             };

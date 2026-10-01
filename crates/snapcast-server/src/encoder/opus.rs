@@ -2,11 +2,57 @@
 
 use anyhow::{Result, bail};
 use audiopus::coder::Encoder as OpusEnc;
-use audiopus::{Application, Channels, SampleRate};
+use audiopus::{Application, Bitrate, Channels, SampleRate};
 use snapcast_proto::SampleFormat;
 
 use super::{EncodedChunk, Encoder};
 use crate::AudioData;
+
+/// Default bitrate in bits/second (matches C++ snapserver).
+const DEFAULT_BITRATE: i32 = 192_000;
+
+/// Encoder settings parsed from the codec options string.
+#[derive(Debug, PartialEq)]
+struct OpusOptions {
+    bitrate: i32,
+    complexity: Option<u8>,
+}
+
+/// Parse `BITRATE:<bps>,COMPLEXITY:<0-10>` (each key optional, any order).
+fn parse_options(options: &str) -> Result<OpusOptions> {
+    let mut parsed = OpusOptions {
+        bitrate: DEFAULT_BITRATE,
+        complexity: None,
+    };
+    for option in options.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+        let Some((key, value)) = option.split_once(':') else {
+            bail!("invalid Opus option {option:?}, expected KEY:VALUE");
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_uppercase().as_str() {
+            "BITRATE" => {
+                let bitrate: i32 = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid Opus bitrate: {value}"))?;
+                if !(6_000..=512_000).contains(&bitrate) {
+                    bail!("Opus bitrate must be 6000..=512000 bps, got {bitrate}");
+                }
+                parsed.bitrate = bitrate;
+            }
+            "COMPLEXITY" => {
+                let complexity: u8 = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid Opus complexity: {value}"))?;
+                if complexity > 10 {
+                    bail!("Opus complexity must be 0..=10, got {complexity}");
+                }
+                parsed.complexity = Some(complexity);
+            }
+            other => bail!("unknown Opus option {other:?} (supported: BITRATE, COMPLEXITY)"),
+        }
+    }
+    Ok(parsed)
+}
 
 /// Opus encoder wrapping libopus via audiopus.
 pub struct OpusEncoder {
@@ -18,8 +64,12 @@ pub struct OpusEncoder {
 }
 
 impl OpusEncoder {
-    /// Create a new Opus encoder. Options: bitrate in kbps (default: 192).
-    pub fn new(format: SampleFormat, _options: &str) -> Result<Self> {
+    /// Create a new Opus encoder.
+    ///
+    /// Options: `BITRATE:<bps>` (6000–512000, default 192000) and
+    /// `COMPLEXITY:<0-10>` (default: libopus), comma-separated.
+    pub fn new(format: SampleFormat, options: &str) -> Result<Self> {
+        let options = parse_options(options)?;
         let sample_rate = match format.rate() {
             8000 => SampleRate::Hz8000,
             12000 => SampleRate::Hz12000,
@@ -40,7 +90,17 @@ impl OpusEncoder {
             }
         };
 
-        let encoder = OpusEnc::new(sample_rate, channels, Application::Audio)?;
+        let mut encoder = OpusEnc::new(sample_rate, channels, Application::Audio)?;
+        encoder.set_bitrate(Bitrate::BitsPerSecond(options.bitrate))?;
+        if let Some(complexity) = options.complexity {
+            encoder.set_complexity(complexity)?;
+        }
+        tracing::info!(
+            codec = "opus",
+            bitrate = options.bitrate,
+            complexity = ?options.complexity,
+            "Opus encoder configured"
+        );
 
         // Build OpusHead identification header
         let mut header = Vec::with_capacity(19);
@@ -138,5 +198,52 @@ impl Encoder for OpusEncoder {
         }
 
         Ok(EncodedChunk { data: output })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_options_use_defaults() {
+        assert_eq!(
+            parse_options("").unwrap(),
+            OpusOptions {
+                bitrate: DEFAULT_BITRATE,
+                complexity: None
+            }
+        );
+    }
+
+    #[test]
+    fn parses_bitrate_and_complexity() {
+        assert_eq!(
+            parse_options("BITRATE:256000,COMPLEXITY:10").unwrap(),
+            OpusOptions {
+                bitrate: 256_000,
+                complexity: Some(10)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_unknown_options() {
+        assert!(parse_options("BITRATE:1000").is_err());
+        assert!(parse_options("COMPLEXITY:11").is_err());
+        assert!(parse_options("FOO:1").is_err());
+        assert!(parse_options("BITRATE").is_err());
+    }
+
+    #[test]
+    fn encoder_accepts_inline_codec_options() {
+        let format = SampleFormat::new(48000, 16, 2);
+        let enc = crate::encoder::create(&crate::encoder::EncoderConfig {
+            codec: "opus:BITRATE:256000,COMPLEXITY:10".into(),
+            format,
+            options: String::new(),
+        })
+        .unwrap();
+        assert_eq!(enc.name(), "opus");
     }
 }

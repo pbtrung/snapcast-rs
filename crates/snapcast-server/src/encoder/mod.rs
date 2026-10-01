@@ -37,7 +37,9 @@ pub(crate) trait Encoder: Send {
 /// Configuration for creating an encoder.
 #[derive(Debug, Clone)]
 pub(crate) struct EncoderConfig {
-    /// Codec name: "pcm", "flac", "opus", "ogg".
+    /// Codec name: "pcm", "flac", "opus", "ogg". May carry inline options
+    /// after the first `:` (e.g. `"opus:BITRATE:256000,COMPLEXITY:10"`), as
+    /// in the C++ snapserver `codec` setting.
     pub codec: String,
     /// Audio sample format.
     pub format: SampleFormat,
@@ -55,7 +57,11 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         ..
     } = config;
     let format = *format;
-    match codec.as_str() {
+    let (codec, options) = match codec.split_once(':') {
+        Some((name, inline)) if options.is_empty() => (name, inline),
+        _ => (codec.as_str(), options.as_str()),
+    };
+    match codec {
         snapcast_proto::CODEC_PCM => Ok(Box::new(pcm::PcmEncoder::new(format))),
         #[cfg(feature = "flac")]
         snapcast_proto::CODEC_FLAC => Ok(Box::new(flac::FlacEncoder::new(format, options)?)),
@@ -143,5 +149,23 @@ mod tests {
     fn f32_to_16_bit_pcm_uses_two_byte_samples() {
         let pcm = f32_to_pcm(&[0.0, 1.0], 16);
         assert_eq!(pcm.len(), 4);
+    }
+
+    #[test]
+    fn create_splits_inline_codec_options() {
+        let format = SampleFormat::new(48000, 16, 2);
+        let config = |codec: &str| EncoderConfig {
+            codec: codec.into(),
+            format,
+            options: String::new(),
+        };
+        assert_eq!(create(&config("pcm")).unwrap().name(), "pcm");
+        #[cfg(feature = "flac")]
+        {
+            assert_eq!(create(&config("flac:5")).unwrap().name(), "flac");
+            assert!(create(&config("flac:99")).is_err());
+        }
+        let err = create(&config("nope:X:1")).err().unwrap().to_string();
+        assert!(err.contains("unsupported codec: nope"), "{err}");
     }
 }
