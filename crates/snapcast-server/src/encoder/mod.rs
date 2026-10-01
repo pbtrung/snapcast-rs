@@ -30,6 +30,10 @@ pub(crate) trait Encoder: Send {
 
     /// Encode an audio chunk. Accepts F32 or Pcm input.
     fn encode(&mut self, input: &AudioData) -> Result<EncodedChunk>;
+
+    /// Drop buffered input and codec state before encoding resumes after a
+    /// gap, so the first output after the gap holds no audio from before it.
+    fn reset(&mut self) {}
 }
 
 /// Configuration for creating an encoder.

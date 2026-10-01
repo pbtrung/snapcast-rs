@@ -520,7 +520,9 @@ pub struct SnapServer {
 /// Spawn a per-stream encode loop on a dedicated thread.
 ///
 /// Receives `AudioFrame`, passes `AudioData` directly to the encoder,
-/// and broadcasts encoded `WireChunkData` to sessions.
+/// and broadcasts encoded `WireChunkData` to sessions. While no session is
+/// connected, frames are still received and paced but not encoded; the
+/// encoder is reset when the first session arrives.
 fn spawn_stream_encoder(
     stream_id: String,
     mut rx: mpsc::Receiver<AudioFrame>,
@@ -537,6 +539,7 @@ fn spawn_stream_encoder(
 
         rt.block_on(async {
             let mut next_tick: Option<tokio::time::Instant> = None;
+            let mut idle = false;
             while let Some(frame) = rx.recv().await {
                 // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
                 if let AudioData::F32(ref samples) = frame.data {
@@ -554,6 +557,18 @@ fn spawn_stream_encoder(
                     }
                     *tick += chunk_dur;
                     tokio::time::sleep_until(*tick).await;
+                }
+                if chunk_tx.receiver_count() == 0 {
+                    if !idle {
+                        idle = true;
+                        tracing::debug!(stream = %stream_id, "No clients, pausing encoding");
+                    }
+                    continue;
+                }
+                if idle {
+                    idle = false;
+                    enc.reset();
+                    tracing::debug!(stream = %stream_id, "Client connected, resuming encoding");
                 }
                 match enc.encode(&frame.data) {
                     Ok(encoded) if !encoded.data.is_empty() => {
@@ -796,5 +811,97 @@ impl SnapServer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// Encoder that counts calls and echoes its input.
+    struct CountingEncoder {
+        encodes: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl encoder::Encoder for CountingEncoder {
+        fn name(&self) -> &str {
+            "count"
+        }
+
+        fn header(&self) -> &[u8] {
+            &[]
+        }
+
+        fn encode(&mut self, input: &AudioData) -> anyhow::Result<encoder::EncodedChunk> {
+            self.encodes.fetch_add(1, Ordering::SeqCst);
+            let AudioData::Pcm(data) = input else {
+                anyhow::bail!("expected Pcm");
+            };
+            Ok(encoder::EncodedChunk { data: data.clone() })
+        }
+
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pcm_frame(timestamp_usec: i64) -> AudioFrame {
+        AudioFrame {
+            data: AudioData::Pcm(vec![0u8; 960 * 4]),
+            timestamp_usec,
+        }
+    }
+
+    /// Wait until the encode loop has taken every queued frame, then give it a
+    /// moment to finish handling the last one (Pcm frames are not paced).
+    async fn drain(tx: &mpsc::Sender<AudioFrame>) {
+        while tx.capacity() < tx.max_capacity() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn encoder_pauses_while_no_client_is_connected() {
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let resets = Arc::new(AtomicUsize::new(0));
+        let enc = Box::new(CountingEncoder {
+            encodes: Arc::clone(&encodes),
+            resets: Arc::clone(&resets),
+        });
+        let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
+        let (chunk_tx, _) = broadcast::channel(16);
+        spawn_stream_encoder("s".into(), rx, enc, chunk_tx.clone(), 48000, 2);
+
+        for ts in 1..=3 {
+            tx.send(pcm_frame(ts)).await.unwrap();
+        }
+        drain(&tx).await;
+        assert_eq!(
+            encodes.load(Ordering::SeqCst),
+            0,
+            "no client: nothing encoded"
+        );
+
+        let mut chunks = chunk_tx.subscribe();
+        tx.send(pcm_frame(4)).await.unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.recv())
+            .await
+            .expect("chunk after a client connected")
+            .unwrap();
+        assert_eq!(chunk.timestamp_usec, 4);
+        assert_eq!(encodes.load(Ordering::SeqCst), 1);
+        assert_eq!(resets.load(Ordering::SeqCst), 1, "reset once on resume");
+
+        tx.send(pcm_frame(5)).await.unwrap();
+        chunks.recv().await.unwrap();
+        assert_eq!(
+            resets.load(Ordering::SeqCst),
+            1,
+            "no reset while clients stay"
+        );
     }
 }

@@ -243,6 +243,10 @@ impl Encoder for FlacEncoder {
 
         Ok(EncodedChunk { data: out })
     }
+
+    fn reset(&mut self) {
+        self.pending.clear();
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +365,18 @@ mod tests {
             }
         }
         assert!(produced, "expected 24-bit FLAC frames");
+    }
+
+    #[test]
+    fn reset_drops_partial_block() {
+        let fmt = SampleFormat::new(48000, 16, 2);
+        let mut enc = FlacEncoder::new(fmt, "").unwrap();
+        // 960 frames: less than one 1152-frame block, so it stays pending.
+        let out = enc.encode(&AudioData::Pcm(vec![7u8; 960 * 4])).unwrap();
+        assert!(out.data.is_empty());
+        assert!(!enc.pending.is_empty());
+        enc.reset();
+        assert!(enc.pending.is_empty());
     }
 
     #[test]

@@ -192,6 +192,12 @@ impl Encoder for OpusEncoder {
 
         Ok(EncodedChunk { data: output })
     }
+
+    fn reset(&mut self) {
+        if let Err(e) = self.encoder.reset_state() {
+            tracing::warn!(codec = "opus", error = %e, "reset failed");
+        }
+    }
 }
 
 #[cfg(test)]
