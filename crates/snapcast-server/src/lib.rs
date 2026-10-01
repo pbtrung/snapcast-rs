@@ -12,8 +12,10 @@
 //! The server is built around a channel-based API matching `snapcast-client`:
 //!
 //! - [`SnapServer`] is the main entry point
-//! - [`ServerEvent`] flows from server → consumer (client connected, stream status, custom messages)
-//! - [`ServerCommand`] flows from consumer → server (typed mutations, custom messages, stop)
+//! - [`ServerEvent`] flows from server → consumer (client connected, stream status, …)
+//! - [`ServerCommand`] flows from consumer → server (typed mutations, stop)
+//! - [`ClientAcceptor`] hands the server streaming clients the embedder accepted
+//!   on other transports (e.g. WebSocket), alongside the TCP listener
 //!
 //! # Example
 //!
@@ -46,6 +48,7 @@
 
 use std::sync::Arc;
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 
 // Re-export proto types that embedders need
@@ -55,6 +58,7 @@ pub use snapcast_proto::{DEFAULT_SAMPLE_FORMAT, DEFAULT_STREAM_PORT};
 
 const EVENT_CHANNEL_SIZE: usize = 256;
 const COMMAND_CHANNEL_SIZE: usize = 64;
+const INCOMING_CLIENT_CHANNEL_SIZE: usize = 16;
 const AUDIO_CHANNEL_SIZE: usize = 256;
 
 /// Channel size for F32 embedded sources — backpressure from encoder pacing.
@@ -456,9 +460,53 @@ pub struct StreamConfig {
     pub sample_format: Option<String>,
 }
 
+/// A byte-stream transport carrying binary-protocol frames for one client.
+///
+/// Implemented for every `AsyncRead + AsyncWrite` type; the server only needs
+/// whole frames written per `write_all` + `flush` pair, which is what lets a
+/// message-based transport such as a WebSocket be adapted to it.
+pub trait ClientTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> ClientTransport for T {}
+
+/// Hands streaming clients accepted outside the TCP listener to a running
+/// [`SnapServer`]. Obtain one with [`SnapServer::client_acceptor`].
+///
+/// The library still opens no ports: the embedder accepts the connection
+/// (for example a WebSocket upgrade on its HTTP server) and passes the
+/// resulting transport in.
+#[derive(Clone)]
+pub struct ClientAcceptor {
+    tx: mpsc::Sender<session::IncomingClient>,
+}
+
+impl ClientAcceptor {
+    /// Serve a streaming client over `transport`. `peer` is used for logging.
+    ///
+    /// # Errors
+    /// Fails if the server has stopped (or was never started with
+    /// [`SnapServer::serve`]).
+    pub async fn accept(
+        &self,
+        transport: impl ClientTransport,
+        peer: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        self.tx
+            .send(session::IncomingClient {
+                transport: Box::new(transport),
+                peer: peer.into(),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("server is not running"))
+    }
+}
+
 /// The embeddable Snapcast server.
 pub struct SnapServer {
     config: ServerConfig,
+    /// Externally accepted client transports → session server.
+    client_tx: mpsc::Sender<session::IncomingClient>,
+    client_rx: Option<mpsc::Receiver<session::IncomingClient>>,
     event_tx: mpsc::Sender<ServerEvent>,
     command_tx: mpsc::Sender<ServerCommand>,
     command_rx: Option<mpsc::Receiver<ServerCommand>>,
@@ -531,8 +579,11 @@ impl SnapServer {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
         let (chunk_tx, _) = broadcast::channel(256);
+        let (client_tx, client_rx) = mpsc::channel(INCOMING_CLIENT_CHANNEL_SIZE);
         let server = Self {
             config,
+            client_tx,
+            client_rx: Some(client_rx),
             event_tx,
             command_tx,
             command_rx: Some(command_rx),
@@ -581,6 +632,14 @@ impl SnapServer {
     /// Get a cloneable command sender.
     pub fn command_sender(&self) -> mpsc::Sender<ServerCommand> {
         self.command_tx.clone()
+    }
+
+    /// Get a cloneable handle for serving clients over transports other than
+    /// the TCP listener passed to [`serve`](Self::serve).
+    pub fn client_acceptor(&self) -> ClientAcceptor {
+        ClientAcceptor {
+            tx: self.client_tx.clone(),
+        }
     }
 
     /// Access the server configuration.
@@ -693,12 +752,21 @@ impl SnapServer {
             );
         }
 
+        let incoming_clients = self
+            .client_rx
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("serve() already called"))?;
         let session_for_run = Arc::clone(&session_srv);
         let session_event_tx = event_tx.clone();
         let session_chunk_tx = self.chunk_tx.clone();
         let session_handle = tokio::spawn(async move {
             if let Err(e) = session_for_run
-                .run(listener, session_chunk_tx, session_event_tx)
+                .run(
+                    listener,
+                    incoming_clients,
+                    session_chunk_tx,
+                    session_event_tx,
+                )
                 .await
             {
                 tracing::error!(error = %e, "Session server error");

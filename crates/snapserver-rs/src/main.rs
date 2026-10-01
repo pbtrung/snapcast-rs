@@ -5,6 +5,7 @@ mod http;
 mod jsonrpc;
 mod notify;
 mod stream;
+mod ws_transport;
 
 use clap::Parser;
 use snapcast_server::{ServerCommand, ServerEvent, SnapServer};
@@ -295,6 +296,7 @@ fn main() -> anyhow::Result<()> {
             notify_tx: notify_tx.clone(),
             auth_config: std::sync::Arc::clone(&auth_cfg),
             cmd_tx: server.command_sender(),
+            client_acceptor: server.client_acceptor(),
         };
         tokio::spawn(async move {
             if let Err(e) = http::run_http(http_cfg).await {

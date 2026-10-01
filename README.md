@@ -11,6 +11,7 @@ A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the
 - **Bounded Protocol Reads**: Client and server reject oversized binary-protocol payloads before allocation.
 - **Per-Stream Format Ownership**: Each server stream owns its codec/sample-format encoder state.
 - **Lossless f32 Decode Path**: The FLAC decoder outputs native f32 samples — no intermediate 16-bit quantization.
+- **WebSocket Streaming**: Clients can stream over `ws://host:1780` (the server's `/stream` endpoint on its HTTP port) as well as plain TCP, one binary-protocol frame per WebSocket message, as in C++ Snapcast. No TLS (`wss://`) support.
 - **Configurable Bind Addresses**: Listeners bind loopback, IPv4, IPv6, or specific interfaces.
 - **Systemd Integration**: Native `sd-notify` support on Linux for service readiness and status reporting.
 
@@ -99,6 +100,7 @@ snapserver-rs --help
 # Client
 snapclient-rs tcp://192.168.1.50:1704
 snapclient-rs tcp://[::1]:1704
+snapclient-rs ws://192.168.1.50:1780                     # WebSocket (server HTTP port)
 snapclient-rs                                            # mDNS auto-discovery
 snapclient-rs --help
 

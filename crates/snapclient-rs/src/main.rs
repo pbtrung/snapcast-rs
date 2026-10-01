@@ -61,14 +61,6 @@ fn main() -> anyhow::Result<()> {
         host: settings.server.host.clone(),
         port: settings.server.port,
         auth: settings.server.auth.clone(),
-        #[cfg(feature = "tls")]
-        server_certificate: settings.server.server_certificate.clone(),
-        #[cfg(feature = "tls")]
-        certificate: settings.server.certificate.clone(),
-        #[cfg(feature = "tls")]
-        certificate_key: settings.server.certificate_key.clone(),
-        #[cfg(feature = "tls")]
-        key_password: settings.server.key_password.clone(),
         instance: settings.instance,
         host_id: settings.host_id.clone(),
         latency: settings.player.latency,

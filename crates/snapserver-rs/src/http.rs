@@ -1,11 +1,16 @@
 //! HTTP/WebSocket control server + Snapweb static file serving.
+//!
+//! Routes: `GET /jsonrpc` (WebSocket JSON-RPC control), `POST /jsonrpc`
+//! (HTTP JSON-RPC), `GET /stream` (WebSocket streaming clients speaking the
+//! binary protocol, as in C++ snapserver) and optionally Snapweb.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde_json::Value;
@@ -21,6 +26,7 @@ struct AppState {
     notify_tx: broadcast::Sender<Value>,
     auth_config: Arc<AuthConfig>,
     cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    client_acceptor: snapcast_server::ClientAcceptor,
 }
 
 /// Configuration for the HTTP server.
@@ -39,6 +45,8 @@ pub(crate) struct HttpConfig {
     pub auth_config: Arc<AuthConfig>,
     /// Server command sender.
     pub cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    /// Hands WebSocket streaming clients (`/stream`) to the audio server.
+    pub client_acceptor: snapcast_server::ClientAcceptor,
 }
 
 /// Start the HTTP server with JSON-RPC + WebSocket + optional Snapweb.
@@ -48,17 +56,9 @@ pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
         notify_tx: cfg.notify_tx,
         auth_config: cfg.auth_config,
         cmd_tx: cfg.cmd_tx,
+        client_acceptor: cfg.client_acceptor,
     };
-
-    let mut app = Router::new()
-        .route("/jsonrpc", get(ws_handler).post(http_jsonrpc_handler))
-        .with_state(app_state);
-
-    if let Some(ref root) = cfg.doc_root {
-        let serve = tower_http::services::ServeDir::new(root);
-        app = app.fallback_service(serve);
-        tracing::info!(doc_root = root, "Serving Snapweb");
-    }
+    let app = router(app_state, cfg.doc_root.as_deref());
 
     let listener = tokio::net::TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
     tracing::info!(
@@ -66,8 +66,47 @@ pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
         port = cfg.port,
         "HTTP/WebSocket server listening"
     );
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+/// Build the HTTP router. Must be served with
+/// `into_make_service_with_connect_info::<SocketAddr>()` (`/stream` logs the peer).
+fn router(app_state: AppState, doc_root: Option<&str>) -> Router {
+    let mut app = Router::new()
+        .route("/jsonrpc", get(ws_handler).post(http_jsonrpc_handler))
+        .route("/stream", get(stream_ws_handler))
+        .with_state(app_state);
+
+    if let Some(root) = doc_root {
+        let serve = tower_http::services::ServeDir::new(root);
+        app = app.fallback_service(serve);
+        tracing::info!(doc_root = root, "Serving Snapweb");
+    }
+    app
+}
+
+/// WebSocket upgrade handler at GET /stream: a streaming client speaking the
+/// Snapcast binary protocol, one frame per binary message.
+async fn stream_ws_handler(
+    ws: WebSocketUpgrade,
+    State(app): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let transport = crate::ws_transport::WsTransport::new(socket);
+        if let Err(e) = app
+            .client_acceptor
+            .accept(transport, format!("ws://{peer}"))
+            .await
+        {
+            tracing::warn!(%peer, error = %e, "Dropping WebSocket stream client");
+        }
+    })
 }
 
 /// HTTP POST /jsonrpc handler.
@@ -227,6 +266,9 @@ mod tests {
             notify_tx,
             auth_config: Arc::new(auth_config),
             cmd_tx,
+            client_acceptor: snapcast_server::SnapServer::new(Default::default())
+                .0
+                .client_acceptor(),
         };
         (state, event_rx, cmd_rx, notify_rx)
     }
@@ -469,5 +511,84 @@ mod tests {
         state.notify_tx.send(n.clone()).unwrap();
         assert_eq!(sub.recv().await.unwrap(), n);
         assert_eq!(n["params"]["stream_id"], "music");
+    }
+
+    // --- WebSocket streaming endpoint (end-to-end) ---------------------------
+
+    /// A real snapcast-client connects over `ws://.../stream` to a real
+    /// SnapServer behind the HTTP router, completes the handshake, syncs time
+    /// and receives decoded audio.
+    #[tokio::test]
+    async fn websocket_stream_client_receives_audio() {
+        use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
+
+        let (mut server, _server_events) =
+            snapcast_server::SnapServer::new(snapcast_server::ServerConfig::default());
+        let audio_tx = server.add_stream("default");
+        let acceptor = server.client_acceptor();
+        let audio_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move { server.serve(audio_listener).await });
+
+        let (mut state, _e, _c, _n) = make_state(AuthConfig::default());
+        state.client_acceptor = acceptor;
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_port = http_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(
+                http_listener,
+                router(state, None).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let (mut client, mut events, mut client_audio) = SnapClient::new(ClientConfig {
+            scheme: snapcast_proto::SCHEME_WS.into(),
+            host: "127.0.0.1".into(),
+            port: http_port,
+            ..ClientConfig::default()
+        });
+        tokio::spawn(async move { client.run().await });
+
+        let wait = |secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let deadline = wait(5);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(ClientEvent::StreamStarted { codec, .. })) => {
+                    assert_eq!(codec, "flac");
+                    break;
+                }
+                Ok(Some(_)) => {}
+                other => panic!("no StreamStarted over WebSocket: {other:?}"),
+            }
+        }
+        let deadline = wait(10);
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(ClientEvent::TimeSyncComplete { .. })) => break,
+                Ok(Some(_)) => {}
+                other => panic!("no time sync over WebSocket: {other:?}"),
+            }
+        }
+
+        let samples: Vec<f32> = (0..2304).map(|i| ((i as f32) * 0.01).sin() * 0.5).collect();
+        let mut ts = 1_000_000_000;
+        for _ in 0..20 {
+            audio_tx
+                .send(snapcast_server::AudioFrame {
+                    data: snapcast_server::AudioData::F32(samples.clone()),
+                    timestamp_usec: ts,
+                })
+                .await
+                .unwrap();
+            ts += 24_000;
+        }
+
+        let frame = tokio::time::timeout_at(wait(5), client_audio.recv())
+            .await
+            .expect("no audio over WebSocket")
+            .expect("audio channel closed");
+        assert_eq!(frame.sample_rate, 48000);
+        assert_eq!(frame.channels, 2);
+        assert!(!frame.samples.is_empty());
     }
 }

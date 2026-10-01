@@ -49,10 +49,7 @@ mac_address = "1"
 libc = "0.2"
 
 # Networking
-tokio-tungstenite = { version = "0.30", features = ["connect", "__rustls-tls"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-native-certs = "0.8"
+tokio-tungstenite = { version = "0.30", features = ["connect"] }
 futures-util = "0.3"
 
 # Audio decoding

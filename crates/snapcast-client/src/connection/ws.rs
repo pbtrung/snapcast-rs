@@ -1,7 +1,8 @@
 //! WebSocket connection to a snapserver.
 //!
-//! Hosts the frame send/receive shared with the WSS (TLS) transport — both use
-//! tungstenite's `MaybeTlsStream`, so only connection establishment differs.
+//! Connects to the server's streaming endpoint
+//! ([`snapcast_proto::WS_STREAM_PATH`]); every binary message carries exactly
+//! one binary-protocol frame.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -12,14 +13,21 @@ use snapcast_proto::types::Timeval;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// Shared WebSocket transport stream type.
-///
-/// tungstenite's `MaybeTlsStream` wraps both plain and TLS sockets, so the
-/// plain-WS and WSS transports hold the same stream type and share frame I/O.
-pub(super) type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+/// WebSocket transport stream type (always plain TCP; no TLS support).
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Send one binary Snapcast frame over a (plain or TLS) WebSocket stream.
-pub(super) async fn send_frame(
+/// URL of the server's WebSocket streaming endpoint, bracketing IPv6 hosts.
+fn stream_url(scheme: &str, host: &str, port: u16) -> String {
+    let path = snapcast_proto::WS_STREAM_PATH;
+    if host.contains(':') {
+        format!("{scheme}://[{host}]:{port}{path}")
+    } else {
+        format!("{scheme}://{host}:{port}{path}")
+    }
+}
+
+/// Send one binary Snapcast frame over the WebSocket stream.
+async fn send_frame(
     ws: &mut WsStream,
     msg_type: MessageType,
     payload: &MessagePayload,
@@ -39,8 +47,8 @@ pub(super) async fn send_frame(
     Ok(())
 }
 
-/// Receive one binary Snapcast frame from a (plain or TLS) WebSocket stream.
-pub(super) async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
+/// Receive one binary Snapcast frame from the WebSocket stream.
+async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
     loop {
         let msg = ws
             .next()
@@ -87,7 +95,7 @@ impl WsConnection {
 
     /// Establish the WebSocket connection.
     pub async fn connect(&mut self) -> Result<()> {
-        let url = format!("ws://{}:{}/jsonrpc", self.host, self.port);
+        let url = stream_url(snapcast_proto::SCHEME_WS, &self.host, self.port);
         let (ws, _) = tokio_tungstenite::connect_async(&url)
             .await
             .with_context(|| format!("WebSocket connect to {url}"))?;
@@ -113,5 +121,16 @@ impl WsConnection {
     /// Receive one binary Snapcast frame.
     pub async fn recv(&mut self) -> Result<TypedMessage> {
         recv_frame(self.ws.as_mut().context("not connected")?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_url;
+
+    #[test]
+    fn stream_url_targets_stream_endpoint() {
+        assert_eq!(stream_url("ws", "host", 1780), "ws://host:1780/stream");
+        assert_eq!(stream_url("ws", "::1", 1780), "ws://[::1]:1780/stream");
     }
 }

@@ -22,16 +22,12 @@ opus-decoder = "0.1"
 
 # Optional
 tokio-tungstenite = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rubato = { workspace = true, optional = true }
 
 [features]
 default = []
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
-tls = ["websocket", "dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs"]
 resampler = ["dep:rubato"]
 
 [dev-dependencies]

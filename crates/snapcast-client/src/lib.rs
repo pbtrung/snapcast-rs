@@ -139,7 +139,7 @@ pub enum ClientCommand {
 /// Configuration for the embeddable client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Connection scheme. Only "tcp" is supported for audio streaming.
+    /// Connection scheme: "tcp" or "ws" (`websocket` feature).
     pub scheme: String,
     /// Server hostname or IP (empty = mDNS discovery).
     pub host: String,
@@ -147,18 +147,6 @@ pub struct ClientConfig {
     pub port: u16,
     /// Optional authentication for Hello handshake.
     pub auth: Option<crate::config::Auth>,
-    /// Server CA certificate for TLS verification.
-    #[cfg(feature = "tls")]
-    pub server_certificate: Option<std::path::PathBuf>,
-    /// Client certificate (PEM).
-    #[cfg(feature = "tls")]
-    pub certificate: Option<std::path::PathBuf>,
-    /// Client private key (PEM).
-    #[cfg(feature = "tls")]
-    pub certificate_key: Option<std::path::PathBuf>,
-    /// Password for encrypted private key.
-    #[cfg(feature = "tls")]
-    pub key_password: Option<String>,
     /// Instance id (for multiple clients on one host).
     pub instance: u32,
     /// Unique host identifier (default: MAC address).
@@ -176,14 +164,6 @@ impl Default for ClientConfig {
             host: String::new(),
             port: snapcast_proto::DEFAULT_STREAM_PORT,
             auth: None,
-            #[cfg(feature = "tls")]
-            server_certificate: None,
-            #[cfg(feature = "tls")]
-            certificate: None,
-            #[cfg(feature = "tls")]
-            certificate_key: None,
-            #[cfg(feature = "tls")]
-            key_password: None,
             instance: 1,
             host_id: String::new(),
             latency: 0,
@@ -263,9 +243,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn run_rejects_websocket_audio_scheme() {
+    async fn run_rejects_unsupported_scheme() {
         let config = ClientConfig {
-            scheme: snapcast_proto::SCHEME_WS.into(),
+            scheme: "wss".into(),
             host: "localhost".into(),
             port: snapcast_proto::DEFAULT_HTTP_PORT,
             ..ClientConfig::default()
@@ -273,6 +253,6 @@ mod tests {
         let (mut client, _events, _audio_rx) = SnapClient::new(config);
 
         let err = client.run().await.unwrap_err();
-        assert!(err.to_string().contains("websocket audio transport"));
+        assert!(err.to_string().contains("unsupported scheme"));
     }
 }

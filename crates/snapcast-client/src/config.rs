@@ -1,13 +1,11 @@
 //! Client configuration types mirroring the C++ `ClientSettings`.
 
-use std::path::PathBuf;
-
 use snapcast_proto::SampleFormat;
 
 /// Server connection settings.
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
-    /// Connection scheme. Only "tcp" is supported for audio streaming.
+    /// Connection scheme: "tcp" or "ws".
     pub scheme: String,
     /// Server hostname or IP.
     pub host: String,
@@ -15,14 +13,6 @@ pub struct ServerSettings {
     pub port: u16,
     /// Optional authentication.
     pub auth: Option<Auth>,
-    /// Server CA certificate for TLS verification.
-    pub server_certificate: Option<PathBuf>,
-    /// Client certificate (PEM).
-    pub certificate: Option<PathBuf>,
-    /// Client private key (PEM).
-    pub certificate_key: Option<PathBuf>,
-    /// Password for encrypted private key.
-    pub key_password: Option<String>,
 }
 
 /// Authentication credentials.
@@ -148,10 +138,6 @@ impl Default for ServerSettings {
             host: String::new(),
             port: snapcast_proto::DEFAULT_STREAM_PORT,
             auth: None,
-            server_certificate: None,
-            certificate: None,
-            certificate_key: None,
-            key_password: None,
         }
     }
 }

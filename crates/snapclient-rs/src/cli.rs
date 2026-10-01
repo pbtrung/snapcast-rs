@@ -1,7 +1,5 @@
 //! CLI argument parsing — maps command-line args to [`ClientSettings`].
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
@@ -18,7 +16,7 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
   If 'url' is not configured, snapclient defaults to 'tcp://_snapcast._tcp'"
 )]
 pub struct Cli {
-    /// Snapserver URL: `tcp://<host>[:<port>]`
+    /// Snapserver URL: `tcp://<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
     pub url: Option<String>,
 
     /// Instance id when running multiple instances on the same host
@@ -28,22 +26,6 @@ pub struct Cli {
     /// Unique host id (default: MAC address)
     #[arg(long = "hostID", default_value = "")]
     pub host_id: String,
-
-    /// Client certificate file (PEM format)
-    #[arg(long = "cert")]
-    pub certificate: Option<PathBuf>,
-
-    /// Client private key file (PEM format)
-    #[arg(long = "cert-key")]
-    pub certificate_key: Option<PathBuf>,
-
-    /// Key password (for encrypted private key)
-    #[arg(long = "key-password")]
-    pub key_password: Option<String>,
-
-    /// Verify server with CA certificate (PEM format). Use without value for default certificates.
-    #[arg(long = "server-cert")]
-    pub server_certificate: Option<Option<PathBuf>>,
 
     /// List PCM devices
     #[arg(short, long)]
@@ -93,23 +75,7 @@ impl Cli {
     pub fn into_settings(self) -> Result<ClientSettings> {
         let default_url = "tcp://_snapcast._tcp";
         let url = self.url.as_deref().unwrap_or(default_url);
-        let mut server = parse_url(url)?;
-
-        // TLS certificate options
-        if let Some(cert) = self.certificate {
-            server.certificate = Some(cert);
-        }
-        if let Some(key) = self.certificate_key {
-            server.certificate_key = Some(key);
-        }
-        if let Some(pw) = self.key_password {
-            server.key_password = Some(pw);
-        }
-        if let Some(server_cert) = self.server_certificate {
-            // --server-cert without value → use default certs (empty path)
-            // --server-cert=path → use specific cert
-            server.server_certificate = Some(server_cert.unwrap_or_default());
-        }
+        let server = parse_url(url)?;
 
         // Player
         let (player_name, player_param) = if self.player.is_empty() {
@@ -181,13 +147,13 @@ fn parse_url(url: &str) -> Result<ServerSettings> {
         .split_once("://")
         .with_context(|| format!("invalid URL, expected <scheme>://<host>[:port]: {url}"))?;
 
-    match scheme {
-        snapcast_proto::SCHEME_TCP => settings.scheme = scheme.to_string(),
-        snapcast_proto::SCHEME_WS | snapcast_proto::SCHEME_WSS => {
-            bail!("websocket audio transport is not supported yet; use tcp://")
-        }
-        _ => bail!("unsupported scheme: {scheme} (expected tcp)"),
-    }
+    let default_port = match scheme {
+        snapcast_proto::SCHEME_TCP => snapcast_proto::DEFAULT_STREAM_PORT,
+        // WebSocket streaming clients connect to the server's HTTP port.
+        snapcast_proto::SCHEME_WS => snapcast_proto::DEFAULT_HTTP_PORT,
+        _ => bail!("unsupported scheme: {scheme} (expected tcp or ws)"),
+    };
+    settings.scheme = scheme.to_string();
 
     // Extract optional user:password@
     let rest = if let Some((userinfo, host_part)) = rest.rsplit_once('@') {
@@ -203,7 +169,7 @@ fn parse_url(url: &str) -> Result<ServerSettings> {
         rest
     };
 
-    let (host, port) = parse_host_port(rest, snapcast_proto::DEFAULT_STREAM_PORT)?;
+    let (host, port) = parse_host_port(rest, default_port)?;
     settings.host = host;
     settings.port = port;
 
@@ -313,8 +279,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_websocket_scheme_is_unsupported() {
-        assert!(parse_url("ws://homeserver.local").is_err());
+    fn parse_websocket_scheme() {
+        let s = parse_url("ws://homeserver.local").unwrap();
+        assert_eq!(s.scheme, "ws");
+        assert_eq!(s.host, "homeserver.local");
+        assert_eq!(s.port, snapcast_proto::DEFAULT_HTTP_PORT);
+        let s = parse_url("ws://[::1]:8080").unwrap();
+        assert_eq!((s.host.as_str(), s.port), ("::1", 8080));
         assert!(parse_url("wss://secure.host:1788").is_err());
     }
 
@@ -379,30 +350,6 @@ mod tests {
         assert_eq!(s.player.sample_format.rate(), 48000);
         assert_eq!(s.player.sample_format.channels(), 0);
         assert_eq!(s.player.pcm_device.name, "hw:1");
-    }
-
-    #[test]
-    fn cli_cert_options() {
-        let cli = Cli::parse_from([
-            "snapclient-rs",
-            "--cert",
-            "/path/to/cert.pem",
-            "--cert-key",
-            "/path/to/key.pem",
-            "--key-password",
-            "secret",
-            "tcp://server:1704",
-        ]);
-        let s = cli.into_settings().unwrap();
-        assert_eq!(
-            s.server.certificate.unwrap().to_str().unwrap(),
-            "/path/to/cert.pem"
-        );
-        assert_eq!(
-            s.server.certificate_key.unwrap().to_str().unwrap(),
-            "/path/to/key.pem"
-        );
-        assert_eq!(s.server.key_password.unwrap(), "secret");
     }
 
     #[test]

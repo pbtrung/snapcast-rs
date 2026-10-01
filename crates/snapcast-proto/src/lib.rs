@@ -37,8 +37,6 @@ pub const DEFAULT_STREAM_PORT: u16 = 1704;
 pub const DEFAULT_CONTROL_PORT: u16 = 1705;
 /// Default HTTP port for JSON-RPC + Snapweb.
 pub const DEFAULT_HTTP_PORT: u16 = 1780;
-/// Default WebSocket Secure port.
-pub const DEFAULT_WSS_PORT: u16 = 1788;
 /// Snapcast binary protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
 /// Snapcast JSON-RPC control protocol version.
@@ -65,8 +63,10 @@ pub const DEFAULT_MAX_PAYLOAD_SIZE: u32 = 2 * 1024 * 1024;
 pub const SCHEME_TCP: &str = "tcp";
 /// WebSocket streaming transport scheme.
 pub const SCHEME_WS: &str = "ws";
-/// WebSocket-over-TLS streaming transport scheme.
-pub const SCHEME_WSS: &str = "wss";
+/// HTTP path of the WebSocket endpoint for streaming clients (`ws://host:1780/stream`).
+///
+/// Each binary WebSocket message carries exactly one binary-protocol frame.
+pub const WS_STREAM_PATH: &str = "/stream";
 /// Raw PCM codec name.
 pub const CODEC_PCM: &str = "pcm";
 /// FLAC codec name.

@@ -224,6 +224,7 @@ impl SessionServer {
     pub async fn run(
         &self,
         listener: TcpListener,
+        mut incoming: mpsc::Receiver<IncomingClient>,
         chunk_rx: broadcast::Sender<WireChunkData>,
         event_tx: mpsc::Sender<ServerEvent>,
     ) -> Result<()> {
@@ -232,26 +233,53 @@ impl SessionServer {
             "Stream server accepting clients"
         );
 
+        let mut incoming_open = true;
         loop {
-            let (stream, peer) = listener.accept().await?;
-            stream.set_nodelay(true).ok();
-            let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(10));
-            let sock = socket2::SockRef::from(&stream);
-            sock.set_tcp_keepalive(&ka).ok();
-            tracing::info!(%peer, "Client connecting");
-
-            let chunk_sub = chunk_rx.subscribe();
-            let ctx = Arc::clone(&self.ctx);
-            let event_tx = event_tx.clone();
-
-            tokio::spawn(async move {
-                let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
-                if let Err(e) = result {
-                    tracing::debug!(%peer, error = %e, "Client session ended");
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    stream.set_nodelay(true).ok();
+                    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(10));
+                    let sock = socket2::SockRef::from(&stream);
+                    sock.set_tcp_keepalive(&ka).ok();
+                    self.spawn_client(stream, peer.to_string(), &chunk_rx, &event_tx);
                 }
-            });
+                client = incoming.recv(), if incoming_open => match client {
+                    Some(client) => {
+                        self.spawn_client(client.transport, client.peer, &chunk_rx, &event_tx);
+                    }
+                    None => incoming_open = false,
+                },
+            }
         }
     }
+
+    fn spawn_client<S>(
+        &self,
+        stream: S,
+        peer: String,
+        chunk_rx: &broadcast::Sender<WireChunkData>,
+        event_tx: &mpsc::Sender<ServerEvent>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        tracing::info!(%peer, "Client connecting");
+        let chunk_sub = chunk_rx.subscribe();
+        let ctx = Arc::clone(&self.ctx);
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            let result = handle_client(stream, chunk_sub, &ctx, event_tx).await;
+            if let Err(e) = result {
+                tracing::debug!(%peer, error = %e, "Client session ended");
+            }
+        });
+    }
+}
+
+/// A client connection accepted by the embedder on a non-TCP transport.
+pub(crate) struct IncomingClient {
+    pub transport: Box<dyn crate::ClientTransport>,
+    pub peer: String,
 }
 
 // ── Client handler ────────────────────────────────────────────

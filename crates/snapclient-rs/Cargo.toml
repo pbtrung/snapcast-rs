@@ -29,10 +29,9 @@ mdns-sd = { workspace = true, optional = true }
 
 
 [features]
-default = ["mdns"]
+default = ["mdns", "websocket"]
 mdns = ["dep:mdns-sd"]
 websocket = ["snapcast-client/websocket"]
-tls = ["snapcast-client/tls"]
 resampler = ["snapcast-client/resampler"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
