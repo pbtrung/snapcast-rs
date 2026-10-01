@@ -82,7 +82,7 @@ cargo build --release -p snapserver-rs --features opus  # + Opus
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.
 
-Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+. On Arch Linux, the server needs `avahi` (`sudo pacman -S avahi`) and the client needs `alsa-lib`.
+Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+. They are built with Opus enabled. On Arch Linux, the server needs `avahi` and `opus` (`sudo pacman -S avahi opus`) and the client needs `alsa-lib`.
 
 Run the checks with `make check` (fmt, clippy, tests).
 

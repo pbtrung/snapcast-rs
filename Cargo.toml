@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/snapcast-proto", "crates/snapcast-client", "crates/snapcast-server", "crates/snapclient-rs", "crates/snapserver-rs", "crates/snapcast-tests"]
 
 [workspace.package]
-version = "0.999.1"
+version = "0.999.2"
 edition = "2024"
 rust-version = "1.94.1"
 license = "GPL-3.0-only"
@@ -12,9 +12,9 @@ authors = ["Fabian Schmieder"]
 
 [workspace.dependencies]
 # Internal
-snapcast-proto = { path = "crates/snapcast-proto", version = "0.999.1" }
-snapcast-client = { path = "crates/snapcast-client", version = "0.999.1", default-features = false }
-snapcast-server = { path = "crates/snapcast-server", version = "0.999.1" }
+snapcast-proto = { path = "crates/snapcast-proto", version = "0.999.2" }
+snapcast-client = { path = "crates/snapcast-client", version = "0.999.2", default-features = false }
+snapcast-server = { path = "crates/snapcast-server", version = "0.999.2" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
