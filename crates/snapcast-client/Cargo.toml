@@ -27,18 +27,15 @@ rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 rubato = { workspace = true, optional = true }
-lz4_flex = { version = "0.13.0", optional = true }
 
 [features]
 default = []
 websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 tls = ["websocket", "dep:tokio-rustls", "dep:rustls", "dep:rustls-native-certs"]
 resampler = ["dep:rubato"]
-f32lz4 = ["dep:lz4_flex"]
 
 [dev-dependencies]
 proptest = "1"
 
 [package.metadata.docs.rs]
 all-features = false
-features = ["f32lz4"]

@@ -1,7 +1,5 @@
-//! Audio encoders — PCM, FLAC, Opus, Vorbis, F32LZ4.
+//! Audio encoders — PCM, FLAC, Opus, Vorbis.
 
-#[cfg(feature = "f32lz4")]
-pub mod f32lz4;
 #[cfg(feature = "flac")]
 pub mod flac;
 #[cfg(feature = "opus")]
@@ -26,7 +24,7 @@ pub(crate) struct EncodedChunk {
 /// Each encoder accepts [`AudioData`] (F32 or Pcm) and handles conversion
 /// internally. This keeps format-specific logic in the encoder, not the caller.
 pub(crate) trait Encoder: Send {
-    /// Codec name (e.g. "flac", "pcm", "opus", "ogg", "f32lz4").
+    /// Codec name (e.g. "flac", "pcm", "opus", "ogg").
     fn name(&self) -> &str;
 
     /// Codec header bytes sent to clients before audio data.
@@ -39,7 +37,7 @@ pub(crate) trait Encoder: Send {
 /// Configuration for creating an encoder.
 #[derive(Debug, Clone)]
 pub(crate) struct EncoderConfig {
-    /// Codec name: "pcm", "flac", "opus", "ogg", "f32lz4".
+    /// Codec name: "pcm", "flac", "opus", "ogg".
     pub codec: String,
     /// Audio sample format.
     pub format: SampleFormat,
@@ -65,11 +63,6 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         snapcast_proto::CODEC_OPUS => Ok(Box::new(opus::OpusEncoder::new(format, options)?)),
         #[cfg(feature = "vorbis")]
         snapcast_proto::CODEC_OGG => Ok(Box::new(vorbis::VorbisEncoder::new(format, options)?)),
-        #[cfg(feature = "f32lz4")]
-        snapcast_proto::CODEC_F32LZ4 => {
-            let enc = f32lz4::F32Lz4Encoder::new(format);
-            Ok(Box::new(enc))
-        }
         other => anyhow::bail!("unsupported codec: {other} (check enabled features)"),
     }
 }
@@ -108,7 +101,7 @@ pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Vec<u8> {
 
 /// Convert PCM bytes to f32 samples at the given bit depth.
 /// Shared helper for encoders that need f32 input.
-#[cfg(any(feature = "f32lz4", feature = "opus", test))]
+#[cfg(any(feature = "opus", test))]
 pub(crate) fn pcm_to_f32(pcm: &[u8], bits: u16) -> Vec<f32> {
     match bits {
         16 => pcm

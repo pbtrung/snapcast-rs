@@ -20,7 +20,6 @@
 //! See the [protocol documentation](https://github.com/snapcast/snapcast/blob/master/doc/binary_protocol.md)
 //! for the full specification.
 
-pub mod f32lz4;
 pub mod message;
 pub mod sample_format;
 pub mod status;
@@ -76,5 +75,3 @@ pub const CODEC_FLAC: &str = "flac";
 pub const CODEC_OPUS: &str = "opus";
 /// Ogg/Vorbis codec name as used on the Snapcast wire.
 pub const CODEC_OGG: &str = "ogg";
-/// Lossless f32 LZ4 codec name.
-pub const CODEC_F32LZ4: &str = "f32lz4";

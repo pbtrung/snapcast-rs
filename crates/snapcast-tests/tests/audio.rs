@@ -44,7 +44,7 @@ async fn audio_round_trip() {
     // Wait for stream to start
     expect_event(&mut client.events, 2000, |e| match e {
         ClientEvent::StreamStarted { codec, .. } => {
-            // Default codec depends on server features (flac or f32lz4)
+            // Default codec depends on server features (flac or pcm)
             assert!(!codec.is_empty());
             Some(())
         }
@@ -91,5 +91,5 @@ async fn audio_round_trip() {
 
     assert!(total_samples >= 9600);
 
-    // The audio went through: server encoded f32lz4 → wire → client decoded
+    // The audio went through: server encoded → wire → client decoded
 }

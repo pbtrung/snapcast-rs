@@ -96,7 +96,7 @@ impl Encoder for OpusEncoder {
                     self.warned = true;
                     tracing::warn!(
                         codec = "opus",
-                        "F32 input requires quantization to 16-bit — consider f32lz4 for lossless path"
+                        "F32 input requires quantization to 16-bit — consider pcm for lossless path"
                     );
                 }
                 std::borrow::Cow::Owned(super::f32_to_pcm(samples, 16))

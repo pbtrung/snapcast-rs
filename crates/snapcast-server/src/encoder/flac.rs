@@ -201,7 +201,7 @@ impl Encoder for FlacEncoder {
                     tracing::warn!(
                         codec = "flac",
                         bits = self.format.bits(),
-                        "F32 input requires quantization — consider f32lz4 for lossless path"
+                        "F32 input requires quantization — consider pcm for lossless path"
                     );
                 }
                 std::borrow::Cow::Owned(super::f32_to_pcm(samples, self.format.bits()))

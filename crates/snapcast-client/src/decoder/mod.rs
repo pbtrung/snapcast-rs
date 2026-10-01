@@ -1,7 +1,5 @@
 //! Audio decoder trait and implementations.
 
-#[cfg(feature = "f32lz4")]
-pub mod f32lz4;
 pub mod flac;
 pub mod opus;
 pub mod vorbis;

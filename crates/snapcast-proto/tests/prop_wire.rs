@@ -268,7 +268,6 @@ proptest! {
             Just("opus".to_string()),
             Just("ogg".to_string()),
             Just("pcm".to_string()),
-            Just("f32lz4".to_string()),
             "[a-zA-Z0-9]{0,16}",
         ],
         payload_bytes in prop::collection::vec(any::<u8>(), 0..2048),

@@ -403,9 +403,7 @@ pub enum ServerCommand {
 fn default_codec() -> &'static str {
     #[cfg(feature = "flac")]
     return snapcast_proto::CODEC_FLAC;
-    #[cfg(all(feature = "f32lz4", not(feature = "flac")))]
-    return snapcast_proto::CODEC_F32LZ4;
-    #[cfg(not(any(feature = "flac", feature = "f32lz4")))]
+    #[cfg(not(feature = "flac"))]
     return snapcast_proto::CODEC_PCM;
 }
 
@@ -413,8 +411,8 @@ fn default_codec() -> &'static str {
 pub struct ServerConfig {
     /// Audio buffer size in milliseconds. Default: 1000.
     pub buffer_ms: u32,
-    /// Codec name, e.g. "flac", "f32lz4", "pcm".
-    /// Default: "flac" (feature-dependent: flac > f32lz4 > pcm).
+    /// Codec name, e.g. "flac", "pcm".
+    /// Default: "flac" (feature-dependent: flac > pcm).
     pub codec: String,
     /// Default sample format. Default: 48000:16:2.
     pub sample_format: String,
@@ -452,7 +450,7 @@ impl Default for ServerConfig {
 /// Per-stream configuration. If `None`, inherits from [`ServerConfig`].
 #[derive(Debug, Clone, Default)]
 pub struct StreamConfig {
-    /// Codec override (e.g. "flac", "f32lz4", "opus", "ogg", "pcm").
+    /// Codec override (e.g. "flac", "opus", "ogg", "pcm").
     pub codec: Option<String>,
     /// Sample format override (e.g. "48000:16:2").
     pub sample_format: Option<String>,

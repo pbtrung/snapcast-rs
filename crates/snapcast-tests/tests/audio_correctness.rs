@@ -99,10 +99,10 @@ async fn flac_roundtrip_preserves_waveform_content() {
     })
     .await;
     // On default features this must be FLAC (lossless). If the crate were built
-    // without flac it would fall back to f32lz4/pcm — still lossless — so we
+    // without flac it would fall back to pcm — still lossless — so we
     // only require a known lossless codec here rather than hard-coding "flac".
     assert!(
-        codec == "flac" || codec == "f32lz4" || codec == "pcm",
+        codec == "flac" || codec == "pcm",
         "expected a lossless default codec, got {codec:?}"
     );
 

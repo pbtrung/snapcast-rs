@@ -29,9 +29,8 @@ mdns-sd = { workspace = true, optional = true }
 
 
 [features]
-default = ["mdns", "f32lz4"]
+default = ["mdns"]
 mdns = ["dep:mdns-sd"]
-f32lz4 = ["snapcast-client/f32lz4"]
 websocket = ["snapcast-client/websocket"]
 tls = ["snapcast-client/tls"]
 resampler = ["snapcast-client/resampler"]

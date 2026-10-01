@@ -2,7 +2,7 @@
 
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
-A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the multiroom audio system by [Johannes Pohl (badaix)](https://github.com/badaix), which synchronizes playback across devices with sub-millisecond precision. The library crates implement the protocol, codecs and time sync without owning any audio device, port or file. The `snapserver-rs` and `snapclient-rs` binaries wrap them as standalone replacements for TCP-based Snapcast setups. With the standard codecs (PCM, FLAC, Opus, Vorbis) they work alongside the original C++ Snapcast.
+A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the multiroom audio system by [Johannes Pohl (badaix)](https://github.com/badaix), which synchronizes playback across devices with sub-millisecond precision. The library crates implement the protocol, codecs and time sync without owning any audio device, port or file. The `snapserver-rs` and `snapclient-rs` binaries wrap them as standalone replacements for TCP-based Snapcast setups. They interoperate with the original C++ Snapcast.
 
 ## Key Features
 
@@ -10,7 +10,7 @@ A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the
 - **Integrated Resampling**: Automatic fallback to `rubato`-based resampling if the local hardware doesn't support the server's native format.
 - **Bounded Protocol Reads**: Client and server reject oversized binary-protocol payloads before allocation.
 - **Per-Stream Format Ownership**: Each server stream owns its codec/sample-format encoder state.
-- **Lossless f32 Decode Path**: FLAC and f32lz4 decoders output native f32 samples — no intermediate 16-bit quantization.
+- **Lossless f32 Decode Path**: The FLAC decoder outputs native f32 samples — no intermediate 16-bit quantization.
 - **Configurable Bind Addresses**: Listeners bind loopback, IPv4, IPv6, or specific interfaces.
 - **Systemd Integration**: Native `sd-notify` support on Linux for service readiness and status reporting.
 
@@ -33,7 +33,6 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 | Feature  | Default | C dep     | Description |
 |----------|---------|-----------|-------------|
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
-| `f32lz4` | —       | none      | f32 LZ4 codec (lz4_flex) |
 | `opus`   | —       | libopus   | Opus encoding |
 | `vorbis` | —       | libvorbis | Vorbis encoding |
 | `mdns`   | ✅      | avahi     | mDNS service advertisement (binary only) |
@@ -44,11 +43,10 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 |--------|---------|-------|-----------|---------|
 | PCM    | ✅ always | none | 16/24/32-bit | zero |
 | FLAC   | ✅ default | none | 16/24-bit (decoded to f32) | 24ms (block size) |
-| f32lz4 | optional | none | 32-bit float | zero |
 | Opus   | optional | libopus | 16-bit | 20ms |
 | Vorbis | optional | libvorbis | lossy | variable |
 
-FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM or f32lz4 for anything beyond that. f32lz4 is snapcast-rs only — C++ Snapcast clients cannot decode it.
+FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond that.
 
 ## Building
 

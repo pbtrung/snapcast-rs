@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(config.http_bind_address, "0.0.0.0");
         assert_eq!(config.stream_bind_address, "0.0.0.0");
         assert_eq!(config.doc_root, None);
-        // Feature-dependent default codec: flac > f32lz4 > pcm.
+        // Feature-dependent default codec: flac > pcm.
         // With default features, `flac` is enabled.
         assert_eq!(config.server.codec, "flac");
         assert_eq!(config.server.sample_format, "48000:16:2");

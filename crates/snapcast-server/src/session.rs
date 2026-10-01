@@ -37,7 +37,7 @@ pub struct SessionRouting {
 /// Per-stream codec header, stored at stream registration time.
 #[derive(Debug, Clone)]
 pub struct StreamCodecInfo {
-    /// Codec name (e.g. "flac", "pcm", "f32lz4").
+    /// Codec name (e.g. "flac", "pcm").
     pub codec: String,
     /// Encoded codec header bytes.
     pub header: Vec<u8>,

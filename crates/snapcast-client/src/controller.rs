@@ -317,8 +317,6 @@ impl Controller {
             "flac" => Box::new(decoder::flac::create(header)?),
             "ogg" => Box::new(decoder::vorbis::create(header)?),
             "opus" => Box::new(decoder::opus::create(header)?),
-            #[cfg(feature = "f32lz4")]
-            "f32lz4" => Box::new(decoder::f32lz4::create()),
             other => bail!("unsupported codec: {other}"),
         };
 
