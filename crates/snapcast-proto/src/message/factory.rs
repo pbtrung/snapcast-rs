@@ -63,6 +63,37 @@ pub fn deserialize(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, Pr
     Ok(TypedMessage { base, payload: msg })
 }
 
+/// Split one complete frame (header + payload) off the front of `buf`.
+///
+/// Returns `Ok(None)` while `buf` holds less than a whole frame. Stream
+/// transports append every read to a buffer and call this until it yields
+/// `None`; because no bytes are consumed until a frame is complete, a read
+/// raced inside `tokio::select!` can be cancelled without losing data.
+///
+/// The declared payload size is checked against
+/// [`crate::DEFAULT_MAX_PAYLOAD_SIZE`] before waiting for the payload, so a
+/// corrupt header cannot make the caller buffer without bound. The returned
+/// header's `received` timestamp is whatever was on the wire; callers stamp it.
+pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<TypedMessage>, ProtoError> {
+    if buf.len() < BaseMessage::HEADER_SIZE {
+        return Ok(None);
+    }
+    let base = BaseMessage::read_from(&mut &buf[..BaseMessage::HEADER_SIZE])?;
+    if base.size > crate::DEFAULT_MAX_PAYLOAD_SIZE {
+        return Err(ProtoError::PayloadTooLarge {
+            len: base.size as usize,
+            max: crate::DEFAULT_MAX_PAYLOAD_SIZE as usize,
+        });
+    }
+    let frame_len = BaseMessage::HEADER_SIZE + base.size as usize;
+    if buf.len() < frame_len {
+        return Ok(None);
+    }
+    let msg = deserialize(base, &buf[BaseMessage::HEADER_SIZE..frame_len]);
+    buf.drain(..frame_len);
+    msg.map(Some)
+}
+
 /// Serialize a typed message into a complete wire frame (BaseMessage header + payload).
 ///
 /// The `base` header's `size` field will be set to the payload size.
@@ -256,5 +287,41 @@ mod tests {
         // size should now be set
         assert!(base.size > 0);
         assert_eq!(frame.len(), BaseMessage::HEADER_SIZE + base.size as usize);
+    }
+
+    #[test]
+    fn take_frame_waits_for_complete_frames() {
+        let payload = MessagePayload::Time(Time {
+            latency: Timeval { sec: 0, usec: 7 },
+        });
+        let mut base = make_base(MessageType::Time, 0);
+        let frame = serialize(&mut base, &payload).unwrap();
+        let mut two = frame.clone();
+        two.extend_from_slice(&frame);
+
+        // Byte-by-byte arrival: nothing until the first frame is complete.
+        let mut buf = Vec::new();
+        let mut frames = 0;
+        for b in two {
+            buf.push(b);
+            while let Some(msg) = take_frame(&mut buf).unwrap() {
+                assert_eq!(msg.base.msg_type, MessageType::Time);
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn take_frame_rejects_oversized_header_without_payload() {
+        let mut base = make_base(MessageType::WireChunk, 0);
+        base.size = crate::DEFAULT_MAX_PAYLOAD_SIZE + 1;
+        let mut buf = Vec::new();
+        base.write_to(&mut buf).unwrap();
+        assert!(matches!(
+            take_frame(&mut buf),
+            Err(ProtoError::PayloadTooLarge { .. })
+        ));
     }
 }

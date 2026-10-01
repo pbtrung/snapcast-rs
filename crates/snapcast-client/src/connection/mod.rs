@@ -18,44 +18,31 @@ use snapcast_proto::MessageType;
 use snapcast_proto::message::base::BaseMessage;
 use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::types::Timeval;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 /// Read a complete frame (header + payload) from an async reader.
-async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<TypedMessage> {
-    // Read 26-byte header
-    let mut header_buf = [0u8; BaseMessage::HEADER_SIZE];
-    reader
-        .read_exact(&mut header_buf)
-        .await
-        .context("reading base message header")?;
-
-    let mut base = BaseMessage::read_from(&mut &header_buf[..])
-        .map_err(|e| anyhow::anyhow!("parsing header: {e}"))?;
-
-    // Stamp received time using steady clock (matching C++ steadytimeofday)
-    base.received = steady_time_of_day();
-    ensure_payload_size(base.size)?;
-
-    // Read payload
-    let mut payload_buf = vec![0u8; base.size as usize];
-    if !payload_buf.is_empty() {
-        reader
-            .read_exact(&mut payload_buf)
-            .await
-            .context("reading payload")?;
+///
+/// Bytes are accumulated in `buf` across calls and only consumed once a whole
+/// frame has arrived, so this is cancel-safe inside `tokio::select!`. Bytes
+/// past the returned frame stay in `buf` for the next call.
+async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<TypedMessage> {
+    loop {
+        if let Some(mut msg) =
+            factory::take_frame(buf).map_err(|e| anyhow::anyhow!("parsing frame: {e}"))?
+        {
+            // Stamp received time using steady clock (matching C++ steadytimeofday)
+            msg.base.received = steady_time_of_day();
+            return Ok(msg);
+        }
+        buf.reserve(8192);
+        let n = reader.read_buf(buf).await.context("reading frame")?;
+        anyhow::ensure!(n > 0, "connection closed by server");
     }
-
-    factory::deserialize(base, &payload_buf).map_err(|e| anyhow::anyhow!("deserializing: {e}"))
-}
-
-pub(crate) fn ensure_payload_size(size: u32) -> Result<()> {
-    anyhow::ensure!(
-        size <= snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE,
-        "payload too large: {size} bytes"
-    );
-    Ok(())
 }
 
 /// Write a complete frame (header + payload) to an async writer.
@@ -78,6 +65,8 @@ struct PendingRequest {
 /// TCP connection to a snapserver.
 pub struct TcpConnection {
     stream: Option<TcpStream>,
+    /// Received bytes not yet assembled into a complete frame.
+    read_buf: Vec<u8>,
     host: String,
     port: u16,
     pending: HashMap<u16, PendingRequest>,
@@ -158,6 +147,7 @@ impl TcpConnection {
     pub fn new(host: &str, port: u16) -> Self {
         Self {
             stream: None,
+            read_buf: Vec::new(),
             host: host.to_string(),
             port,
             pending: HashMap::new(),
@@ -172,6 +162,7 @@ impl TcpConnection {
             .await
             .with_context(|| format!("connecting to {addr}"))?;
         self.stream = Some(stream);
+        self.read_buf.clear();
         self.pending.clear();
         self.next_id = 1;
         Ok(())
@@ -237,8 +228,8 @@ impl TcpConnection {
     /// deliver it to the waiting caller and receive again.
     pub async fn recv(&mut self) -> Result<TypedMessage> {
         loop {
-            let stream = self.stream_mut()?;
-            let msg = read_frame(stream).await?;
+            let stream = self.stream.as_mut().context("not connected")?;
+            let msg = read_frame(stream, &mut self.read_buf).await?;
 
             if msg.base.refers_to != 0
                 && let Some(pending) = self.pending.remove(&msg.base.refers_to)
@@ -303,7 +294,8 @@ mod tests {
 
         // Read back
         let mut cursor = std::io::Cursor::new(&buf);
-        let msg = read_frame(&mut cursor).await.unwrap();
+        let mut rbuf = Vec::new();
+        let msg = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg.base.msg_type, MessageType::Time);
         assert_eq!(msg.base.id, 42);
         match msg.payload {
@@ -334,7 +326,9 @@ mod tests {
         write_frame(&mut buf, &mut base, &payload).await.unwrap();
 
         let mut cursor = std::io::Cursor::new(&buf);
-        let msg = read_frame(&mut cursor).await.unwrap();
+
+        let mut rbuf = Vec::new();
+        let msg = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg.base.refers_to, 7);
         match msg.payload {
             MessagePayload::Error(e) => {
@@ -373,9 +367,10 @@ mod tests {
 
         // Read both back
         let mut cursor = std::io::Cursor::new(&buf);
-        let msg1 = read_frame(&mut cursor).await.unwrap();
+        let mut rbuf = Vec::new();
+        let msg1 = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg1.base.msg_type, MessageType::Time);
-        let msg2 = read_frame(&mut cursor).await.unwrap();
+        let msg2 = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg2.base.msg_type, MessageType::ClientInfo);
     }
 
@@ -385,12 +380,6 @@ mod tests {
         assert!(conn.stream.is_none());
         assert_eq!(conn.host, "localhost");
         assert_eq!(conn.port, 1704);
-    }
-
-    #[test]
-    fn rejects_oversized_payload() {
-        let too_large = snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE + 1;
-        assert!(ensure_payload_size(too_large).is_err());
     }
 
     #[test]
@@ -416,14 +405,16 @@ mod tests {
     async fn read_frame_empty_reader_errors() {
         // Header read_exact fails immediately on an empty reader.
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-        assert!(read_frame(&mut cursor).await.is_err());
+        let mut rbuf = Vec::new();
+        assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
     #[tokio::test]
     async fn read_frame_truncated_header_errors() {
         // Fewer than HEADER_SIZE bytes → header read_exact fails.
         let mut cursor = std::io::Cursor::new(vec![0u8; BaseMessage::HEADER_SIZE - 1]);
-        assert!(read_frame(&mut cursor).await.is_err());
+        let mut rbuf = Vec::new();
+        assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
     #[tokio::test]
@@ -445,7 +436,8 @@ mod tests {
         write_frame(&mut buf, &mut base, &payload).await.unwrap();
         buf.truncate(buf.len() - 1);
         let mut cursor = std::io::Cursor::new(buf);
-        assert!(read_frame(&mut cursor).await.is_err());
+        let mut rbuf = Vec::new();
+        assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
     // ---- TcpConnection "not connected" paths ----

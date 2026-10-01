@@ -12,7 +12,7 @@ use snapcast_proto::message::server_settings::ServerSettings;
 use snapcast_proto::message::time::Time;
 use snapcast_proto::message::wire_chunk::WireChunk;
 use snapcast_proto::types::Timeval;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
@@ -257,7 +257,7 @@ impl SessionServer {
 // ── Client handler ────────────────────────────────────────────
 
 async fn handle_client<S>(
-    mut stream: S,
+    stream: S,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     ctx: &SessionContext,
     event_tx: mpsc::Sender<ServerEvent>,
@@ -265,7 +265,9 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let hello_msg = read_frame_from(&mut stream).await?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut frames = FrameReader::new(reader);
+    let hello_msg = frames.next().await?;
     let hello_id = hello_msg.base.id;
     let hello = match hello_msg.payload {
         MessagePayload::Hello(h) => h,
@@ -286,7 +288,7 @@ where
     }
 
     if let Some(validator) = &ctx.auth {
-        validate_auth(validator.as_ref(), &hello, &mut stream, &client_id).await?;
+        validate_auth(validator.as_ref(), &hello, &mut writer, &client_id).await?;
     }
 
     // Register channels
@@ -341,8 +343,7 @@ where
         &MessagePayload::ServerSettings(client_settings),
         hello_id,
     )?;
-    stream
-        .write_all(&ss_frame)
+    write_frame(&mut writer, &ss_frame)
         .await
         .context("write server settings")?;
 
@@ -350,7 +351,7 @@ where
     match ctx.codec_header_for(&initial_stream_id).await {
         Some(info) => {
             send_msg(
-                &mut stream,
+                &mut writer,
                 MessageType::CodecHeader,
                 &MessagePayload::CodecHeader(CodecHeader {
                     codec: info.codec,
@@ -366,7 +367,8 @@ where
 
     // Main loop
     let result = session_loop(SessionLoop {
-        stream,
+        frames,
+        writer,
         chunk_rx,
         settings_rx,
         routing_rx,
@@ -395,7 +397,8 @@ where
 // ── Session loop ──
 
 struct SessionLoop<'a, S> {
-    stream: S,
+    frames: FrameReader<ReadHalf<S>>,
+    writer: WriteHalf<S>,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     settings_rx: mpsc::Receiver<ClientSettingsUpdate>,
     routing_rx: watch::Receiver<SessionRouting>,
@@ -409,7 +412,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let SessionLoop {
-        stream,
+        mut frames,
+        mut writer,
         mut chunk_rx,
         mut settings_rx,
         mut routing_rx,
@@ -417,7 +421,6 @@ where
         client_id,
         ctx,
     } = args;
-    let (mut reader, mut writer) = tokio::io::split(stream);
     let mut routing = routing_rx.borrow().clone();
 
     loop {
@@ -452,12 +455,12 @@ where
                             }),
                             0,
                         )?;
-                        writer.write_all(&frame).await.context("write codec header")?;
+                        write_frame(&mut writer, &frame).await.context("write codec header")?;
                     }
                 }
                 routing = new;
             }
-            msg = read_frame_from(&mut reader) => {
+            msg = frames.next() => {
                 let msg = msg?;
                 match msg.payload {
                     MessagePayload::Time(_t) => {
@@ -468,7 +471,7 @@ where
                             &MessagePayload::Time(Time { latency }),
                             msg.base.id,
                         )?;
-                        writer.write_all(&frame).await.context("write time")?;
+                        write_frame(&mut writer, &frame).await.context("write time")?;
                     }
                     MessagePayload::ClientInfo(info) => {
                         {
@@ -513,16 +516,16 @@ fn should_send_chunk(
     true
 }
 
-async fn write_chunk<W: AsyncWriteExt + Unpin>(writer: &mut W, chunk: WireChunkData) -> Result<()> {
+async fn write_chunk<W: AsyncWrite + Unpin>(writer: &mut W, chunk: WireChunkData) -> Result<()> {
     let wc = WireChunk {
         timestamp: Timeval::from_usec(chunk.timestamp_usec),
         payload: chunk.data,
     };
     let frame = serialize_msg(MessageType::WireChunk, &MessagePayload::WireChunk(wc), 0)?;
-    writer.write_all(&frame).await.context("write chunk")
+    write_frame(writer, &frame).await.context("write chunk")
 }
 
-async fn write_settings<W: AsyncWriteExt + Unpin>(
+async fn write_settings<W: AsyncWrite + Unpin>(
     writer: &mut W,
     update: ClientSettingsUpdate,
 ) -> Result<()> {
@@ -537,7 +540,9 @@ async fn write_settings<W: AsyncWriteExt + Unpin>(
         &MessagePayload::ServerSettings(ss),
         0,
     )?;
-    writer.write_all(&frame).await.context("write settings")?;
+    write_frame(writer, &frame)
+        .await
+        .context("write settings")?;
     tracing::debug!(
         volume = update.volume,
         latency = update.latency,
@@ -610,31 +615,53 @@ async fn send_msg<W: AsyncWrite + Unpin>(
     payload: &MessagePayload,
 ) -> Result<()> {
     let frame = serialize_msg(msg_type, payload, 0)?;
-    stream.write_all(&frame).await.context("write message")
+    write_frame(stream, &frame).await.context("write message")
 }
 
-async fn read_frame_from<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<TypedMessage> {
-    let mut header_buf = [0u8; BaseMessage::HEADER_SIZE];
-    reader
-        .read_exact(&mut header_buf)
-        .await
-        .context("read header")?;
-    let mut base =
-        BaseMessage::read_from(&mut &header_buf[..]).map_err(|e| anyhow::anyhow!("parse: {e}"))?;
-    base.received = now_timeval();
-    anyhow::ensure!(
-        base.size <= snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE,
-        "payload too large: {} bytes",
-        base.size
-    );
-    let mut payload_buf = vec![0u8; base.size as usize];
-    if !payload_buf.is_empty() {
-        reader
-            .read_exact(&mut payload_buf)
-            .await
-            .context("read payload")?;
+/// Write one complete frame and flush it.
+///
+/// Message-oriented transports (WebSocket adapters) send a message per write
+/// and only transmit on flush, so every frame is flushed individually.
+async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> std::io::Result<()> {
+    writer.write_all(frame).await?;
+    writer.flush().await
+}
+
+/// Cancel-safe reader of whole frames from a byte stream.
+///
+/// Incoming bytes are buffered until a complete frame is available, so
+/// `next()` can lose a `tokio::select!` race without dropping a partially
+/// read frame.
+struct FrameReader<R> {
+    reader: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+        }
     }
-    factory::deserialize(base, &payload_buf).map_err(|e| anyhow::anyhow!("deserialize: {e}"))
+
+    async fn next(&mut self) -> Result<TypedMessage> {
+        loop {
+            if let Some(mut msg) =
+                factory::take_frame(&mut self.buf).map_err(|e| anyhow::anyhow!("parse: {e}"))?
+            {
+                msg.base.received = now_timeval();
+                return Ok(msg);
+            }
+            self.buf.reserve(8192);
+            let n = self
+                .reader
+                .read_buf(&mut self.buf)
+                .await
+                .context("read frame")?;
+            anyhow::ensure!(n > 0, "connection closed");
+        }
+    }
 }
 
 fn now_timeval() -> Timeval {
@@ -695,9 +722,9 @@ mod tests {
         }
         .to_bytes()
         .unwrap();
-        let mut cursor = std::io::Cursor::new(header);
+        let mut frames = FrameReader::new(std::io::Cursor::new(header));
 
-        let err = read_frame_from(&mut cursor).await.unwrap_err();
+        let err = frames.next().await.unwrap_err();
         assert!(err.to_string().contains("payload too large"));
     }
 

@@ -49,22 +49,18 @@ pub(super) async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
             .context("WebSocket error")?;
         match msg {
             Message::Binary(data) => {
-                if data.len() < BaseMessage::HEADER_SIZE {
-                    continue;
-                }
-                let mut base = BaseMessage::read_from(&mut &data[..BaseMessage::HEADER_SIZE])
-                    .map_err(|e| anyhow::anyhow!("parse header: {e}"))?;
-                base.received = super::steady_time_of_day();
-                super::ensure_payload_size(base.size)?;
-                let payload = &data[BaseMessage::HEADER_SIZE..];
+                // Each binary message carries exactly one complete frame.
+                let mut buf = data.to_vec();
+                let mut msg = factory::take_frame(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("parse frame: {e}"))?
+                    .context("incomplete frame in WebSocket message")?;
                 anyhow::ensure!(
-                    payload.len() == base.size as usize,
-                    "payload size mismatch: header={}, actual={}",
-                    base.size,
-                    payload.len()
+                    buf.is_empty(),
+                    "{} trailing bytes after frame in WebSocket message",
+                    buf.len()
                 );
-                return factory::deserialize(base, payload)
-                    .map_err(|e| anyhow::anyhow!("deserialize: {e}"));
+                msg.base.received = super::steady_time_of_day();
+                return Ok(msg);
             }
             Message::Close(_) => anyhow::bail!("WebSocket closed"),
             _ => continue, // skip text/ping/pong
