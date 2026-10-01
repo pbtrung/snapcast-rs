@@ -1,9 +1,9 @@
 //! Wave-3 property/fuzz test: codec-header parser robustness.
 //!
-//! For every default-reachable decoder (PCM, FLAC, Vorbis, Opus), feed arbitrary
+//! For every default-reachable decoder (PCM, FLAC, Opus), feed arbitrary
 //! `CodecHeader.payload` bytes — any length, truncated, garbage, or crafted to look
 //! like a real header — into the untrusted codec-header parsing path
-//! (RIFF/WAVE, fLaC/STREAMINFO, OggS/Vorbis, Opus pseudo-header / OpusHead).
+//! (RIFF/WAVE, fLaC/STREAMINFO, Opus pseudo-header / OpusHead).
 //!
 //! The single invariant under test: `create()` / `set_header()` must NEVER panic.
 //! It must return `Ok` or `Err` for any input. A genuine panic/overflow here would be
@@ -11,8 +11,8 @@
 //! network from an untrusted server), so we deliberately do NOT wrap anything in
 //! `should_panic` or narrow the input domain to dodge such a case.
 //!
-//! Uses DEFAULT features only. The `flac`, `opus`, and `vorbis` decoder modules are
-//! declared unconditionally in `decoder/mod.rs`, so all four parsers are reachable.
+//! Uses DEFAULT features only. The `flac` and `opus` decoder modules are declared
+//! unconditionally in `decoder/mod.rs`, so all three parsers are reachable.
 
 use proptest::prelude::*;
 
@@ -89,20 +89,6 @@ proptest! {
     fn prop_flac_create_magic_prefixed_never_panics(payload in arb_payload_with_prefix(b"fLaC")) {
         let h = header("flac", payload);
         let _ = snapcast_client::decoder::flac::create(&h);
-    }
-
-    // ---- Vorbis: OggS page + Vorbis id header via decoder::vorbis::create ----
-
-    #[test]
-    fn prop_vorbis_create_never_panics(payload in arb_payload()) {
-        let h = header("ogg", payload);
-        let _ = snapcast_client::decoder::vorbis::create(&h);
-    }
-
-    #[test]
-    fn prop_vorbis_create_oggs_prefixed_never_panics(payload in arb_payload_with_prefix(b"OggS")) {
-        let h = header("ogg", payload);
-        let _ = snapcast_client::decoder::vorbis::create(&h);
     }
 
     // ---- Opus: Opus pseudo-header / OpusHead via decoder::opus::create ----

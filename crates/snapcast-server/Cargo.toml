@@ -28,15 +28,12 @@ anyhow = { workspace = true }
 flacenc = { version = "0.5", default-features = false, optional = true }
 audiopus = { workspace = true, optional = true }
 audiopus_sys = { version = "0.1.8", optional = true, features = ["dynamic"] }
-vorbis_rs = { version = "0.5", optional = true }
-ogg = { version = "0.9", optional = true }
 uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = ["flac"]
 flac = ["dep:flacenc"]
 opus = ["dep:audiopus", "dep:audiopus_sys"]
-vorbis = ["dep:vorbis_rs", "dep:ogg"]
 
 [dev-dependencies]
 

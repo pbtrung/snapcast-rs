@@ -266,7 +266,6 @@ proptest! {
         codec in prop_oneof![
             Just("flac".to_string()),
             Just("opus".to_string()),
-            Just("ogg".to_string()),
             Just("pcm".to_string()),
             "[a-zA-Z0-9]{0,16}",
         ],

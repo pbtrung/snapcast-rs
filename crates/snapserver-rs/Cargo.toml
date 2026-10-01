@@ -33,5 +33,4 @@ astro-dnssd = { version = "0.3", optional = true }
 default = ["snapcast-server/default", "mdns"]
 flac = ["snapcast-server/flac"]
 opus = ["snapcast-server/opus"]
-vorbis = ["snapcast-server/vorbis"]
 mdns = ["dep:astro-dnssd"]

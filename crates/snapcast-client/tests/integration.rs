@@ -176,7 +176,7 @@ async fn receives_codec_header() {
                     ch.codec,
                     ch.payload.len()
                 );
-                assert!(["pcm", "flac", "ogg", "opus"].contains(&ch.codec.as_str()));
+                assert!(["pcm", "flac", "opus"].contains(&ch.codec.as_str()));
                 assert!(!ch.payload.is_empty());
                 got_codec = true;
                 break;

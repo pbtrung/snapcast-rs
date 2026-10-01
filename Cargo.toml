@@ -56,7 +56,7 @@ rustls-native-certs = "0.8"
 futures-util = "0.3"
 
 # Audio decoding
-symphonia = { version = "0.5", features = ["flac", "pcm", "ogg", "vorbis"] }
+symphonia = { version = "0.5", features = ["flac", "pcm"] }
 audiopus = "0.2"
 
 # Audio resampling

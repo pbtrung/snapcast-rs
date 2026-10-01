@@ -450,7 +450,7 @@ impl Default for ServerConfig {
 /// Per-stream configuration. If `None`, inherits from [`ServerConfig`].
 #[derive(Debug, Clone, Default)]
 pub struct StreamConfig {
-    /// Codec override (e.g. "flac", "opus", "ogg", "pcm").
+    /// Codec override (e.g. "flac", "opus", "pcm").
     pub codec: Option<String>,
     /// Sample format override (e.g. "48000:16:2").
     pub sample_format: Option<String>,

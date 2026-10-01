@@ -34,7 +34,6 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 |----------|---------|-----------|-------------|
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
 | `opus`   | —       | libopus   | Opus encoding |
-| `vorbis` | —       | libvorbis | Vorbis encoding |
 | `mdns`   | ✅      | avahi     | mDNS service advertisement (binary only) |
 
 ## Codecs
@@ -44,7 +43,6 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 | PCM    | ✅ always | none | 16/24/32-bit | zero |
 | FLAC   | ✅ default | none | 16/24-bit (decoded to f32) | 24ms (block size) |
 | Opus   | optional | libopus | 16-bit | 20ms |
-| Vorbis | optional | libvorbis | lossy | variable |
 
 FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond that.
 
@@ -56,16 +54,16 @@ On Arch Linux:
 
 ```bash
 sudo pacman -S base-devel pkgconf alsa-lib avahi
-# only for the optional codecs:
-sudo pacman -S opus libvorbis
+# only for the optional Opus codec:
+sudo pacman -S opus
 ```
 
 On Debian/Ubuntu:
 
 ```bash
 sudo apt install build-essential pkg-config libasound2-dev libavahi-compat-libdnssd-dev
-# only for the optional codecs:
-sudo apt install libopus-dev libvorbis-dev
+# only for the optional Opus codec:
+sudo apt install libopus-dev
 ```
 
 Then build from source:
@@ -74,7 +72,7 @@ Then build from source:
 git clone https://github.com/pbtrung/snapcast-rs.git
 cd snapcast-rs
 cargo build --release                              # default: flac + mdns
-cargo build --release --features opus,vorbis      # + native codecs
+cargo build --release -p snapserver-rs --features opus  # + Opus
 ```
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.

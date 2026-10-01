@@ -3,7 +3,7 @@
 //! Starts the server with an explicit codec and asserts that the client's
 //! `StreamStarted` event reports the codec name the server was configured with,
 //! plus a sane sample format. Exercises both default-available codecs: `flac`
-//! and `pcm`. Opus/vorbis are intentionally excluded because they are feature-
+//! and `pcm`. Opus is intentionally excluded because it is feature-
 //! gated and may not be compiled in.
 
 use snapcast_client::{ClientConfig, ClientEvent, SnapClient};

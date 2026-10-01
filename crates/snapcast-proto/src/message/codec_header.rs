@@ -11,7 +11,7 @@ use crate::message::wire;
 /// Codec header payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecHeader {
-    /// Codec name: "pcm", "flac", "ogg", "opus", or "null".
+    /// Codec name: "pcm", "flac", "opus", or "null".
     pub codec: String,
     /// Codec-specific header bytes (e.g. FLAC stream header, RIFF header).
     pub payload: Vec<u8>,

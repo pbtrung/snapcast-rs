@@ -38,7 +38,6 @@ fn convert_filter(filter: &str) -> String {
                     }
                     "flac" | "flacdecoder" => "snapclient_rs::decoder::flac",
                     "opus" | "opusdecoder" => "snapclient_rs::decoder::opus",
-                    "ogg" | "oggdecoder" => "snapclient_rs::decoder::vorbis",
                     "stats" | "latency" => "snapclient_rs::stream",
                     other => other,
                 };

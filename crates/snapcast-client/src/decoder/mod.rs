@@ -2,7 +2,6 @@
 
 pub mod flac;
 pub mod opus;
-pub mod vorbis;
 
 use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;

@@ -1,12 +1,10 @@
-//! Audio encoders — PCM, FLAC, Opus, Vorbis.
+//! Audio encoders — PCM, FLAC, Opus.
 
 #[cfg(feature = "flac")]
 pub mod flac;
 #[cfg(feature = "opus")]
 pub mod opus;
 pub mod pcm;
-#[cfg(feature = "vorbis")]
-pub mod vorbis;
 
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
@@ -24,7 +22,7 @@ pub(crate) struct EncodedChunk {
 /// Each encoder accepts [`AudioData`] (F32 or Pcm) and handles conversion
 /// internally. This keeps format-specific logic in the encoder, not the caller.
 pub(crate) trait Encoder: Send {
-    /// Codec name (e.g. "flac", "pcm", "opus", "ogg").
+    /// Codec name (e.g. "flac", "pcm", "opus").
     fn name(&self) -> &str;
 
     /// Codec header bytes sent to clients before audio data.
@@ -37,7 +35,7 @@ pub(crate) trait Encoder: Send {
 /// Configuration for creating an encoder.
 #[derive(Debug, Clone)]
 pub(crate) struct EncoderConfig {
-    /// Codec name: "pcm", "flac", "opus", "ogg". May carry inline options
+    /// Codec name: "pcm", "flac", "opus". May carry inline options
     /// after the first `:` (e.g. `"opus:BITRATE:256000,COMPLEXITY:10"`), as
     /// in the C++ snapserver `codec` setting.
     pub codec: String,
@@ -67,8 +65,6 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         snapcast_proto::CODEC_FLAC => Ok(Box::new(flac::FlacEncoder::new(format, options)?)),
         #[cfg(feature = "opus")]
         snapcast_proto::CODEC_OPUS => Ok(Box::new(opus::OpusEncoder::new(format, options)?)),
-        #[cfg(feature = "vorbis")]
-        snapcast_proto::CODEC_OGG => Ok(Box::new(vorbis::VorbisEncoder::new(format, options)?)),
         other => anyhow::bail!("unsupported codec: {other} (check enabled features)"),
     }
 }

@@ -315,7 +315,6 @@ impl Controller {
         let mut dec: Box<dyn Decoder> = match header.codec.as_str() {
             "pcm" => Box::new(PcmDecoder::new()),
             "flac" => Box::new(decoder::flac::create(header)?),
-            "ogg" => Box::new(decoder::vorbis::create(header)?),
             "opus" => Box::new(decoder::opus::create(header)?),
             other => bail!("unsupported codec: {other}"),
         };

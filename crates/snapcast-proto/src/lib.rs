@@ -73,5 +73,3 @@ pub const CODEC_PCM: &str = "pcm";
 pub const CODEC_FLAC: &str = "flac";
 /// Opus codec name.
 pub const CODEC_OPUS: &str = "opus";
-/// Ogg/Vorbis codec name as used on the Snapcast wire.
-pub const CODEC_OGG: &str = "ogg";

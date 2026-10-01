@@ -63,7 +63,7 @@ struct Cli {
     #[arg(long)]
     buffer: Option<u32>,
 
-    /// Default codec: pcm, flac, opus, ogg
+    /// Default codec: pcm, flac, opus
     #[arg(long)]
     codec: Option<String>,
 
