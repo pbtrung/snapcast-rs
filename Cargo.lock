@@ -2358,6 +2358,7 @@ dependencies = [
  "clap",
  "futures-util",
  "jsonwebtoken",
+ "libc",
  "rust-ini",
  "serde",
  "serde_json",

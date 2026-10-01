@@ -81,7 +81,7 @@ Run the checks with `make check` (fmt, clippy, tests).
 
 ```bash
 # Server
-snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"
+snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"   # creates the FIFO if missing (&mode=read to only open it)
 snapserver-rs --codec flac
 snapserver-rs --codec "opus:BITRATE:256000,COMPLEXITY:10"  # needs the opus feature
 snapserver-rs --stream-bind-address 127.0.0.1             # bind audio listener to loopback

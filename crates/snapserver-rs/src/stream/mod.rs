@@ -41,7 +41,13 @@ pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
     pace: Option<Duration>,
 ) -> PumpEnd {
     let mut buf = vec![0u8; chunk_bytes];
-    let mut interval = pace.map(tokio::time::interval);
+    let mut interval = pace.map(|period| {
+        let mut iv = tokio::time::interval(period);
+        // After a stall (e.g. a writer pausing), continue at realtime
+        // instead of bursting the missed reads.
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        iv
+    });
     loop {
         if let Some(iv) = interval.as_mut() {
             iv.tick().await;
