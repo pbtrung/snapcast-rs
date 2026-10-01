@@ -50,7 +50,17 @@ FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond t
 
 ## Building
 
-Requires Rust **1.94.1+**. On Debian/Ubuntu, install the system libraries first:
+Requires Rust **1.94.1+**. Install the system libraries first.
+
+On Arch Linux:
+
+```bash
+sudo pacman -S base-devel pkgconf alsa-lib avahi
+# only for the optional codecs:
+sudo pacman -S opus libvorbis
+```
+
+On Debian/Ubuntu:
 
 ```bash
 sudo apt install build-essential pkg-config libasound2-dev libavahi-compat-libdnssd-dev
@@ -69,7 +79,7 @@ cargo build --release --features opus,vorbis      # + native codecs
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.
 
-Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+ and the runtime libraries `libasound2` (client) and `libavahi-compat-libdnssd1` (server).
+Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+. On Arch Linux, the server needs `avahi` (`sudo pacman -S avahi`) and the client needs `alsa-lib`.
 
 Run the checks with `make check` (fmt, clippy, tests).
 
