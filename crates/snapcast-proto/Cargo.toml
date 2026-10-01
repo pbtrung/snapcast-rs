@@ -20,9 +20,6 @@ thiserror = { workspace = true }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 libc = { workspace = true }
 
-[features]
-custom-protocol = []
-
 [dev-dependencies]
 proptest = "1"
 

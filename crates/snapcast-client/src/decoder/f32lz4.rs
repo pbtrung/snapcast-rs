@@ -9,8 +9,6 @@
 
 use anyhow::{Result, bail};
 use snapcast_proto::SampleFormat;
-#[cfg(feature = "encryption")]
-use snapcast_proto::f32lz4::{F32LZ4_ENC_HEADER_LEN, F32LZ4_ENC_MARKER};
 use snapcast_proto::f32lz4::{F32LZ4_HEADER_LEN, F32LZ4_MAGIC};
 use snapcast_proto::message::codec_header::CodecHeader;
 
@@ -20,10 +18,6 @@ use crate::stream::SampleEncoding;
 /// F32 LZ4 decoder.
 pub struct F32Lz4Decoder {
     sample_format: SampleFormat,
-    #[cfg(feature = "encryption")]
-    decryptor: Option<crate::crypto::ChunkDecryptor>,
-    #[cfg(feature = "encryption")]
-    encryption_psk: Option<String>,
 }
 
 impl Decoder for F32Lz4Decoder {
@@ -39,22 +33,6 @@ impl Decoder for F32Lz4Decoder {
         let bits = u16::from_le_bytes(header.payload[10..12].try_into().unwrap());
         self.sample_format = SampleFormat::new(rate, bits, channels);
 
-        // Check for encryption marker after the 12-byte base header
-        #[cfg(feature = "encryption")]
-        if header.payload.len() >= F32LZ4_ENC_HEADER_LEN
-            && &header.payload[F32LZ4_HEADER_LEN..F32LZ4_HEADER_LEN + F32LZ4_ENC_MARKER.len()]
-                == F32LZ4_ENC_MARKER
-        {
-            let salt =
-                &header.payload[F32LZ4_HEADER_LEN + F32LZ4_ENC_MARKER.len()..F32LZ4_ENC_HEADER_LEN];
-            if let Some(ref psk) = self.encryption_psk {
-                self.decryptor = Some(crate::crypto::ChunkDecryptor::new(psk, salt));
-                tracing::info!("F32LZ4 decryption enabled");
-            } else {
-                bail!("Server requires encryption but no encryption_psk configured");
-            }
-        }
-
         tracing::info!(rate, channels, bits, "F32LZ4 decoder initialized");
         Ok(self.sample_format)
     }
@@ -62,18 +40,6 @@ impl Decoder for F32Lz4Decoder {
     fn decode(&mut self, data: &mut Vec<u8>) -> Result<bool> {
         if data.is_empty() {
             return Ok(false);
-        }
-
-        // Decrypt if encryption is active
-        #[cfg(feature = "encryption")]
-        if let Some(ref dec) = self.decryptor {
-            match dec.decrypt(data) {
-                Ok(decrypted) => *data = decrypted,
-                Err(e) => {
-                    tracing::warn!(error = %e, "F32LZ4 decryption failed");
-                    return Ok(false);
-                }
-            }
         }
 
         match lz4_flex::decompress_size_prepended(data) {
@@ -99,17 +65,6 @@ impl Decoder for F32Lz4Decoder {
 }
 
 /// Create an F32Lz4Decoder.
-#[cfg(feature = "encryption")]
-pub fn create(encryption_psk: Option<&str>) -> F32Lz4Decoder {
-    F32Lz4Decoder {
-        sample_format: SampleFormat::default(),
-        decryptor: None,
-        encryption_psk: encryption_psk.map(String::from),
-    }
-}
-
-/// Create an F32Lz4Decoder.
-#[cfg(not(feature = "encryption"))]
 pub fn create() -> F32Lz4Decoder {
     F32Lz4Decoder {
         sample_format: SampleFormat::default(),
@@ -130,9 +85,6 @@ mod tests {
         let compressed = lz4_flex::compress_prepend_size(&f32_bytes);
 
         // Decode
-        #[cfg(feature = "encryption")]
-        let mut dec = create(None);
-        #[cfg(not(feature = "encryption"))]
         let mut dec = create();
         let header = CodecHeader {
             codec: "f32lz4".into(),

@@ -12,7 +12,3 @@ snapcast-server = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
-
-[features]
-custom-protocol = ["snapcast-proto/custom-protocol", "snapcast-client/custom-protocol", "snapcast-server/custom-protocol"]
-encryption = ["snapcast-client/encryption", "snapcast-server/encryption"]

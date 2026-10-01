@@ -35,8 +35,6 @@ f32lz4 = ["snapcast-client/f32lz4"]
 websocket = ["snapcast-client/websocket"]
 tls = ["snapcast-client/tls"]
 resampler = ["snapcast-client/resampler"]
-custom-protocol = ["snapcast-client/custom-protocol"]
-encryption = ["snapcast-client/encryption"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.7"

@@ -68,8 +68,6 @@ struct SessionContext {
     client_filter: Option<Arc<dyn crate::auth::ClientFilter>>,
     send_audio_to_muted: bool,
     settings_senders: Mutex<HashMap<String, mpsc::Sender<ClientSettingsUpdate>>>,
-    #[cfg(feature = "custom-protocol")]
-    custom_senders: Mutex<HashMap<String, mpsc::Sender<CustomOutbound>>>,
     routing_senders: Mutex<HashMap<String, watch::Sender<SessionRouting>>>,
     codec_headers: Mutex<HashMap<String, StreamCodecInfo>>,
     shared_state: Arc<tokio::sync::Mutex<crate::state::ServerState>>,
@@ -167,16 +165,6 @@ pub(crate) struct SessionServerConfig {
     pub send_audio_to_muted: bool,
 }
 
-/// Outbound custom message to a specific client.
-#[cfg(feature = "custom-protocol")]
-#[derive(Debug, Clone)]
-pub struct CustomOutbound {
-    /// Message type ID (9+).
-    pub type_id: u16,
-    /// Raw payload.
-    pub payload: Vec<u8>,
-}
-
 impl SessionServer {
     /// Create a new session server.
     pub(crate) fn new(config: SessionServerConfig) -> Self {
@@ -187,8 +175,6 @@ impl SessionServer {
                 client_filter: config.client_filter,
                 send_audio_to_muted: config.send_audio_to_muted,
                 settings_senders: Mutex::new(HashMap::new()),
-                #[cfg(feature = "custom-protocol")]
-                custom_senders: Mutex::new(HashMap::new()),
                 routing_senders: Mutex::new(HashMap::new()),
                 codec_headers: Mutex::new(HashMap::new()),
                 shared_state: config.shared_state,
@@ -266,18 +252,6 @@ impl SessionServer {
             });
         }
     }
-
-    /// Send a custom binary protocol message to a specific client.
-    #[cfg(feature = "custom-protocol")]
-    pub async fn send_custom(&self, client_id: &str, type_id: u16, payload: Vec<u8>) {
-        let tx = {
-            let senders = self.ctx.custom_senders.lock().await;
-            senders.get(client_id).cloned()
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(CustomOutbound { type_id, payload }).await;
-        }
-    }
 }
 
 // ── Client handler ────────────────────────────────────────────
@@ -317,18 +291,11 @@ where
 
     // Register channels
     let (settings_tx, settings_rx) = mpsc::channel(16);
-    #[cfg(feature = "custom-protocol")]
-    let (custom_tx, custom_rx) = mpsc::channel(64);
 
     ctx.settings_senders
         .lock()
         .await
         .insert(client_id.clone(), settings_tx);
-    #[cfg(feature = "custom-protocol")]
-    ctx.custom_senders
-        .lock()
-        .await
-        .insert(client_id.clone(), custom_tx);
 
     // Register in state + build initial routing
     let initial_stream_id;
@@ -403,8 +370,6 @@ where
         chunk_rx,
         settings_rx,
         routing_rx,
-        #[cfg(feature = "custom-protocol")]
-        custom_rx,
         event_tx: event_tx.clone(),
         client_id: client_id.clone(),
         ctx,
@@ -414,8 +379,6 @@ where
     // Cleanup
     ctx.settings_senders.lock().await.remove(&client_id);
     ctx.routing_senders.lock().await.remove(&client_id);
-    #[cfg(feature = "custom-protocol")]
-    ctx.custom_senders.lock().await.remove(&client_id);
     {
         let mut s = ctx.shared_state.lock().await;
         if let Some(c) = s.clients.get_mut(&client_id) {
@@ -429,20 +392,13 @@ where
     result
 }
 
-// ── Session loop (single function, cfg on custom-protocol arms) ──
-//
-// Custom-protocol outbound messages are drained via `try_recv` before each
-// `select!` iteration because `tokio::select!` doesn't support `#[cfg]` on arms.
-// This adds up to one select cycle of latency (~20ms at 48kHz) for custom
-// messages, which is acceptable for low-frequency control traffic.
+// ── Session loop ──
 
 struct SessionLoop<'a, S> {
     stream: S,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     settings_rx: mpsc::Receiver<ClientSettingsUpdate>,
     routing_rx: watch::Receiver<SessionRouting>,
-    #[cfg(feature = "custom-protocol")]
-    custom_rx: mpsc::Receiver<CustomOutbound>,
     event_tx: mpsc::Sender<ServerEvent>,
     client_id: String,
     ctx: &'a SessionContext,
@@ -457,8 +413,6 @@ where
         mut chunk_rx,
         mut settings_rx,
         mut routing_rx,
-        #[cfg(feature = "custom-protocol")]
-        mut custom_rx,
         event_tx,
         client_id,
         ctx,
@@ -467,20 +421,6 @@ where
     let mut routing = routing_rx.borrow().clone();
 
     loop {
-        // Drain pending custom outbound before blocking on select.
-        // tokio::select! doesn't support #[cfg] on arms, so custom messages
-        // are drained via try_recv. This adds up to one select cycle of latency
-        // (~20ms at 48kHz) which is fine for low-frequency control messages.
-        #[cfg(feature = "custom-protocol")]
-        while let Ok(msg) = custom_rx.try_recv() {
-            let frame = serialize_msg(
-                MessageType::Custom(msg.type_id),
-                &MessagePayload::Custom(msg.payload),
-                0,
-            )?;
-            writer.write_all(&frame).await.context("write custom")?;
-        }
-
         tokio::select! {
             chunk = chunk_rx.recv() => {
                 let chunk = match chunk {
@@ -543,15 +483,6 @@ where
                             volume: info.volume,
                             muted: info.muted,
                         }).await;
-                    }
-                    #[cfg(feature = "custom-protocol")]
-                    MessagePayload::Custom(payload) => {
-                        if let MessageType::Custom(type_id) = msg.base.msg_type {
-                            let _ = event_tx.send(ServerEvent::CustomMessage {
-                                client_id: client_id.clone(),
-                                message: snapcast_proto::CustomMessage::new(type_id, payload),
-                            }).await;
-                        }
                     }
                     _ => {}
                 }

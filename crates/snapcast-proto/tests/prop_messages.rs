@@ -22,9 +22,6 @@
 //! untrusted parsing entry points (`BaseMessage::read_from` and
 //! `factory::deserialize`) and require they return `Ok`/`Err` but never panic
 //! or overflow.
-//!
-//! The `custom-protocol` feature is OFF under default features, so the `Custom`
-//! variant is intentionally not covered here.
 
 use std::io::Cursor;
 

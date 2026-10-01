@@ -27,8 +27,6 @@ pub mod status;
 pub mod time;
 pub mod types;
 
-#[cfg(feature = "custom-protocol")]
-pub use message::CustomMessage;
 pub use message::MessageType;
 pub use message::base::{BaseMessage, ProtoError};
 pub use sample_format::SampleFormat;
@@ -80,12 +78,3 @@ pub const CODEC_OPUS: &str = "opus";
 pub const CODEC_OGG: &str = "ogg";
 /// Lossless f32 LZ4 codec name.
 pub const CODEC_F32LZ4: &str = "f32lz4";
-/// Encrypted f32 LZ4 command-line/config alias.
-pub const CODEC_F32LZ4_ENCRYPTED_ALIAS: &str = "f32lz4e";
-
-/// Default pre-shared key for f32lz4e (encrypted f32lz4) codec.
-///
-/// Used when the `f32lz4e` codec is selected without an explicit PSK.
-/// Provides transport obfuscation out of the box — not a substitute for
-/// real key management in security-sensitive deployments.
-pub const DEFAULT_ENCRYPTION_PSK: &str = "snapcast-f32lz4e-default-psk-v1";

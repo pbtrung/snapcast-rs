@@ -44,8 +44,6 @@
 pub mod config;
 pub mod connection;
 pub(crate) mod controller;
-#[cfg(feature = "encryption")]
-pub(crate) mod crypto;
 pub mod decoder;
 pub(crate) mod double_buffer;
 pub mod stream;
@@ -61,8 +59,6 @@ const COMMAND_CHANNEL_SIZE: usize = 64;
 const AUDIO_CHANNEL_SIZE: usize = 256;
 
 // Re-export proto types that embedders need
-#[cfg(feature = "custom-protocol")]
-pub use snapcast_proto::CustomMessage;
 pub use snapcast_proto::SampleFormat;
 pub use snapcast_proto::{DEFAULT_STREAM_PORT, PROTOCOL_VERSION};
 
@@ -124,9 +120,6 @@ pub enum ClientEvent {
         /// Clock difference to server in milliseconds.
         diff_ms: f64,
     },
-    #[cfg(feature = "custom-protocol")]
-    /// Custom message received from server.
-    CustomMessage(snapcast_proto::CustomMessage),
 }
 
 /// Commands the consumer sends to the client.
@@ -139,9 +132,6 @@ pub enum ClientCommand {
         /// Mute state.
         muted: bool,
     },
-    /// Send a custom message to the server.
-    #[cfg(feature = "custom-protocol")]
-    SendCustom(snapcast_proto::CustomMessage),
     /// Stop the client gracefully.
     Stop,
 }
@@ -177,9 +167,6 @@ pub struct ClientConfig {
     pub latency: i32,
     /// Client name sent in Hello. Default: "Snapclient".
     pub client_name: String,
-    /// Pre-shared key for f32lz4 decryption. `None` = auto-detect from env SNAPCAST_PSK.
-    #[cfg(feature = "encryption")]
-    pub encryption_psk: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -201,8 +188,6 @@ impl Default for ClientConfig {
             host_id: String::new(),
             latency: 0,
             client_name: snapcast_proto::DEFAULT_CLIENT_NAME.into(),
-            #[cfg(feature = "encryption")]
-            encryption_psk: None,
         }
     }
 }

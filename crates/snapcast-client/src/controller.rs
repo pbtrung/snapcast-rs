@@ -209,15 +209,6 @@ impl Controller {
                                 )
                                 .await?;
                         }
-                        #[cfg(feature = "custom-protocol")]
-                        Some(ClientCommand::SendCustom(msg)) => {
-                            self.connection
-                                .send(
-                                    MessageType::Custom(msg.type_id),
-                                    &MessagePayload::Custom(msg.payload),
-                                )
-                                .await?;
-                        }
                     }
                 }
                 _ = quick_sync_timer.tick(), if quick_syncs_remaining > 0 => {
@@ -305,14 +296,6 @@ impl Controller {
             MessagePayload::Error(e) => {
                 tracing::error!(code = e.code, error = %e.error, "Server error");
             }
-            #[cfg(feature = "custom-protocol")]
-            MessagePayload::Custom(payload) => {
-                if let MessageType::Custom(type_id) = msg.base.msg_type {
-                    self.emit(ClientEvent::CustomMessage(
-                        snapcast_proto::CustomMessage::new(type_id, payload),
-                    ));
-                }
-            }
             _ => {}
         }
         Ok(())
@@ -334,11 +317,7 @@ impl Controller {
             "flac" => Box::new(decoder::flac::create(header)?),
             "ogg" => Box::new(decoder::vorbis::create(header)?),
             "opus" => Box::new(decoder::opus::create(header)?),
-            #[cfg(all(feature = "f32lz4", feature = "encryption"))]
-            "f32lz4" => Box::new(decoder::f32lz4::create(
-                self.settings.encryption_psk.as_deref(),
-            )),
-            #[cfg(all(feature = "f32lz4", not(feature = "encryption")))]
+            #[cfg(feature = "f32lz4")]
             "f32lz4" => Box::new(decoder::f32lz4::create()),
             other => bail!("unsupported codec: {other}"),
         };

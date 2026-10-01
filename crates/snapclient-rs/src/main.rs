@@ -16,8 +16,6 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    #[cfg(feature = "encryption")]
-    let encryption_psk = cli.encryption_psk.clone();
     let mut settings = cli.into_settings()?;
 
     #[cfg(unix)]
@@ -71,10 +69,6 @@ fn main() -> anyhow::Result<()> {
         certificate_key: settings.server.certificate_key.clone(),
         #[cfg(feature = "tls")]
         key_password: settings.server.key_password.clone(),
-        #[cfg(feature = "encryption")]
-        encryption_psk: Some(
-            encryption_psk.unwrap_or_else(|| snapcast_proto::DEFAULT_ENCRYPTION_PSK.into()),
-        ),
         instance: settings.instance,
         host_id: settings.host_id.clone(),
         latency: settings.player.latency,
@@ -145,10 +139,6 @@ fn main() -> anyhow::Result<()> {
                                 &[sd_notify::NotifyState::Status(&status)],
                             );
                         }
-                    }
-                    #[cfg(feature = "custom-protocol")]
-                    ClientEvent::CustomMessage(msg) => {
-                        tracing::info!(type_id = msg.type_id, "Custom message received");
                     }
                 }
             }

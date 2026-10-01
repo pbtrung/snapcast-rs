@@ -45,9 +45,6 @@ pub(crate) struct EncoderConfig {
     pub format: SampleFormat,
     /// Codec-specific options (e.g. FLAC compression level).
     pub options: String,
-    /// Pre-shared key for f32lz4 encryption. `None` = no encryption.
-    #[cfg(feature = "encryption")]
-    pub encryption_psk: Option<String>,
 }
 
 /// Create an encoder from config.
@@ -71,12 +68,6 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         #[cfg(feature = "f32lz4")]
         snapcast_proto::CODEC_F32LZ4 => {
             let enc = f32lz4::F32Lz4Encoder::new(format);
-            #[cfg(feature = "encryption")]
-            let enc = if let Some(ref key) = config.encryption_psk {
-                enc.with_encryption(key)
-            } else {
-                enc
-            };
             Ok(Box::new(enc))
         }
         other => anyhow::bail!("unsupported codec: {other} (check enabled features)"),

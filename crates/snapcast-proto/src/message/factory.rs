@@ -40,9 +40,6 @@ pub enum MessagePayload {
     Error(Error),
     /// Stream tags (type 6, deprecated). Raw bytes.
     StreamTags(Vec<u8>),
-    /// Custom raw payload (type 9+).
-    #[cfg(feature = "custom-protocol")]
-    Custom(Vec<u8>),
 }
 
 /// Deserialize a typed message from a base header and raw payload bytes.
@@ -62,8 +59,6 @@ pub fn deserialize(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, Pr
         MessageType::Error => MessagePayload::Error(Error::read_from(&mut cursor)?),
         MessageType::StreamTags => MessagePayload::StreamTags(payload.to_vec()),
         MessageType::Base | MessageType::Unknown(_) => MessagePayload::StreamTags(payload.to_vec()),
-        #[cfg(feature = "custom-protocol")]
-        MessageType::Custom(_) => MessagePayload::Custom(payload.to_vec()),
     };
     Ok(TypedMessage { base, payload: msg })
 }
@@ -82,8 +77,6 @@ pub fn serialize(base: &mut BaseMessage, payload: &MessagePayload) -> Result<Vec
         MessagePayload::ClientInfo(m) => m.write_to(&mut payload_buf)?,
         MessagePayload::Error(m) => m.write_to(&mut payload_buf)?,
         MessagePayload::StreamTags(data) => payload_buf.extend_from_slice(data),
-        #[cfg(feature = "custom-protocol")]
-        MessagePayload::Custom(data) => payload_buf.extend_from_slice(data),
     }
     base.size = payload_buf.len() as u32;
 
@@ -263,26 +256,5 @@ mod tests {
         // size should now be set
         assert!(base.size > 0);
         assert_eq!(frame.len(), BaseMessage::HEADER_SIZE + base.size as usize);
-    }
-
-    #[cfg(feature = "custom-protocol")]
-    #[test]
-    fn round_trip_custom_message() {
-        let payload = b"hello custom";
-        let mut base = make_base(MessageType::Custom(42), 0);
-        let frame = serialize(&mut base, &MessagePayload::Custom(payload.to_vec())).unwrap();
-
-        let mut cursor = std::io::Cursor::new(&frame);
-        let header = BaseMessage::read_from(&mut cursor).unwrap();
-        assert_eq!(header.msg_type, MessageType::Custom(42));
-        assert_eq!(header.size, payload.len() as u32);
-
-        let mut body = vec![0u8; header.size as usize];
-        std::io::Read::read_exact(&mut cursor, &mut body).unwrap();
-        let msg = deserialize(header, &body).unwrap();
-        match msg.payload {
-            MessagePayload::Custom(data) => assert_eq!(data, payload),
-            _ => panic!("expected Custom"),
-        }
     }
 }

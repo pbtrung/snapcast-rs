@@ -86,11 +86,6 @@ pub struct Cli {
     /// Log filter: `<tag>:<level>[,<tag>:<level>]*`
     #[arg(long, default_value = "*:info")]
     pub logfilter: String,
-
-    /// Pre-shared key for f32lz4e decryption (default: built-in key)
-    #[cfg(feature = "encryption")]
-    #[arg(long)]
-    pub encryption_psk: Option<String>,
 }
 
 impl Cli {

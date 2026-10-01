@@ -217,12 +217,6 @@ impl Dispatcher {
                 let s = self.shared_state.lock().await;
                 let _ = response_tx.send(s.to_status());
             }
-            #[cfg(feature = "custom-protocol")]
-            ServerCommand::SendToClient { client_id, message } => {
-                self.session_srv
-                    .send_custom(&client_id, message.type_id, message.payload)
-                    .await;
-            }
         }
     }
 }
@@ -561,17 +555,5 @@ mod tests {
             .await;
         let status = rx.await.unwrap();
         assert_eq!(status.server.groups.len(), 1);
-    }
-
-    #[cfg(feature = "custom-protocol")]
-    #[tokio::test]
-    async fn send_to_client_unknown_is_noop() {
-        let (d, _rx) = dispatcher_with(ServerState::default());
-        // No registered client — must be a graceful no-op, not a panic.
-        d.dispatch(ServerCommand::SendToClient {
-            client_id: "ghost".into(),
-            message: snapcast_proto::CustomMessage::new(9, b"hi"),
-        })
-        .await;
     }
 }

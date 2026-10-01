@@ -13,7 +13,7 @@
 //!
 //! Uses DEFAULT features only. The `flac`, `opus`, and `vorbis` decoder modules are
 //! declared unconditionally in `decoder/mod.rs` (only `f32lz4` is feature-gated), so
-//! all four parsers are reachable without `f32lz4`/`encryption`.
+//! all four parsers are reachable without `f32lz4`.
 
 use proptest::prelude::*;
 

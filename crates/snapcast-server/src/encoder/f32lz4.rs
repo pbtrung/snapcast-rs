@@ -6,26 +6,16 @@
 
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
-#[cfg(feature = "encryption")]
-use snapcast_proto::f32lz4::{F32LZ4_ENC_MARKER, F32LZ4_SALT_LEN};
 use snapcast_proto::f32lz4::{F32LZ4_HEADER_LEN, F32LZ4_MAGIC};
 
 use super::{EncodedChunk, Encoder};
 use crate::AudioData;
-
-/// Fill buffer with random bytes (uses system RNG).
-#[cfg(feature = "encryption")]
-fn random_bytes(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("OS RNG unavailable");
-}
 
 /// F32 LZ4 encoder — compresses f32 audio with LZ4.
 pub struct F32Lz4Encoder {
     format: SampleFormat,
     header: Vec<u8>,
     warned: bool,
-    #[cfg(feature = "encryption")]
-    encryptor: Option<crate::crypto::ChunkEncryptor>,
 }
 
 impl F32Lz4Encoder {
@@ -45,22 +35,7 @@ impl F32Lz4Encoder {
             format,
             header,
             warned: false,
-            #[cfg(feature = "encryption")]
-            encryptor: None,
         }
-    }
-
-    /// Enable encryption with a pre-shared key. Appends salt to the codec header.
-    #[cfg(feature = "encryption")]
-    pub fn with_encryption(mut self, psk: &str) -> Self {
-        let mut salt = [0u8; F32LZ4_SALT_LEN];
-        random_bytes(&mut salt);
-        self.encryptor = Some(crate::crypto::ChunkEncryptor::new(psk, &salt));
-        // Append encryption marker + salt to header
-        self.header.extend_from_slice(F32LZ4_ENC_MARKER);
-        self.header.extend_from_slice(&salt);
-        tracing::info!("F32LZ4 encryption enabled");
-        self
     }
 }
 
@@ -99,17 +74,7 @@ impl Encoder for F32Lz4Encoder {
 
         let frames = f32_bytes.len() / (4 * channels);
         tracing::trace!(input_bytes = f32_bytes.len(), frames, "F32LZ4 encoding");
-        let compressed = lz4_flex::compress_prepend_size(&f32_bytes);
-
-        #[cfg(feature = "encryption")]
-        let data = if let Some(ref mut enc) = self.encryptor {
-            enc.encrypt(&compressed)
-                .map_err(|e| anyhow::anyhow!("encryption failed: {e}"))?
-        } else {
-            compressed
-        };
-        #[cfg(not(feature = "encryption"))]
-        let data = compressed;
+        let data = lz4_flex::compress_prepend_size(&f32_bytes);
 
         Ok(EncodedChunk { data })
     }

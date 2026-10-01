@@ -21,15 +21,13 @@ The **binary crates** (`snapclient-rs`, `snapserver-rs`) are thin wrappers aroun
 
 The result is a Snapcast implementation that works as a TCP-audio replacement for common Snapcast deployments and as an embeddable building block for Rust applications that need synchronized multiroom audio.
 
-snapcast-rs is compatible with the original C++ Snapcast over the TCP audio transport when using standard codecs (PCM, FLAC, Opus, Vorbis). However, three optional features break audio compatibility:
+snapcast-rs is compatible with the original C++ Snapcast over the TCP audio transport when using standard codecs (PCM, FLAC, Opus, Vorbis). However, one optional feature breaks audio compatibility:
 
 | Feature | What it does | C++ behavior |
 |---------|-------------|--------------|
 | `f32lz4` | 32-bit float LZ4 codec | C++ clients reject unknown codec |
-| `custom-protocol` | Application-defined message types (9+) | C++ clients silently ignore |
-| `encryption` | ChaCha20-Poly1305 encrypted f32lz4 | C++ clients reject unknown codec |
 
-If you enable `f32lz4` or `encryption` on the server, C++ clients cannot decode the audio. To prevent them from auto-connecting via mDNS, change the service type in your application binary (mDNS is the application's responsibility, not the library's):
+If you enable `f32lz4` on the server, C++ clients cannot decode the audio. To prevent them from auto-connecting via mDNS, change the service type in your application binary (mDNS is the application's responsibility, not the library's):
 
 ```rust
 // Use astro-dnssd or any DNS-SD crate in your binary
@@ -38,7 +36,7 @@ let _mdns = astro_dnssd::DNSServiceBuilder::new("_myapp._tcp", port)
     .register()?;
 ```
 
-For full interoperability with C++ clients, use `--codec flac` or `--codec pcm` and leave `custom-protocol` and `encryption` disabled.
+For full interoperability with C++ clients, use `--codec flac` or `--codec pcm`.
 
 ## Install
 
@@ -143,7 +141,6 @@ ClientConfig {
     host_id: String,           // unique identifier (default: MAC)
     latency: i32,              // additional latency offset (ms)
     client_name: String,       // default: "Snapclient"
-    encryption_psk: Option<String>, // f32lz4 encryption (feature: encryption)
 }
 ```
 
@@ -155,8 +152,6 @@ ClientConfig {
 | `websocket` | —       | none  | Experimental transport module only; `SnapConnection::new` rejects `ws://` until binary audio WS is implemented |
 | `tls`       | —       | none  | Experimental WSS module only; `SnapConnection::new` rejects `wss://` until binary audio WS is implemented |
 | `resampler` | —       | none  | Sample rate conversion (rubato) |
-| `custom-protocol` | — | none | Custom binary messages (type 9+) |
-| `encryption` | — | none | ChaCha20-Poly1305 encrypted f32lz4 |
 
 ## Server Library API
 
@@ -225,7 +220,6 @@ ServerConfig {
     sample_format: String,     // default: "48000:16:2"
     auth: Option<Arc<dyn AuthValidator>>, // default: None (no auth)
     client_filter: Option<Arc<dyn ClientFilter>>, // default: None (accept all)
-    encryption_psk: Option<String>, // f32lz4 encryption (feature: encryption)
     initial_state: Option<ServerState>, // seed clients/groups on startup (None = empty)
     send_audio_to_muted: bool, // default: false
 }
@@ -253,8 +247,6 @@ StreamConfig {
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
 | `opus`   | —       | libopus   | Opus encoding |
 | `vorbis` | —       | libvorbis | Vorbis encoding |
-| `custom-protocol` | — | none | Custom binary messages (type 9+) |
-| `encryption` | — | none | ChaCha20-Poly1305 encrypted f32lz4 |
 
 ### Authentication
 
@@ -375,93 +367,6 @@ For bandwidth-constrained networks: use FLAC. For quality + simplicity: f32lz4.
 
 > ⚠️ **f32lz4 is not compatible with the original C++ Snapcast.** C++ clients/servers do not recognize this codec. Use `--codec flac` or `--codec pcm` for interoperability with C++ Snapcast.
 
-## Custom Binary Protocol (`--features custom-protocol`)
-
-> ⚠️ **snapcast-rs only.** This feature extends the Snapcast binary protocol with application-defined message types. It is not part of the original C++ Snapcast.
-
-C++ Snapcast safely ignores unknown message types — the factory returns `nullptr` for any unrecognized type, and the connection logs a warning and continues:
-
-```cpp
-// C++ snapcast: common/message/factory.hpp
-switch (base_message.type) {
-    case message_type::kCodecHeader: ...
-    case message_type::kTime: ...
-    // ...
-    default:
-        return nullptr;  // unknown types silently skipped
-}
-```
-
-This means Rust servers can send custom messages to Rust clients while C++ clients on the same server simply ignore them.
-
-### Use Case: Client-Side EQ
-
-A Rust-based multiroom system (e.g. [SnapDog](https://github.com/SnapDogRocks/snapdog)) can push per-client EQ settings through the binary protocol — no JSON-RPC, no HTTP, no extra connections:
-
-```rust
-use snapcast_proto::CustomMessage;
-
-// Server pushes EQ to a specific client
-cmd.send(ServerCommand::SendToClient {
-    client_id: "kitchen".into(),
-    message: CustomMessage::new(9, serde_json::to_vec(&EqConfig {
-        bands: vec![Band { freq: 100, gain: 3.0 }, Band { freq: 10000, gain: -2.0 }],
-    })?),
-}).await;
-
-// Client receives and applies
-match event {
-    ClientEvent::CustomMessage(msg) if msg.type_id == 9 => {
-        let eq: EqConfig = serde_json::from_slice(&msg.payload)?;
-        equalizer.update(eq);
-    }
-}
-```
-
-Message types 0–8 are reserved by the Snapcast protocol. Types 9+ are available for application use. The payload format is opaque — the library passes raw bytes, the application chooses JSON, bincode, protobuf, or any other format.
-
-## Encryption (`--features encryption`)
-
-Optional ChaCha20-Poly1305 authenticated encryption for f32lz4 audio chunks. Pure Rust (RustCrypto), zero C dependencies.
-
-### Binary usage
-
-The binaries support `f32lz4e` as a codec alias — it selects `f32lz4` with encryption using a built-in default key:
-
-```bash
-# Server — just works, default PSK
-snapserver-rs --codec f32lz4e
-
-# Client — just works, default PSK matches
-snapclient-rs tcp://192.168.1.50:1704
-
-# Custom PSK (must match on both sides)
-snapserver-rs --codec f32lz4e --encryption-psk "my-secret"
-snapclient-rs --encryption-psk "my-secret" tcp://192.168.1.50:1704
-```
-
-### Library usage
-
-```rust
-// Server
-let config = ServerConfig {
-    codec: "f32lz4".into(),
-    encryption_psk: Some("my-secret-key".into()),
-    ..ServerConfig::default()
-};
-
-// Client
-let config = ClientConfig {
-    encryption_psk: Some("my-secret-key".into()),
-    ..ClientConfig::default()
-};
-```
-
-- Key derivation: HKDF-SHA256 from PSK + random session salt
-- Per-chunk: 12-byte nonce (counter) + 16-byte auth tag = 28 bytes overhead (~0.6%)
-- Protects audio content and integrity — metadata (time sync, settings) stays plaintext
-- Wrong key: client connects but audio chunks are silently dropped
-
 ## Documentation
 
 API documentation: [snapcast-client](https://docs.rs/snapcast-client) · [snapcast-server](https://docs.rs/snapcast-server) · [snapcast-proto](https://docs.rs/snapcast-proto)
@@ -485,7 +390,7 @@ available to the linker:
 | `opus` | `libopus-dev pkg-config` | `opus pkg-config` |
 | `vorbis` | `libvorbis-dev` | `libvorbis` |
 
-The CI workflow validates the default build plus custom protocol, encryption, client transport/resampler features, and the Linux native codec feature set with those packages installed.
+The CI workflow validates the default build plus client transport/resampler features, and the Linux native codec feature set with those packages installed.
 
 ## Usage
 
@@ -493,8 +398,6 @@ The CI workflow validates the default build plus custom protocol, encryption, cl
 # Server
 snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"
 snapserver-rs --codec flac
-snapserver-rs --codec f32lz4e                            # encrypted f32lz4 (default key)
-snapserver-rs --codec f32lz4e --encryption-psk "secret"  # custom key
 snapserver-rs --stream-bind-address 127.0.0.1             # bind audio listener to loopback
 snapserver-rs --help
 
@@ -502,7 +405,6 @@ snapserver-rs --help
 snapclient-rs tcp://192.168.1.50:1704
 snapclient-rs tcp://[::1]:1704
 snapclient-rs                                            # mDNS auto-discovery
-snapclient-rs --encryption-psk "secret"                  # custom key
 snapclient-rs --help
 
 # Feed audio

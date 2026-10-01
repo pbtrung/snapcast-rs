@@ -106,13 +106,7 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
             config.server.sample_format = v.to_string();
         });
         get_u32(s, "buffer", |v| config.server.buffer_ms = v);
-        #[cfg(feature = "encryption")]
-        get_str(s, "encryption_psk", |v| {
-            config.server.encryption_psk = Some(v.to_string());
-        });
     }
-
-    resolve_encryption(&mut config);
 
     config
 }
@@ -171,8 +165,6 @@ pub(crate) struct CliOverrides {
     pub auth_enabled: bool,
     /// Override the auth secret.
     pub auth_secret: Option<String>,
-    #[cfg(feature = "encryption")]
-    pub encryption_psk: Option<String>,
     #[cfg(feature = "mdns")]
     pub no_mdns: bool,
     #[cfg(feature = "mdns")]
@@ -220,37 +212,10 @@ pub(crate) fn merge_cli(mut config: BinaryConfig, cli: CliOverrides) -> BinaryCo
     if let Some(v) = cli.auth_secret {
         config.auth.secret = v;
     }
-    #[cfg(feature = "encryption")]
-    if let Some(v) = cli.encryption_psk {
-        config.server.encryption_psk = Some(v);
-    }
     #[cfg(feature = "mdns")]
     let _ = (cli.no_mdns, cli.mdns_name); // handled in main.rs
 
-    // Resolve f32lz4e → f32lz4 + default PSK (if no explicit PSK set)
-    resolve_encryption(&mut config);
-
     config
-}
-
-/// If codec is `f32lz4e`, rewrite to `f32lz4` and apply default PSK
-/// unless an explicit PSK was already set.
-#[cfg(feature = "encryption")]
-fn resolve_encryption(config: &mut BinaryConfig) {
-    if config.server.codec == snapcast_proto::CODEC_F32LZ4_ENCRYPTED_ALIAS {
-        config.server.codec = snapcast_proto::CODEC_F32LZ4.into();
-        if config.server.encryption_psk.is_none() {
-            config.server.encryption_psk = Some(snapcast_proto::DEFAULT_ENCRYPTION_PSK.into());
-        }
-    }
-}
-
-#[cfg(not(feature = "encryption"))]
-fn resolve_encryption(config: &mut BinaryConfig) {
-    if config.server.codec == snapcast_proto::CODEC_F32LZ4_ENCRYPTED_ALIAS {
-        tracing::error!("Codec f32lz4e requires the 'encryption' feature — falling back to f32lz4");
-        config.server.codec = snapcast_proto::CODEC_F32LZ4.into();
-    }
 }
 
 #[cfg(test)]
@@ -319,8 +284,6 @@ mod tests {
                 no_mdns: false,
                 #[cfg(feature = "mdns")]
                 mdns_name: None,
-                #[cfg(feature = "encryption")]
-                encryption_psk: None,
             },
         );
         assert_eq!(merged.stream_bind_address, "::1");
@@ -351,8 +314,6 @@ mod tests {
             no_mdns: false,
             #[cfg(feature = "mdns")]
             mdns_name: None,
-            #[cfg(feature = "encryption")]
-            encryption_psk: None,
         }
     }
 
@@ -544,45 +505,6 @@ mod tests {
         assert!(config.auth.validate().is_err());
     }
 
-    // ---- resolve_encryption (default build: encryption feature OFF) ----
-
-    #[cfg(not(feature = "encryption"))]
-    #[test]
-    fn f32lz4e_codec_falls_back_to_f32lz4_without_encryption_feature() {
-        let config = config_from("[stream]\ncodec = f32lz4e\n");
-        // The encrypted alias is rewritten to plain f32lz4.
-        assert_eq!(config.server.codec, "f32lz4");
-    }
-
-    #[cfg(not(feature = "encryption"))]
-    #[test]
-    fn non_alias_codec_unchanged_by_resolve_encryption() {
-        let config = config_from("[stream]\ncodec = pcm\n");
-        assert_eq!(config.server.codec, "pcm");
-    }
-
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn f32lz4e_codec_rewritten_and_default_psk_applied() {
-        let config = config_from("[stream]\ncodec = f32lz4e\n");
-        assert_eq!(config.server.codec, "f32lz4");
-        assert_eq!(
-            config.server.encryption_psk.as_deref(),
-            Some(snapcast_proto::DEFAULT_ENCRYPTION_PSK)
-        );
-    }
-
-    #[cfg(feature = "encryption")]
-    #[test]
-    fn f32lz4e_codec_keeps_explicit_psk() {
-        let config = config_from("[stream]\ncodec = f32lz4e\nencryption_psk = my-explicit-key\n");
-        assert_eq!(config.server.codec, "f32lz4");
-        assert_eq!(
-            config.server.encryption_psk.as_deref(),
-            Some("my-explicit-key")
-        );
-    }
-
     // ---- merge_cli: overrides, no-ops, precedence ----
 
     #[test]
@@ -686,20 +608,6 @@ mod tests {
             },
         );
         assert_eq!(merged.auth.secret, "cli-secret");
-    }
-
-    #[test]
-    fn merge_cli_resolves_f32lz4e_codec() {
-        // merge_cli calls resolve_encryption after applying the codec override.
-        let merged = merge_cli(
-            BinaryConfig::default(),
-            CliOverrides {
-                codec: Some("f32lz4e".into()),
-                ..empty_cli()
-            },
-        );
-        // Regardless of the encryption feature, the alias is normalized away.
-        assert_eq!(merged.server.codec, "f32lz4");
     }
 
     // ---- combined config + CLI precedence ----

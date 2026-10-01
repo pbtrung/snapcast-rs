@@ -33,9 +33,6 @@ pub enum MessageType {
     ClientInfo,
     /// Error (type 8).
     Error,
-    /// Application-defined message (type 9+).
-    #[cfg(feature = "custom-protocol")]
-    Custom(u16),
     /// Unrecognized message type — payload is skipped/ignored.
     Unknown(u16),
 }
@@ -53,9 +50,6 @@ impl MessageType {
             6 => Self::StreamTags,
             7 => Self::ClientInfo,
             8 => Self::Error,
-            #[cfg(feature = "custom-protocol")]
-            9.. => Self::Custom(value),
-            #[cfg(not(feature = "custom-protocol"))]
             _ => Self::Unknown(value),
         }
     }
@@ -73,8 +67,6 @@ impl From<MessageType> for u16 {
             MessageType::StreamTags => 6,
             MessageType::ClientInfo => 7,
             MessageType::Error => 8,
-            #[cfg(feature = "custom-protocol")]
-            MessageType::Custom(id) => id,
             MessageType::Unknown(id) => id,
         }
     }
@@ -105,42 +97,10 @@ mod tests {
     #[test]
     fn unknown_message_type_returns_unknown() {
         assert_eq!(MessageType::from_u16(6), MessageType::StreamTags);
-        #[cfg(not(feature = "custom-protocol"))]
-        {
-            assert_eq!(MessageType::from_u16(9), MessageType::Unknown(9));
-            assert_eq!(
-                MessageType::from_u16(u16::MAX),
-                MessageType::Unknown(u16::MAX)
-            );
-        }
-        #[cfg(feature = "custom-protocol")]
-        {
-            assert_eq!(MessageType::from_u16(9), MessageType::Custom(9));
-            assert_eq!(
-                MessageType::from_u16(u16::MAX),
-                MessageType::Custom(u16::MAX)
-            );
-        }
-    }
-}
-
-/// Custom message for application-defined protocol extensions (type 9+).
-#[cfg(feature = "custom-protocol")]
-#[derive(Debug, Clone)]
-pub struct CustomMessage {
-    /// Message type ID (9+).
-    pub type_id: u16,
-    /// Raw payload bytes.
-    pub payload: Vec<u8>,
-}
-
-#[cfg(feature = "custom-protocol")]
-impl CustomMessage {
-    /// Create a new custom message.
-    pub fn new(type_id: u16, payload: impl Into<Vec<u8>>) -> Self {
-        Self {
-            type_id,
-            payload: payload.into(),
-        }
+        assert_eq!(MessageType::from_u16(9), MessageType::Unknown(9));
+        assert_eq!(
+            MessageType::from_u16(u16::MAX),
+            MessageType::Unknown(u16::MAX)
+        );
     }
 }

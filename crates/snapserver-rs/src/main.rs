@@ -63,18 +63,13 @@ struct Cli {
     #[arg(long)]
     buffer: Option<u32>,
 
-    /// Default codec: f32lz4, f32lz4e, pcm, flac, opus, ogg
+    /// Default codec: f32lz4, pcm, flac, opus, ogg
     #[arg(long)]
     codec: Option<String>,
 
     /// Default sample format
     #[arg(long)]
     sampleformat: Option<String>,
-
-    /// Pre-shared key for f32lz4e encryption (overrides default key)
-    #[cfg(feature = "encryption")]
-    #[arg(long)]
-    encryption_psk: Option<String>,
 
     /// Stream source URI (can be specified multiple times)
     #[arg(long = "source")]
@@ -132,8 +127,6 @@ fn main() -> anyhow::Result<()> {
             sources: cli.sources,
             auth_enabled: cli.auth,
             auth_secret: cli.auth_secret,
-            #[cfg(feature = "encryption")]
-            encryption_psk: cli.encryption_psk,
             #[cfg(feature = "mdns")]
             no_mdns: cli.mdns_disable,
             #[cfg(feature = "mdns")]

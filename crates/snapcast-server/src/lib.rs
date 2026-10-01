@@ -49,10 +49,6 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 // Re-export proto types that embedders need
-#[cfg(feature = "custom-protocol")]
-pub use snapcast_proto::CustomMessage;
-#[cfg(feature = "encryption")]
-pub use snapcast_proto::DEFAULT_ENCRYPTION_PSK;
 pub use snapcast_proto::SampleFormat;
 pub use snapcast_proto::message::hello::Hello;
 pub use snapcast_proto::{DEFAULT_SAMPLE_FORMAT, DEFAULT_STREAM_PORT};
@@ -181,8 +177,6 @@ pub struct WireChunkData {
 
 pub mod auth;
 pub(crate) mod command;
-#[cfg(feature = "encryption")]
-pub(crate) mod crypto;
 pub(crate) mod encoder;
 pub(crate) mod session;
 pub mod state;
@@ -302,14 +296,6 @@ pub enum ServerEvent {
         /// Optional parameters.
         params: serde_json::Value,
     },
-    /// Custom binary protocol message from a streaming client.
-    #[cfg(feature = "custom-protocol")]
-    CustomMessage {
-        /// Client ID.
-        client_id: String,
-        /// The custom message.
-        message: snapcast_proto::CustomMessage,
-    },
 }
 
 /// Commands the consumer sends to the server.
@@ -409,14 +395,6 @@ pub enum ServerCommand {
         /// Response channel.
         response_tx: tokio::sync::oneshot::Sender<status::ServerStatus>,
     },
-    /// Send a custom binary protocol message to a streaming client.
-    #[cfg(feature = "custom-protocol")]
-    SendToClient {
-        /// Target client ID.
-        client_id: String,
-        /// The custom message.
-        message: snapcast_proto::CustomMessage,
-    },
     /// Stop the server gracefully.
     Stop,
 }
@@ -446,9 +424,6 @@ pub struct ServerConfig {
     /// Client filter — called after Hello to accept/reject connections.
     /// `None` = accept all clients.
     pub client_filter: Option<std::sync::Arc<dyn auth::ClientFilter>>,
-    /// Pre-shared key for f32lz4 encryption. `None` = no encryption.
-    #[cfg(feature = "encryption")]
-    pub encryption_psk: Option<String>,
     /// Initial server state to seed on startup (clients, groups). `None` = empty.
     ///
     /// The library performs no file I/O: the embedder loads this snapshot (e.g.
@@ -468,8 +443,6 @@ impl Default for ServerConfig {
 
             auth: None,
             client_filter: None,
-            #[cfg(feature = "encryption")]
-            encryption_psk: None,
             initial_state: None,
             send_audio_to_muted: false,
         }
@@ -647,8 +620,6 @@ impl SnapServer {
             codec: self.config.codec.clone(),
             format: sample_format,
             options: String::new(),
-            #[cfg(feature = "encryption")]
-            encryption_psk: self.config.encryption_psk.clone(),
         };
         let default_enc = encoder::create(&default_enc_config)?;
 
@@ -708,8 +679,6 @@ impl SnapServer {
                     codec: stream_codec.to_string(),
                     format: stream_format,
                     options: String::new(),
-                    #[cfg(feature = "encryption")]
-                    encryption_psk: self.config.encryption_psk.clone(),
                 })?
             };
             tracing::info!(stream = %name, codec = enc.name(), format = %active_format, "Stream registered");
