@@ -3,14 +3,20 @@
 //! Activated when the server sample rate differs from the player sample rate.
 
 use anyhow::{Result, bail};
-use rubato::{FftFixedIn, Resampler as RubatoResampler};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Resampler as RubatoResampler};
 use snapcast_proto::SampleFormat;
 
 use crate::stream::SampleEncoding;
 
 /// Resampler that converts between sample rates.
+///
+/// Input arrives in arbitrary frame counts while the FFT resampler consumes
+/// fixed-size chunks, so leftover input frames are kept until the next call.
 pub struct Resampler {
-    resampler: FftFixedIn<f64>,
+    resampler: Fft<f32>,
+    /// Interleaved f32 input frames not yet consumed by the resampler.
+    pending: Vec<f32>,
     in_format: SampleFormat,
     in_encoding: SampleEncoding,
     out_format: SampleFormat,
@@ -34,16 +40,17 @@ impl Resampler {
             bail!("cannot resample 0 channels");
         }
 
-        let resampler = FftFixedIn::new(
+        let resampler = Fft::new(
             in_format.rate() as usize,
             out_format.rate() as usize,
             chunk_frames,
-            2, // sub-chunks
             channels,
+            FixedSync::Input,
         )?;
 
         Ok(Some(Self {
             resampler,
+            pending: Vec::new(),
             in_format,
             in_encoding,
             out_format,
@@ -52,70 +59,70 @@ impl Resampler {
     }
 
     /// Resample interleaved sample data in-place.
+    ///
+    /// Output may be shorter or longer than a rate-scaled copy of the input:
+    /// frames that don't fill a whole resampler chunk are held back until the
+    /// next call.
     pub fn process(&mut self, data: &mut Vec<u8>) -> Result<()> {
         let sample_size = self.in_format.sample_size() as usize;
-        let frame_size = self.in_format.frame_size() as usize;
-        if frame_size == 0 || sample_size == 0 {
+        if self.in_format.frame_size() == 0 || sample_size == 0 {
             bail!("cannot resample zero-sized frames");
         }
-        let in_frames = data.len() / frame_size;
 
-        // Deinterleave to f64 channels
-        let mut channels_in: Vec<Vec<f64>> = vec![vec![0.0; in_frames]; self.channels];
-        for (frame_idx, frame_bytes) in data.chunks_exact(frame_size).enumerate() {
-            for (ch, sample_bytes) in frame_bytes.chunks_exact(sample_size).enumerate() {
-                let sample = match sample_size {
-                    2 => {
-                        i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f64
-                            / i16::MAX as f64
-                    }
-                    4 if self.in_encoding == SampleEncoding::Float32 => f32::from_le_bytes([
+        for sample_bytes in data.chunks_exact(sample_size) {
+            let sample = match sample_size {
+                2 => {
+                    i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f32 / i16::MAX as f32
+                }
+                4 => {
+                    let bytes = [
                         sample_bytes[0],
                         sample_bytes[1],
                         sample_bytes[2],
                         sample_bytes[3],
-                    ])
-                        as f64,
-                    4 if self.in_format.bits() == 24 => {
-                        i32::from_le_bytes([
-                            sample_bytes[0],
-                            sample_bytes[1],
-                            sample_bytes[2],
-                            sample_bytes[3],
-                        ]) as f64
-                            / snapcast_proto::PCM_24BIT_MAX as f64
+                    ];
+                    if self.in_encoding == SampleEncoding::Float32 {
+                        f32::from_le_bytes(bytes)
+                    } else if self.in_format.bits() == 24 {
+                        i32::from_le_bytes(bytes) as f32 / snapcast_proto::PCM_24BIT_MAX
+                    } else {
+                        i32::from_le_bytes(bytes) as f32 / i32::MAX as f32
                     }
-                    4 => {
-                        i32::from_le_bytes([
-                            sample_bytes[0],
-                            sample_bytes[1],
-                            sample_bytes[2],
-                            sample_bytes[3],
-                        ]) as f64
-                            / i32::MAX as f64
-                    }
-                    _ => 0.0,
-                };
-                channels_in[ch][frame_idx] = sample;
-            }
+                }
+                _ => 0.0,
+            };
+            self.pending.push(sample);
         }
 
-        let channels_out = self.resampler.process(&channels_in, None)?;
-        let out_frames = channels_out[0].len();
-        let mut out = Vec::with_capacity(out_frames * self.channels * 4);
-
-        for frame_idx in 0..out_frames {
-            for ch_samples in &channels_out {
-                let s = ch_samples[frame_idx] as f32;
+        let mut out = Vec::new();
+        let mut consumed = 0;
+        loop {
+            let need = self.resampler.input_frames_next();
+            let available = (self.pending.len() - consumed) / self.channels;
+            if available < need {
+                break;
+            }
+            let input = InterleavedSlice::new(&self.pending[consumed..], self.channels, need)?;
+            let mut output = vec![0.0f32; self.resampler.output_frames_next() * self.channels];
+            let out_capacity = output.len() / self.channels;
+            let (in_frames, out_frames) = {
+                let mut output_adapter =
+                    InterleavedSlice::new_mut(&mut output, self.channels, out_capacity)?;
+                self.resampler
+                    .process_into_buffer(&input, &mut output_adapter, None)?
+            };
+            consumed += in_frames * self.channels;
+            for s in &output[..out_frames * self.channels] {
                 out.extend_from_slice(&s.to_le_bytes());
             }
         }
+        self.pending.drain(..consumed);
 
         *data = out;
         Ok(())
     }
 
-    /// Output encoding is always f32 (rubato works in f64 internally).
+    /// Output encoding is always f32.
     pub fn output_encoding(&self) -> SampleEncoding {
         SampleEncoding::Float32
     }
@@ -176,5 +183,27 @@ mod tests {
         // (rubato FFT resampler has latency, first call produces fewer frames)
         assert!(!data.is_empty());
         assert_ne!(data.len(), in_bytes);
+    }
+
+    #[test]
+    fn buffers_partial_chunks_across_calls() {
+        let in_fmt = SampleFormat::new(44100, 16, 2);
+        let out_fmt = SampleFormat::new(48000, 16, 2);
+        let frames = 441;
+        let mut r = Resampler::new_if_needed(in_fmt, out_fmt, SampleEncoding::PcmInt, frames)
+            .unwrap()
+            .unwrap();
+        let frame_bytes = in_fmt.frame_size() as usize;
+
+        // Less than one chunk: held back, nothing emitted.
+        let mut data = vec![0u8; 200 * frame_bytes];
+        r.process(&mut data).unwrap();
+        assert!(data.is_empty());
+
+        // Completing the chunk (plus extra) emits one chunk of output.
+        let mut data = vec![0u8; 300 * frame_bytes];
+        r.process(&mut data).unwrap();
+        assert!(!data.is_empty());
+        assert_eq!(r.pending.len(), (500 - frames) * 2);
     }
 }

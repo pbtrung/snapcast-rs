@@ -23,7 +23,7 @@ tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 libc = { workspace = true }
-cpal = "0.15"
+cpal = "0.18"
 mdns-sd = { workspace = true, optional = true }
 
 
@@ -36,5 +36,5 @@ tls = ["snapcast-client/tls"]
 resampler = ["snapcast-client/resampler"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.7"
-sd-notify = "0.4"
+alsa = { workspace = true }
+sd-notify = "0.5"

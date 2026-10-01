@@ -112,16 +112,13 @@ fn main() -> anyhow::Result<()> {
                                 volume,
                                 if muted { " (muted)" } else { "" }
                             );
-                            let _ = sd_notify::notify(
-                                false,
-                                &[sd_notify::NotifyState::Status(&status)],
-                            );
+                            let _ = sd_notify::notify(&[sd_notify::NotifyState::Status(&status)]);
                         }
                     }
                     ClientEvent::TimeSyncComplete { diff_ms } => {
                         tracing::info!(diff_ms, "Time sync complete");
                         #[cfg(target_os = "linux")]
-                        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+                        let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
                     }
                     ClientEvent::StreamStarted { codec, format } => {
                         tracing::info!(%codec, %format, "Stream started");
@@ -134,10 +131,7 @@ fn main() -> anyhow::Result<()> {
                                 format.bits(),
                                 format.channels()
                             );
-                            let _ = sd_notify::notify(
-                                false,
-                                &[sd_notify::NotifyState::Status(&status)],
-                            );
+                            let _ = sd_notify::notify(&[sd_notify::NotifyState::Status(&status)]);
                         }
                     }
                 }

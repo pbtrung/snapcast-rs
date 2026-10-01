@@ -91,17 +91,17 @@ fn run_cpal(
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("no output device"))?;
 
-    tracing::info!(device = %device.name().unwrap_or_default(), "Using audio device");
+    tracing::info!(device = %device.description().map(|d| d.name().to_string()).unwrap_or_default(), "Using audio device");
 
     // Try to match stream format, fallback to default if unsupported
     let supported_formats = device.supported_output_configs()?;
     let mut target_config = None;
     for f in supported_formats {
         if f.channels() == format.channels()
-            && f.min_sample_rate().0 <= format.rate()
-            && f.max_sample_rate().0 >= format.rate()
+            && f.min_sample_rate() <= format.rate()
+            && f.max_sample_rate() >= format.rate()
         {
-            target_config = Some(f.with_sample_rate(cpal::SampleRate(format.rate())));
+            target_config = Some(f.with_sample_rate(format.rate()));
             break;
         }
     }
@@ -114,7 +114,7 @@ fn run_cpal(
         (c.into(), true)
     };
 
-    let device_rate = config.sample_rate.0;
+    let device_rate = config.sample_rate;
     let device_channels = config.channels as usize;
 
     #[cfg(feature = "resampler")]
@@ -139,16 +139,15 @@ fn run_cpal(
     // callback can stall the audio thread and cause xruns/glitches.
     let mut pcm_buf: Vec<u8> = Vec::new();
     let cpal_stream = device.build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let num_frames = data.len() / device_channels;
 
             let buffer_dac_usec = info
                 .timestamp()
                 .playback
-                .duration_since(&info.timestamp().callback)
-                .map(|d| d.as_micros() as i64)
-                .unwrap_or(0)
+                .duration_since(info.timestamp().callback)
+                .as_micros() as i64
                 + (num_frames as i64 * 1_000_000) / device_rate as i64;
 
             let server_now = {
