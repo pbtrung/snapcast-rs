@@ -236,27 +236,28 @@ pub struct StreamUri {
 
 /// Stream properties (MPRIS-style metadata and capabilities).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StreamProperties {
     /// Playback status (Playing, Paused, Stopped).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback_status: Option<String>,
     /// Loop status (None, Track, Playlist).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_status: Option<String>,
     /// Shuffle mode.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shuffle: Option<bool>,
     /// Volume (0–100).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<u16>,
     /// Mute state.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
     /// Playback rate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<f64>,
     /// Position in seconds.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<f64>,
     /// Can skip to next track.
     #[serde(default)]
@@ -277,6 +278,104 @@ pub struct StreamProperties {
     #[serde(default)]
     pub can_control: bool,
     /// Track metadata (artist, title, album, etc.).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+}
+
+impl StreamUri {
+    /// Split a stream source URI (`scheme://host/path?key=value#fragment`)
+    /// into its components, percent-decoding the path, query and fragment.
+    ///
+    /// Never fails: anything unparsable is left in `raw` with the other
+    /// components empty.
+    pub fn parse(raw: &str) -> Self {
+        let mut uri = Self {
+            raw: raw.to_string(),
+            ..Default::default()
+        };
+        let Some((scheme, rest)) = raw.split_once("://") else {
+            return uri;
+        };
+        let (rest, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (host, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+        uri.scheme = scheme.to_string();
+        uri.host = host.to_string();
+        uri.path = percent_decode(path);
+        uri.fragment = percent_decode(fragment);
+        uri.query = query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                (percent_decode(k), percent_decode(v))
+            })
+            .collect();
+        uri
+    }
+}
+
+/// Decode `%XX` escapes; malformed escapes are kept verbatim.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(b) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_uri_parse_pipe() {
+        let uri = StreamUri::parse("pipe:///tmp/snap%20fifo?name=Radio&sampleformat=48000:16:2");
+        assert_eq!(uri.scheme, "pipe");
+        assert_eq!(uri.host, "");
+        assert_eq!(uri.path, "/tmp/snap fifo");
+        assert_eq!(uri.query["name"], "Radio");
+        assert_eq!(uri.query["sampleformat"], "48000:16:2");
+        assert_eq!(uri.fragment, "");
+        assert_eq!(
+            uri.raw,
+            "pipe:///tmp/snap%20fifo?name=Radio&sampleformat=48000:16:2"
+        );
+    }
+
+    #[test]
+    fn stream_uri_parse_tcp_with_fragment() {
+        let uri = StreamUri::parse("tcp://0.0.0.0:4953?name=TCP#frag");
+        assert_eq!(uri.scheme, "tcp");
+        assert_eq!(uri.host, "0.0.0.0:4953");
+        assert_eq!(uri.path, "");
+        assert_eq!(uri.query["name"], "TCP");
+        assert_eq!(uri.fragment, "frag");
+    }
+
+    #[test]
+    fn stream_uri_parse_invalid_keeps_raw() {
+        let uri = StreamUri::parse("not a uri");
+        assert_eq!(uri.raw, "not a uri");
+        assert_eq!(uri.scheme, "");
+        assert!(uri.query.is_empty());
+    }
+
+    #[test]
+    fn percent_decode_malformed_kept() {
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("%zz%41"), "%zzA");
+    }
 }

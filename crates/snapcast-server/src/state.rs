@@ -326,11 +326,18 @@ impl ServerState {
             .map(|s| status::Stream {
                 id: s.id.clone(),
                 status: status::StreamStatus::from(s.status.as_str()),
-                uri: status::StreamUri {
-                    raw: s.uri.clone(),
-                    ..Default::default()
-                },
-                ..Default::default()
+                uri: status::StreamUri::parse(&s.uri),
+                properties: (!s.properties.is_empty())
+                    .then(|| {
+                        serde_json::from_value(serde_json::Value::Object(
+                            s.properties.clone().into_iter().collect(),
+                        ))
+                        .inspect_err(
+                            |e| tracing::warn!(stream = %s.id, "Invalid stream properties: {e}"),
+                        )
+                        .ok()
+                    })
+                    .flatten(),
             })
             .collect();
         status::ServerStatus {
@@ -418,6 +425,41 @@ mod tests {
         let status = state.to_status();
         assert_eq!(status.server.groups.len(), 1);
         assert_eq!(status.server.groups[0].clients.len(), 1);
+    }
+
+    #[test]
+    fn status_includes_stream_properties() {
+        let mut state = ServerState::default();
+        state.streams.push(StreamInfo {
+            id: "default".into(),
+            status: "playing".into(),
+            uri: "pipe:///tmp/snapfifo".into(),
+            properties: Default::default(),
+        });
+        state.streams.push(StreamInfo {
+            id: "music".into(),
+            status: "playing".into(),
+            uri: "pipe:///tmp/music".into(),
+            properties: [
+                ("playbackStatus".into(), serde_json::json!("playing")),
+                (
+                    "metadata".into(),
+                    serde_json::json!({"title": "Song", "artist": ["A"]}),
+                ),
+            ]
+            .into(),
+        });
+
+        let json = serde_json::to_value(state.to_status()).unwrap();
+        let streams = &json["server"]["streams"];
+        assert!(streams[0].get("properties").is_none());
+        assert_eq!(streams[0]["uri"]["scheme"], "pipe");
+        assert_eq!(streams[0]["uri"]["path"], "/tmp/snapfifo");
+        assert_eq!(streams[0]["uri"]["raw"], "pipe:///tmp/snapfifo");
+        let props = &streams[1]["properties"];
+        assert_eq!(props["playbackStatus"], "playing");
+        assert_eq!(props["metadata"]["title"], "Song");
+        assert_eq!(props["metadata"]["artist"][0], "A");
     }
 
     #[test]

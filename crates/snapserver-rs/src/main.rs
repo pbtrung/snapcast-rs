@@ -190,7 +190,13 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default_format);
 
-            let tx = server.add_stream(&name);
+            let tx = server.add_stream_with_config(
+                &name,
+                snapcast_server::StreamConfig {
+                    uri: Some(source.trim().trim_matches(['\'', '"']).to_string()),
+                    ..Default::default()
+                },
+            );
 
             // Chunk size matches codec block size:
             // FLAC level 0-2: 1152 frames, level 3+: 4096 frames

@@ -458,6 +458,9 @@ pub struct StreamConfig {
     pub codec: Option<String>,
     /// Sample format override (e.g. "48000:16:2").
     pub sample_format: Option<String>,
+    /// Source URI (e.g. "pipe:///tmp/snapfifo?name=default"), reported in the
+    /// stream's status.
+    pub uri: Option<String>,
 }
 
 /// A byte-stream transport carrying binary-protocol frames for one client.
@@ -724,11 +727,16 @@ impl SnapServer {
         for (name, stream_cfg, rx) in streams {
             {
                 let mut s = shared_state.lock().await;
-                if !s.streams.iter().any(|existing| existing.id == name) {
+                let uri = stream_cfg.uri.clone().unwrap_or_default();
+                if let Some(existing) = s.streams.iter_mut().find(|st| st.id == name) {
+                    if !uri.is_empty() {
+                        existing.uri = uri;
+                    }
+                } else {
                     s.streams.push(state::StreamInfo {
                         id: name.clone(),
                         status: "idle".into(),
-                        uri: String::new(),
+                        uri,
                         properties: Default::default(),
                     });
                 }
