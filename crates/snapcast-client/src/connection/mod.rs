@@ -8,7 +8,7 @@
 #[cfg(feature = "websocket")]
 pub mod ws;
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,7 +18,6 @@ use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
 /// Read a complete frame (header + payload) from an async reader.
 ///
@@ -55,11 +54,6 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Pending request waiting for a response.
-struct PendingRequest {
-    tx: oneshot::Sender<TypedMessage>,
-}
-
 /// TCP connection to a snapserver.
 pub struct TcpConnection {
     stream: Option<TcpStream>,
@@ -67,7 +61,9 @@ pub struct TcpConnection {
     read_buf: Vec<u8>,
     host: String,
     port: u16,
-    pending: HashMap<u16, PendingRequest>,
+    /// Messages read by [`TcpConnection::send_request`] while waiting for its
+    /// response, handed out by [`TcpConnection::recv`] in arrival order.
+    queued: VecDeque<TypedMessage>,
     next_id: u16,
 }
 
@@ -140,7 +136,7 @@ impl TcpConnection {
             read_buf: Vec::new(),
             host: host.to_string(),
             port,
-            pending: HashMap::new(),
+            queued: VecDeque::new(),
             next_id: 1,
         }
     }
@@ -153,7 +149,7 @@ impl TcpConnection {
             .with_context(|| format!("connecting to {addr}"))?;
         self.stream = Some(stream);
         self.read_buf.clear();
-        self.pending.clear();
+        self.queued.clear();
         self.next_id = 1;
         Ok(())
     }
@@ -161,7 +157,7 @@ impl TcpConnection {
     /// Close the connection.
     pub fn disconnect(&mut self) {
         self.stream = None;
-        self.pending.clear();
+        self.queued.clear();
     }
 
     fn stream_mut(&mut self) -> Result<&mut TcpStream> {
@@ -184,6 +180,10 @@ impl TcpConnection {
     }
 
     /// Send a request and wait for the response (matched by `refersTo`).
+    ///
+    /// Reads the connection itself while waiting; any other message that
+    /// arrives meanwhile is queued and returned by later [`recv`](Self::recv)
+    /// calls, in order.
     pub async fn send_request(
         &mut self,
         msg_type: MessageType,
@@ -191,10 +191,8 @@ impl TcpConnection {
         timeout: Duration,
     ) -> Result<TypedMessage> {
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-
-        let (tx, rx) = oneshot::channel();
-        self.pending.insert(id, PendingRequest { tx });
+        // 0 means "refers to nothing", so a response could never match it.
+        self.next_id = self.next_id.checked_add(1).unwrap_or(1);
 
         let stream = self.stream_mut()?;
         let mut base = BaseMessage {
@@ -208,27 +206,28 @@ impl TcpConnection {
         stamp_sent(&mut base);
         write_frame(stream, &mut base, payload).await?;
 
-        tokio::time::timeout(timeout, rx)
-            .await
-            .context("request timed out")?
-            .context("response channel closed")
+        tokio::time::timeout(timeout, async {
+            loop {
+                let stream = self.stream.as_mut().context("not connected")?;
+                let msg = read_frame(stream, &mut self.read_buf).await?;
+                if msg.base.refers_to == id {
+                    return Ok(msg);
+                }
+                self.queued.push_back(msg);
+            }
+        })
+        .await
+        .context("request timed out")?
     }
 
-    /// Receive the next message. If it's a response to a pending request,
-    /// deliver it to the waiting caller and receive again.
+    /// Receive the next message, starting with any queued while a
+    /// [`send_request`](Self::send_request) waited for its response.
     pub async fn recv(&mut self) -> Result<TypedMessage> {
-        loop {
-            let stream = self.stream.as_mut().context("not connected")?;
-            let msg = read_frame(stream, &mut self.read_buf).await?;
-
-            if msg.base.refers_to != 0
-                && let Some(pending) = self.pending.remove(&msg.base.refers_to)
-            {
-                let _ = pending.tx.send(msg);
-                continue;
-            }
+        if let Some(msg) = self.queued.pop_front() {
             return Ok(msg);
         }
+        let stream = self.stream.as_mut().context("not connected")?;
+        read_frame(stream, &mut self.read_buf).await
     }
 }
 
@@ -454,24 +453,91 @@ mod tests {
     #[tokio::test]
     async fn send_request_when_not_connected_errors_and_advances_id() {
         let mut conn = TcpConnection::new("localhost", 1704);
-        conn.next_id = u16::MAX; // exercise the wrapping_add
+        conn.next_id = u16::MAX; // exercise the wrap
         let payload = MessagePayload::Time(Time::default());
         let res = conn
             .send_request(MessageType::Time, &payload, Duration::from_millis(10))
             .await;
         assert!(res.is_err(), "not connected");
-        assert_eq!(conn.next_id, 0, "next_id wraps past u16::MAX");
+        assert_eq!(conn.next_id, 1, "next_id wraps past u16::MAX, skipping 0");
     }
 
     #[test]
-    fn disconnect_clears_stream_and_pending() {
+    fn disconnect_clears_stream_and_queue() {
         let mut conn = TcpConnection::new("localhost", 1704);
-        let (tx, _rx) = oneshot::channel();
-        conn.pending.insert(5, PendingRequest { tx });
-        assert_eq!(conn.pending.len(), 1);
+        conn.queued.push_back(TypedMessage {
+            base: BaseMessage {
+                msg_type: MessageType::Time,
+                id: 0,
+                refers_to: 0,
+                sent: Timeval::default(),
+                received: Timeval::default(),
+                size: 0,
+            },
+            payload: MessagePayload::Time(Time::default()),
+        });
         conn.disconnect();
         assert!(conn.stream.is_none());
-        assert!(conn.pending.is_empty());
+        assert!(conn.queued.is_empty());
+    }
+
+    /// Server stand-in: reads one request, sends an unrelated message and
+    /// then the response to it.
+    async fn answer_one_request(listener: tokio::net::TcpListener) {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let req = read_frame(&mut sock, &mut buf).await.unwrap();
+        let mut unrelated = BaseMessage {
+            msg_type: MessageType::Time,
+            id: 0,
+            refers_to: 0,
+            sent: Timeval::default(),
+            received: Timeval::default(),
+            size: 0,
+        };
+        let payload = MessagePayload::Time(Time {
+            latency: Timeval { sec: 0, usec: 1 },
+        });
+        write_frame(&mut sock, &mut unrelated, &payload)
+            .await
+            .unwrap();
+        let mut reply = BaseMessage {
+            refers_to: req.base.id,
+            ..unrelated
+        };
+        let payload = MessagePayload::Time(Time {
+            latency: Timeval { sec: 0, usec: 2 },
+        });
+        write_frame(&mut sock, &mut reply, &payload).await.unwrap();
+        // Keep the socket open until the client is done.
+        let _ = read_frame(&mut sock, &mut buf).await;
+    }
+
+    #[tokio::test]
+    async fn send_request_receives_its_response_and_queues_others() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(answer_one_request(listener));
+
+        let mut conn = TcpConnection::new("127.0.0.1", port);
+        conn.connect().await.unwrap();
+        let payload = MessagePayload::Time(Time::default());
+        let reply = conn
+            .send_request(MessageType::Time, &payload, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(reply.base.refers_to, 1);
+        let MessagePayload::Time(t) = reply.payload else {
+            panic!("expected Time");
+        };
+        assert_eq!(t.latency.usec, 2);
+
+        let queued = conn.recv().await.unwrap();
+        assert_eq!(queued.base.refers_to, 0);
+        let MessagePayload::Time(t) = queued.payload else {
+            panic!("expected Time");
+        };
+        assert_eq!(t.latency.usec, 1, "unrelated message is kept for recv");
     }
 
     // ---- steady-clock helpers ----
