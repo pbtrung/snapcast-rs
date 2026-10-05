@@ -38,9 +38,12 @@ fn parse_opus_header(payload: &[u8]) -> Result<SampleFormat> {
         bail!("not an Opus header (expected 0x{OPUS_ID:08X}, got 0x{id:08X})");
     }
     let rate = u32::from_le_bytes(payload[4..8].try_into().unwrap());
-    let bits = u16::from_le_bytes(payload[8..10].try_into().unwrap());
     let channels = u16::from_le_bytes(payload[10..12].try_into().unwrap());
-    Ok(SampleFormat::new(rate, bits, channels))
+    // The decoder always produces 16-bit samples, whatever width the header
+    // announces (bytes 8..10).
+    let format = SampleFormat::new(rate, 16, channels);
+    format.validate_concrete_pcm()?;
+    Ok(format)
 }
 
 /// Opus audio decoder (pure Rust).
@@ -132,6 +135,18 @@ mod tests {
         assert_eq!(sf.rate(), 48000);
         assert_eq!(sf.bits(), 16);
         assert_eq!(sf.channels(), 2);
+    }
+
+    #[test]
+    fn parse_header_rejects_zero_rate_or_channels() {
+        assert!(parse_opus_header(&opus_header(0, 16, 2)).is_err());
+        assert!(parse_opus_header(&opus_header(48000, 16, 0)).is_err());
+    }
+
+    #[test]
+    fn parse_header_reports_decoder_output_width() {
+        let sf = parse_opus_header(&opus_header(48000, 24, 2)).unwrap();
+        assert_eq!(sf.bits(), 16, "decoder output is 16-bit");
     }
 
     #[test]

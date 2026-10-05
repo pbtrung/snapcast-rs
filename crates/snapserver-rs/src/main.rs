@@ -99,6 +99,16 @@ struct Cli {
     logfilter: String,
 }
 
+/// Parse a sample format and require concrete PCM, so a typo or wildcard is
+/// reported instead of silently falling back to the default format.
+fn parse_pcm_format(value: &str) -> anyhow::Result<snapcast_proto::SampleFormat> {
+    let format: snapcast_proto::SampleFormat = value
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid sample format '{value}': {e}"))?;
+    format.validate_concrete_pcm()?;
+    Ok(format)
+}
+
 /// Library stream config for a configured source whose reader produces
 /// `format`. The encoder must use that same format, or a non-default
 /// `sampleformat` is mis-framed before encoding.
@@ -162,7 +172,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let codec = server_config.server.codec.clone();
-    let sample_format_str = server_config.server.sample_format.clone();
+    let default_format = parse_pcm_format(&server_config.server.sample_format)
+        .map_err(|e| anyhow::anyhow!("[stream] sampleformat: {e}"))?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -186,10 +197,6 @@ fn main() -> anyhow::Result<()> {
         });
 
         // Set up streams from configured sources
-        let default_format: snapcast_proto::SampleFormat = sample_format_str
-            .parse()
-            .unwrap_or(snapcast_proto::DEFAULT_SAMPLE_FORMAT);
-
         for source in &server_config.sources {
             let parsed = match stream::uri::StreamUri::parse(source) {
                 Ok(p) => p,
@@ -199,10 +206,16 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             let name = parsed.param("name").unwrap_or("default").to_string();
-            let format = parsed
-                .param("sampleformat")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(default_format);
+            let format = match parsed.param("sampleformat") {
+                Some(s) => match parse_pcm_format(s) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!(source, error = %e, "Skipping stream with invalid sampleformat");
+                        continue;
+                    }
+                },
+                None => default_format,
+            };
 
             let tx = server.add_stream_with_config(&name, source_stream_config(source, format));
 
@@ -462,6 +475,17 @@ async fn get_client_from_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_pcm_format_rejects_instead_of_falling_back() {
+        assert_eq!(
+            parse_pcm_format("44100:24:2").unwrap(),
+            snapcast_proto::SampleFormat::new(44100, 24, 2)
+        );
+        for bad in ["48000:16", "0:16:2", "48000:*:2", "48000:12:2", "garbage"] {
+            assert!(parse_pcm_format(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn source_stream_config_carries_source_format_to_encoder() {

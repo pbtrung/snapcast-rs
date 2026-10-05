@@ -595,7 +595,17 @@ fn spawn_stream_encoder(
     });
 }
 
-/// Convert f32 samples to PCM bytes at the given bit depth.
+/// Parse a configured sample format and require it to be concrete PCM.
+fn parse_pcm_format(value: &str) -> anyhow::Result<SampleFormat> {
+    let format: SampleFormat = value
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid sample_format '{value}': {e}"))?;
+    format
+        .validate_concrete_pcm()
+        .map_err(|e| anyhow::anyhow!("invalid sample_format '{value}': {e}"))?;
+    Ok(format)
+}
+
 impl SnapServer {
     /// Create a new server. Returns the server and event receiver.
     pub fn new(config: ServerConfig) -> (Self, mpsc::Receiver<ServerEvent>) {
@@ -629,12 +639,10 @@ impl SnapServer {
     /// and handles 20ms chunking, monotonic timestamps, and gap detection internally.
     ///
     /// # Errors
-    /// Returns an error if the server's `sample_format` cannot be parsed.
+    /// Returns an error if the server's `sample_format` cannot be parsed or is
+    /// not concrete PCM.
     pub fn add_f32_stream(&mut self, name: &str) -> Result<F32AudioSender, String> {
-        let sf: SampleFormat =
-            self.config.sample_format.parse().map_err(|e| {
-                format!("invalid sample_format '{}': {e}", self.config.sample_format)
-            })?;
+        let sf = parse_pcm_format(&self.config.sample_format).map_err(|e| e.to_string())?;
         let (tx, rx) = mpsc::channel(F32_CHANNEL_SIZE);
         self.streams
             .push((name.to_string(), StreamConfig::default(), rx));
@@ -679,11 +687,7 @@ impl SnapServer {
 
         let event_tx = self.event_tx.clone();
 
-        let sample_format: snapcast_proto::SampleFormat = self
-            .config
-            .sample_format
-            .parse()
-            .unwrap_or(snapcast_proto::DEFAULT_SAMPLE_FORMAT);
+        let sample_format = parse_pcm_format(&self.config.sample_format)?;
 
         anyhow::ensure!(
             !self.streams.is_empty(),
@@ -754,11 +758,12 @@ impl SnapServer {
                 }
             } else {
                 let stream_codec = stream_cfg.codec.as_deref().unwrap_or(&self.config.codec);
-                let stream_format: snapcast_proto::SampleFormat = stream_cfg
-                    .sample_format
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(sample_format);
+                let stream_format = match stream_cfg.sample_format.as_deref() {
+                    Some(s) => {
+                        parse_pcm_format(s).map_err(|e| anyhow::anyhow!("stream '{name}': {e}"))?
+                    }
+                    None => sample_format,
+                };
                 active_format = stream_format;
                 encoder::create(&encoder::EncoderConfig {
                     codec: stream_codec.to_string(),
@@ -927,6 +932,32 @@ mod tests {
         // 100 frames at 48 kHz = 2083 µs; 380 frames = 7916 µs.
         assert_eq!(first.timestamp_usec, 1_000_000 - 2083);
         assert_eq!(second.timestamp_usec, 1_000_000 + 7916);
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_non_concrete_sample_formats() {
+        for (server_format, stream_format) in [("0:16:2", None), ("48000:16:2", Some("48000:*:2"))]
+        {
+            let (mut server, _events) = SnapServer::new(ServerConfig {
+                sample_format: server_format.into(),
+                ..Default::default()
+            });
+            server.add_stream_with_config(
+                "s",
+                StreamConfig {
+                    sample_format: stream_format.map(Into::into),
+                    ..Default::default()
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let err = server.serve(listener).await.unwrap_err().to_string();
+            assert!(err.contains("invalid sample_format"), "{err}");
+        }
+        let (mut server, _events) = SnapServer::new(ServerConfig {
+            sample_format: "48000:16:0".into(),
+            ..Default::default()
+        });
+        assert!(server.add_f32_stream("f").is_err());
     }
 
     #[tokio::test]

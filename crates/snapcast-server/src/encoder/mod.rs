@@ -71,6 +71,9 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
         ..
     } = config;
     let format = *format;
+    format
+        .validate_concrete_pcm()
+        .map_err(|e| anyhow::anyhow!("{codec} encoder: {e}"))?;
     let (codec, options) = match codec.split_once(':') {
         Some((name, inline)) if options.is_empty() => (name, inline),
         _ => (codec.as_str(), options.as_str()),
@@ -179,5 +182,23 @@ mod tests {
         }
         let err = create(&config("nope:X:1")).err().unwrap().to_string();
         assert!(err.contains("unsupported codec: nope"), "{err}");
+    }
+
+    #[test]
+    fn create_rejects_non_concrete_formats() {
+        for format in [
+            SampleFormat::new(0, 16, 2),
+            SampleFormat::new(48000, 0, 2),
+            SampleFormat::new(48000, 8, 2),
+            SampleFormat::new(48000, 16, 0),
+        ] {
+            let config = EncoderConfig {
+                codec: "pcm".into(),
+                format,
+                options: String::new(),
+            };
+            let err = create(&config).err().expect("rejected").to_string();
+            assert!(err.contains("unsupported sample format"), "{err}");
+        }
     }
 }

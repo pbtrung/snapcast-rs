@@ -43,6 +43,8 @@ fn parse_streaminfo(payload: &[u8]) -> Result<(SampleFormat, AudioCodecParameter
     let bits_per_sample = (((b12 & 0x01) << 4) | (si[13] as u32 >> 4)) + 1;
 
     let sf = SampleFormat::new(sample_rate, bits_per_sample as u16, channels as u16);
+    // Decoded output is f32 at the stream's rate and channel count.
+    SampleFormat::new(sample_rate, 32, channels as u16).validate_concrete_pcm()?;
 
     let mut params = AudioCodecParameters::new();
     params

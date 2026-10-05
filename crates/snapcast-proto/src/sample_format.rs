@@ -18,7 +18,21 @@ pub enum SampleFormatError {
     /// A numeric field could not be parsed.
     #[error("invalid number in sample format: {0}")]
     InvalidNumber(#[from] std::num::ParseIntError),
+    /// The format is not concrete PCM that sources, encoders and decoders
+    /// can process (see [`SampleFormat::validate_concrete_pcm`]).
+    #[error("unsupported sample format {format}: {reason}")]
+    Unsupported {
+        /// The rejected format.
+        format: SampleFormat,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
 }
+
+/// Highest sample rate accepted by [`SampleFormat::validate_concrete_pcm`].
+pub const MAX_SAMPLE_RATE: u32 = 768_000;
+/// Highest channel count accepted by [`SampleFormat::validate_concrete_pcm`].
+pub const MAX_CHANNELS: u16 = 256;
 
 /// Audio sample format: rate, bit depth, and channel count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +93,35 @@ impl SampleFormat {
     pub fn is_initialized(&self) -> bool {
         self.rate != 0 || self.bits != 0 || self.channels != 0
     }
+
+    /// Check that this is a concrete PCM format that audio can actually be
+    /// read, encoded or played in.
+    ///
+    /// Parsing accepts wildcards (`*` → 0) and arbitrary widths because a
+    /// format string may describe a still-unresolved format; anything that
+    /// frames, paces or converts samples must call this first. Requires a
+    /// rate of 1..=[`MAX_SAMPLE_RATE`] Hz, 1..=[`MAX_CHANNELS`] channels and
+    /// 16-, 24- (padded to 4 bytes) or 32-bit samples, which keeps frame and
+    /// byte-rate arithmetic free of overflow.
+    pub fn validate_concrete_pcm(&self) -> Result<(), SampleFormatError> {
+        let reason = if self.rate == 0 {
+            "sample rate must be nonzero"
+        } else if self.rate > MAX_SAMPLE_RATE {
+            "sample rate is above 768000 Hz"
+        } else if !matches!(self.bits, 16 | 24 | 32) {
+            "bit depth must be 16, 24 or 32"
+        } else if self.channels == 0 {
+            "channel count must be nonzero"
+        } else if self.channels > MAX_CHANNELS {
+            "channel count is above 256"
+        } else {
+            return Ok(());
+        };
+        Err(SampleFormatError::Unsupported {
+            format: *self,
+            reason,
+        })
+    }
 }
 
 impl FromStr for SampleFormat {
@@ -126,6 +169,37 @@ impl fmt::Display for SampleFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_concrete_pcm_accepts_supported_formats() {
+        for s in ["48000:16:2", "44100:24:2", "96000:32:8", "8000:16:1"] {
+            let sf: SampleFormat = s.parse().unwrap();
+            assert!(sf.validate_concrete_pcm().is_ok(), "{s}");
+        }
+    }
+
+    #[test]
+    fn validate_concrete_pcm_rejects_wildcards_and_unsupported_widths() {
+        for s in [
+            "*:16:2",
+            "0:16:2",
+            "48000:*:2",
+            "48000:1:2",
+            "48000:8:2",
+            "48000:20:2",
+            "48000:16:0",
+            "48000:16:*",
+            "48000:16:257",
+            "800000:16:2",
+        ] {
+            let sf: SampleFormat = s.parse().unwrap();
+            let err = sf.validate_concrete_pcm().unwrap_err();
+            assert!(
+                err.to_string().starts_with("unsupported sample format"),
+                "{s}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn parse_standard_format() {

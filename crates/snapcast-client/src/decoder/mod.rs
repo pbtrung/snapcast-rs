@@ -79,11 +79,11 @@ fn parse_riff_header(payload: &[u8]) -> Result<SampleFormat> {
         bail!("sample format not found in RIFF header");
     }
 
-    Ok(SampleFormat::new(
-        sample_rate,
-        bits_per_sample,
-        num_channels,
-    ))
+    // Passthrough PCM is framed and converted as-is, so it must be a width
+    // and layout the player handles.
+    let format = SampleFormat::new(sample_rate, bits_per_sample, num_channels);
+    format.validate_concrete_pcm()?;
+    Ok(format)
 }
 
 impl Decoder for PcmDecoder {
@@ -138,6 +138,16 @@ mod tests {
         assert_eq!(sf.rate(), 48000);
         assert_eq!(sf.bits(), 16);
         assert_eq!(sf.channels(), 2);
+    }
+
+    #[test]
+    fn wav_header_with_unsupported_format_fails() {
+        let mut h = wav_header_48000_16_2();
+        h[34..36].copy_from_slice(&8u16.to_le_bytes()); // 8-bit samples
+        assert!(parse_riff_header(&h).is_err());
+        let mut h = wav_header_48000_16_2();
+        h[22..24].copy_from_slice(&0u16.to_le_bytes()); // no channels
+        assert!(parse_riff_header(&h).is_err());
     }
 
     #[test]
