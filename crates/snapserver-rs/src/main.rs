@@ -99,6 +99,20 @@ struct Cli {
     logfilter: String,
 }
 
+/// Library stream config for a configured source whose reader produces
+/// `format`. The encoder must use that same format, or a non-default
+/// `sampleformat` is mis-framed before encoding.
+fn source_stream_config(
+    source: &str,
+    format: snapcast_proto::SampleFormat,
+) -> snapcast_server::StreamConfig {
+    snapcast_server::StreamConfig {
+        sample_format: Some(format.to_string()),
+        uri: Some(source.trim().trim_matches(['\'', '"']).to_string()),
+        ..Default::default()
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -190,13 +204,7 @@ fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(default_format);
 
-            let tx = server.add_stream_with_config(
-                &name,
-                snapcast_server::StreamConfig {
-                    uri: Some(source.trim().trim_matches(['\'', '"']).to_string()),
-                    ..Default::default()
-                },
-            );
+            let tx = server.add_stream_with_config(&name, source_stream_config(source, format));
 
             // Chunk size matches codec block size:
             // FLAC level 0-2: 1152 frames, level 3+: 4096 frames
@@ -449,4 +457,20 @@ async fn get_client_from_status(
         .find(|c| c["id"].as_str() == Some(client_id))
         .cloned()
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_stream_config_carries_source_format_to_encoder() {
+        let format = snapcast_proto::SampleFormat::new(44100, 24, 2);
+        let cfg = source_stream_config("'pipe:///music?sampleformat=44100:24:2'", format);
+        assert_eq!(cfg.sample_format.as_deref(), Some("44100:24:2"));
+        assert_eq!(
+            cfg.uri.as_deref(),
+            Some("pipe:///music?sampleformat=44100:24:2")
+        );
+    }
 }
