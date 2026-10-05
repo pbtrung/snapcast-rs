@@ -3,7 +3,7 @@
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
 
-use super::{EncodedChunk, Encoder};
+use super::{EncodedPacket, Encoder};
 use crate::AudioData;
 
 /// PCM passthrough encoder. Header is a 44-byte WAV header.
@@ -34,7 +34,7 @@ impl Encoder for PcmEncoder {
         &self.header
     }
 
-    fn encode(&mut self, input: &AudioData) -> Result<EncodedChunk> {
+    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
         let data = match input {
             AudioData::Pcm(pcm) => pcm.clone(),
             AudioData::F32(samples) => {
@@ -50,7 +50,13 @@ impl Encoder for PcmEncoder {
                 super::f32_to_pcm(samples, self.format.bits())
             }
         };
-        Ok(EncodedChunk { data })
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![EncodedPacket {
+            data,
+            offset_frames: 0,
+        }])
     }
 }
 
@@ -92,7 +98,9 @@ mod tests {
 
         let pcm = vec![0u8; 960 * 4];
         let result = enc.encode(&AudioData::Pcm(pcm.clone())).unwrap();
-        assert_eq!(result.data.len(), pcm.len());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].data.len(), pcm.len());
+        assert_eq!(result[0].offset_frames, 0);
     }
 
     #[test]
@@ -101,7 +109,7 @@ mod tests {
         let mut enc = PcmEncoder::new(fmt);
         let samples = vec![0.0f32; 960];
         let result = enc.encode(&AudioData::F32(samples)).unwrap();
-        assert_eq!(result.data.len(), 960 * 2); // 16-bit = 2 bytes/sample
+        assert_eq!(result[0].data.len(), 960 * 2); // 16-bit = 2 bytes/sample
     }
 
     #[test]

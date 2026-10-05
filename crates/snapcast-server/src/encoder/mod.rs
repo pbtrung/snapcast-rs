@@ -11,10 +11,18 @@ use snapcast_proto::SampleFormat;
 
 use crate::AudioData;
 
-/// Result of encoding an audio chunk.
-pub(crate) struct EncodedChunk {
+/// One self-contained codec packet, sent to clients as one `WireChunk`.
+///
+/// Clients hand each `WireChunk` to their decoder as a single packet, so
+/// packets must never be concatenated.
+#[derive(Debug)]
+pub(crate) struct EncodedPacket {
     /// Encoded audio data.
     pub data: Vec<u8>,
+    /// Position of the packet's first sample relative to the first sample of
+    /// the input passed to [`Encoder::encode`], in frames. Negative when the
+    /// packet starts with samples buffered from earlier input.
+    pub offset_frames: i64,
 }
 
 /// Trait for audio encoders.
@@ -29,7 +37,11 @@ pub(crate) trait Encoder: Send {
     fn header(&self) -> &[u8];
 
     /// Encode an audio chunk. Accepts F32 or Pcm input.
-    fn encode(&mut self, input: &AudioData) -> Result<EncodedChunk>;
+    ///
+    /// Returns every packet completed by this input, in order: none while
+    /// the encoder is still buffering toward a full packet, several when the
+    /// input spans more than one.
+    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>>;
 
     /// Drop buffered input and codec state before encoding resumes after a
     /// gap, so the first output after the gap holds no audio from before it.

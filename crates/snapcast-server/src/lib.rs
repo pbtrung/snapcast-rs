@@ -574,17 +574,21 @@ fn spawn_stream_encoder(
                     tracing::debug!(stream = %stream_id, "Client connected, resuming encoding");
                 }
                 match enc.encode(&frame.data) {
-                    Ok(encoded) if !encoded.data.is_empty() => {
-                        let _ = chunk_tx.send(WireChunkData {
-                            stream_id: stream_id.clone(),
-                            timestamp_usec: frame.timestamp_usec,
-                            data: encoded.data.into(),
-                        });
+                    // One WireChunk per packet: clients decode each chunk as a
+                    // single codec packet. Empty while the encoder buffers.
+                    Ok(packets) => {
+                        for packet in packets {
+                            let _ = chunk_tx.send(WireChunkData {
+                                stream_id: stream_id.clone(),
+                                timestamp_usec: frame.timestamp_usec
+                                    + packet.offset_frames * 1_000_000 / i64::from(sample_rate),
+                                data: packet.data.into(),
+                            });
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(stream = %stream_id, error = %e, "Encode failed");
                     }
-                    _ => {} // encoder buffering
                 }
             }
         });
@@ -843,12 +847,15 @@ mod tests {
             &[]
         }
 
-        fn encode(&mut self, input: &AudioData) -> anyhow::Result<encoder::EncodedChunk> {
+        fn encode(&mut self, input: &AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
             self.encodes.fetch_add(1, Ordering::SeqCst);
             let AudioData::Pcm(data) = input else {
                 anyhow::bail!("expected Pcm");
             };
-            Ok(encoder::EncodedChunk { data: data.clone() })
+            Ok(vec![encoder::EncodedPacket {
+                data: data.clone(),
+                offset_frames: 0,
+            }])
         }
 
         fn reset(&mut self) {
@@ -870,6 +877,56 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// Encoder that splits every input into two packets 480 frames apart,
+    /// the first starting 100 frames before the input.
+    struct SplittingEncoder;
+
+    impl encoder::Encoder for SplittingEncoder {
+        fn name(&self) -> &str {
+            "split"
+        }
+
+        fn header(&self) -> &[u8] {
+            &[]
+        }
+
+        fn encode(&mut self, _input: &AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
+            Ok(vec![
+                encoder::EncodedPacket {
+                    data: vec![1],
+                    offset_frames: -100,
+                },
+                encoder::EncodedPacket {
+                    data: vec![2],
+                    offset_frames: 380,
+                },
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn each_packet_is_its_own_chunk_with_offset_timestamp() {
+        let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
+        let (chunk_tx, mut chunks) = broadcast::channel(16);
+        spawn_stream_encoder(
+            "s".into(),
+            rx,
+            Box::new(SplittingEncoder),
+            chunk_tx,
+            48000,
+            2,
+        );
+
+        tx.send(pcm_frame(1_000_000)).await.unwrap();
+        let first = chunks.recv().await.unwrap();
+        let second = chunks.recv().await.unwrap();
+        assert_eq!(&first.data[..], [1]);
+        assert_eq!(&second.data[..], [2]);
+        // 100 frames at 48 kHz = 2083 µs; 380 frames = 7916 µs.
+        assert_eq!(first.timestamp_usec, 1_000_000 - 2083);
+        assert_eq!(second.timestamp_usec, 1_000_000 + 7916);
     }
 
     #[tokio::test]

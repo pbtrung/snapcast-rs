@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use opus::{Application, Bitrate, Channels, Encoder as OpusEnc};
 use snapcast_proto::SampleFormat;
 
-use super::{EncodedChunk, Encoder};
+use super::{EncodedPacket, Encoder};
 use crate::AudioData;
 
 /// Default bitrate in bits/second (matches C++ snapserver).
@@ -59,6 +59,8 @@ pub struct OpusEncoder {
     encoder: OpusEnc,
     header: Vec<u8>,
     frame_size: usize,
+    /// Interleaved 16-bit samples not yet filling a whole Opus frame.
+    pending: Vec<i16>,
     warned: bool,
 }
 
@@ -113,6 +115,7 @@ impl OpusEncoder {
             encoder,
             header,
             frame_size,
+            pending: Vec::new(),
             warned: false,
         })
     }
@@ -127,7 +130,7 @@ impl Encoder for OpusEncoder {
         &self.header
     }
 
-    fn encode(&mut self, input: &AudioData) -> Result<EncodedChunk> {
+    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
         let pcm = match input {
             AudioData::Pcm(data) if self.format.bits() == 16 => {
                 std::borrow::Cow::Borrowed(data.as_slice())
@@ -158,42 +161,50 @@ impl Encoder for OpusEncoder {
 
         let channels = self.format.channels() as usize;
         let frame_samples = self.frame_size * channels;
-        let frame_bytes = frame_samples * 2; // 16-bit samples
-        let total_frames = pcm.len() / (channels * 2);
-        tracing::trace!(
-            codec = "opus",
-            input_bytes = pcm.len(),
-            total_frames,
-            "encode"
-        );
-
-        let mut output = Vec::new();
-        let mut encode_buf = [0u8; 4096];
-
-        for chunk in pcm.chunks(frame_bytes) {
-            if chunk.len() < frame_bytes {
-                break;
-            }
-            let samples: Vec<i16> = chunk
+        // Frames carried from earlier input start before this input does.
+        let carried_frames = (self.pending.len() / channels) as i64;
+        // Whole inter-channel frames only, so interleaving never shifts.
+        let aligned = pcm.len() - pcm.len() % (channels * 2);
+        self.pending.extend(
+            pcm[..aligned]
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                .collect();
+                .map(|b| i16::from_le_bytes(*b)),
+        );
+        tracing::trace!(
+            codec = "opus",
+            input_bytes = pcm.len(),
+            pending_frames = self.pending.len() / channels,
+            "encode"
+        );
 
-            match self.encoder.encode(&samples, &mut encode_buf) {
-                Ok(len) => output.extend_from_slice(&encode_buf[..len]),
+        let mut packets = Vec::new();
+        let mut encode_buf = [0u8; 4096];
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= frame_samples {
+            let samples = &self.pending[consumed..consumed + frame_samples];
+            let len = match self.encoder.encode(samples, &mut encode_buf) {
+                Ok(len) => len,
                 Err(e) => {
                     tracing::warn!(codec = "opus", error = %e, "encode failed");
+                    self.pending.drain(..consumed + frame_samples);
                     bail!("Opus encode failed: {e}");
                 }
-            }
+            };
+            packets.push(EncodedPacket {
+                data: encode_buf[..len].to_vec(),
+                offset_frames: (packets.len() * self.frame_size) as i64 - carried_frames,
+            });
+            consumed += frame_samples;
         }
+        self.pending.drain(..consumed);
 
-        Ok(EncodedChunk { data: output })
+        Ok(packets)
     }
 
     fn reset(&mut self) {
+        self.pending.clear();
         if let Err(e) = self.encoder.reset_state() {
             tracing::warn!(codec = "opus", error = %e, "reset failed");
         }
@@ -243,6 +254,41 @@ mod tests {
         assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 48000);
         assert_eq!(u16::from_le_bytes(h[8..10].try_into().unwrap()), 16);
         assert_eq!(u16::from_le_bytes(h[10..12].try_into().unwrap()), 2);
+    }
+
+    /// Interleaved 16-bit stereo PCM bytes for `frames` frames of a tone.
+    fn tone(frames: usize) -> Vec<u8> {
+        (0..frames * 2)
+            .flat_map(|n| ((((n as f32) * 0.05).sin() * 8000.0) as i16).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn multi_frame_input_yields_one_decodable_packet_per_frame() {
+        let fmt = SampleFormat::new(48000, 16, 2);
+        let mut enc = OpusEncoder::new(fmt, "").unwrap();
+        // 300 frames stay pending, then 3.5 Opus frames complete three more.
+        assert!(enc.encode(&AudioData::Pcm(tone(300))).unwrap().is_empty());
+        let packets = enc.encode(&AudioData::Pcm(tone(960 * 3 + 480))).unwrap();
+        assert_eq!(packets.len(), 3, "one packet per 20 ms frame");
+        let offsets: Vec<i64> = packets.iter().map(|p| p.offset_frames).collect();
+        assert_eq!(offsets, [-300, 960 - 300, 2 * 960 - 300]);
+
+        let mut dec = opus::Decoder::new(48000, Channels::Stereo).unwrap();
+        let mut out = vec![0i16; 5760 * 2];
+        for p in &packets {
+            let n = dec.decode(&p.data, &mut out, false).unwrap();
+            assert_eq!(n, 960, "each packet decodes to exactly one frame");
+        }
+        assert_eq!(enc.pending.len(), (300 + 480) * 2, "remainder is carried");
+    }
+
+    #[test]
+    fn reset_drops_partial_frame() {
+        let mut enc = OpusEncoder::new(SampleFormat::new(48000, 16, 2), "").unwrap();
+        assert!(enc.encode(&AudioData::Pcm(tone(500))).unwrap().is_empty());
+        enc.reset();
+        assert!(enc.pending.is_empty());
     }
 
     #[test]
