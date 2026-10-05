@@ -28,7 +28,12 @@ pub struct TestServer {
 
 /// Start a default server on a random port. Returns the handle once serving.
 pub async fn start_server() -> TestServer {
-    let (mut server, events) = SnapServer::new(ServerConfig::default());
+    start_server_with(ServerConfig::default()).await
+}
+
+/// Start a server with `config` and one `default` stream on a random port.
+pub async fn start_server_with(config: ServerConfig) -> TestServer {
+    let (mut server, events) = SnapServer::new(config);
     let audio_tx = server.add_stream("default");
     let cmd = server.command_sender();
     let port = spawn_serving(server).await;

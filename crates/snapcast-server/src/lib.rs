@@ -434,7 +434,26 @@ pub struct ServerConfig {
     pub initial_state: Option<state::ServerState>,
     /// Send audio data to muted clients. Default: false (skip muted, saves bandwidth).
     pub send_audio_to_muted: bool,
+    /// Close a streaming client's session once nothing was received from it
+    /// for this long, or a write to it stalls for this long. Snapclients
+    /// send a time sync request every second, so this only trips on dead or
+    /// half-open connections. `None` = never. Default: 10 s.
+    pub client_idle_timeout: Option<std::time::Duration>,
+    /// Delete clients from the server state (as `DeleteClient` does) once
+    /// they have been disconnected for this long. `None` = keep them forever.
+    /// Default: 2 days.
+    pub remove_disconnected_clients_after: Option<std::time::Duration>,
 }
+
+/// Default for [`ServerConfig::client_idle_timeout`].
+pub const DEFAULT_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Default for [`ServerConfig::remove_disconnected_clients_after`].
+pub const DEFAULT_REMOVE_DISCONNECTED_CLIENTS_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(2 * 24 * 60 * 60);
+
+/// Longest pause between sweeps for clients to remove.
+const MAX_CLIENT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -447,6 +466,8 @@ impl Default for ServerConfig {
             client_filter: None,
             initial_state: None,
             send_audio_to_muted: false,
+            client_idle_timeout: Some(DEFAULT_CLIENT_IDLE_TIMEOUT),
+            remove_disconnected_clients_after: Some(DEFAULT_REMOVE_DISCONNECTED_CLIENTS_AFTER),
         }
     }
 }
@@ -714,7 +735,12 @@ impl SnapServer {
 
         // Shared state for command handlers — seeded from the embedder-supplied
         // snapshot (the library reads no files).
-        let initial_state = self.config.initial_state.take().unwrap_or_default();
+        let mut initial_state = self.config.initial_state.take().unwrap_or_default();
+        // No session exists yet, whatever the snapshot recorded (e.g. one
+        // saved while clients were connected).
+        for client in initial_state.clients.values_mut() {
+            client.connected = false;
+        }
         let shared_state = Arc::new(tokio::sync::Mutex::new(initial_state));
 
         // Create session server before stream registration
@@ -730,6 +756,7 @@ impl SnapServer {
             shared_state: Arc::clone(&shared_state),
             default_stream: first_name.clone(),
             send_audio_to_muted: self.config.send_audio_to_muted,
+            idle_timeout: self.config.client_idle_timeout,
         }));
 
         for (name, stream_cfg, rx) in streams {
@@ -813,9 +840,21 @@ impl SnapServer {
             buffer_ms: self.config.buffer_ms as i32,
         };
 
+        let remove_after = self.config.remove_disconnected_clients_after;
+        let mut client_sweep =
+            tokio::time::interval(remove_after.map_or(MAX_CLIENT_SWEEP_INTERVAL, |d| {
+                d.min(MAX_CLIENT_SWEEP_INTERVAL)
+            }));
+        client_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         // Main loop
         loop {
             tokio::select! {
+                _ = client_sweep.tick(), if remove_after.is_some() => {
+                    if let Some(after) = remove_after {
+                        dispatcher.remove_disconnected_clients(after).await;
+                    }
+                }
                 cmd = command_rx.recv() => {
                     match cmd {
                         Some(ServerCommand::Stop) | None => {

@@ -26,6 +26,43 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// Delete every client that has been disconnected for at least `after`,
+    /// exactly as [`ServerCommand::DeleteClient`] would. Returns the ids
+    /// removed.
+    pub(crate) async fn remove_disconnected_clients(
+        &self,
+        after: std::time::Duration,
+    ) -> Vec<String> {
+        let Some(cutoff) = std::time::SystemTime::now().checked_sub(after) else {
+            return Vec::new();
+        };
+        let mut s = self.shared_state.lock().await;
+        let stale = s.disconnected_clients_since(cutoff);
+        if stale.is_empty() {
+            return stale;
+        }
+        for id in &stale {
+            s.remove_client(id);
+        }
+        let snapshot = s.clone();
+        drop(s);
+        tracing::info!(
+            clients = ?stale,
+            after = ?after,
+            "Removed clients disconnected for too long"
+        );
+        self.announce_removed_clients(snapshot).await;
+        stale
+    }
+
+    /// Report a structural change after clients were deleted.
+    async fn announce_removed_clients(&self, snapshot: ServerState) {
+        let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        // Mirrors Server.OnUpdate in C++ snapserver after Server.DeleteClient.
+        let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+        self.session_srv.update_routing_all().await;
+    }
+
     /// Handle one command.
     ///
     /// `Stop`/`None` are handled by the run loop and never reach here.
@@ -154,13 +191,10 @@ impl Dispatcher {
             }
             ServerCommand::DeleteClient { client_id } => {
                 let mut s = self.shared_state.lock().await;
-                s.remove_client_from_groups(&client_id);
-                s.clients.remove(&client_id);
+                s.remove_client(&client_id);
                 let snapshot = s.clone();
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
-                self.session_srv.update_routing_all().await;
+                self.announce_removed_clients(snapshot).await;
             }
             ServerCommand::SetStreamMeta {
                 stream_id,
@@ -241,6 +275,7 @@ mod tests {
             shared_state: Arc::clone(&shared_state),
             default_stream: "default".into(),
             send_audio_to_muted: false,
+            idle_timeout: None,
         }));
         let (event_tx, event_rx) = mpsc::channel(256);
         (
@@ -252,6 +287,60 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn removes_only_clients_disconnected_longer_than_threshold() {
+        let mut state = ServerState::default();
+        for id in ["old", "recent", "live"] {
+            state.get_or_create_client(id, id, id);
+            state.group_for_client(id, "default");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let three_days = 3 * 24 * 3600;
+        let set = |state: &mut ServerState, id: &str, connected: bool, sec: u64| {
+            let c = state.clients.get_mut(id).unwrap();
+            c.connected = connected;
+            c.last_seen.sec = sec;
+        };
+        set(&mut state, "old", false, now - three_days);
+        set(&mut state, "recent", false, now - 3600);
+        // Connected clients stay however stale last_seen looks.
+        set(&mut state, "live", true, now - three_days);
+
+        let (d, mut events) = dispatcher_with(state);
+        let removed = d
+            .remove_disconnected_clients(crate::DEFAULT_REMOVE_DISCONNECTED_CLIENTS_AFTER)
+            .await;
+        assert_eq!(removed, ["old"]);
+
+        let s = d.shared_state.lock().await;
+        assert!(!s.clients.contains_key("old"));
+        assert!(s.clients.contains_key("recent"));
+        assert!(s.clients.contains_key("live"));
+        assert!(
+            !s.groups
+                .iter()
+                .any(|g| g.clients.iter().any(|c| c == "old")),
+            "removed from its group"
+        );
+        assert_eq!(s.groups.len(), 2, "the emptied group is gone");
+        drop(s);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ServerEvent::StateChanged(_))
+        ));
+        assert!(matches!(events.try_recv(), Ok(ServerEvent::ServerUpdated)));
+
+        // Nothing left to remove: no events.
+        let removed = d
+            .remove_disconnected_clients(crate::DEFAULT_REMOVE_DISCONNECTED_CLIENTS_AFTER)
+            .await;
+        assert!(removed.is_empty());
+        assert!(events.try_recv().is_err());
     }
 
     /// State with one client `c1` in a group on stream `default`; returns the group id.

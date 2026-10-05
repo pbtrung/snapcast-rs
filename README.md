@@ -37,6 +37,24 @@ Both libraries are pure audio engines — no device I/O, no HTTP, no config file
 | `opus`   | —       | libopus   | Opus encoding |
 | `mdns`   | ✅      | avahi     | mDNS service advertisement (binary only) |
 
+## Inactive Clients
+
+The server drops dead connections and forgets long-gone clients. Both are set
+in `snapserver.conf` (durations take `s`/`m`/`h`/`d`, bare numbers are
+seconds, `0` disables):
+
+```ini
+[streaming_client]
+# Close a session that sends nothing (clients sync time every second) or
+# whose writes stall for this long. The client then shows as disconnected.
+idle_timeout = 10s
+# Delete clients disconnected for this long, as Server.DeleteClient does.
+remove_disconnected_after = 2d
+```
+
+Library users set `ServerConfig::client_idle_timeout` and
+`ServerConfig::remove_disconnected_clients_after`.
+
 ## Codecs
 
 | Codec  | Default | C dep | Precision | Latency |

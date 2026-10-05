@@ -199,6 +199,33 @@ impl ServerState {
         self.groups.last_mut().expect("just pushed")
     }
 
+    /// Delete a client: drop it from its group (removing the group if it
+    /// empties) and from the client list.
+    pub fn remove_client(&mut self, client_id: &str) {
+        self.remove_client_from_groups(client_id);
+        self.clients.remove(client_id);
+    }
+
+    /// Ids of clients that are disconnected and were last seen at or before
+    /// `cutoff` (wall-clock time).
+    pub fn disconnected_clients_since(&self, cutoff: std::time::SystemTime) -> Vec<String> {
+        let cutoff = cutoff
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut ids: Vec<String> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                let last_seen = std::time::Duration::new(c.last_seen.sec, 0)
+                    + std::time::Duration::from_micros(c.last_seen.usec);
+                !c.connected && last_seen <= cutoff
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Remove a client from all groups.
     pub fn remove_client_from_groups(&mut self, client_id: &str) {
         for group in &mut self.groups {

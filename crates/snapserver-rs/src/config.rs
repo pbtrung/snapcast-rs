@@ -108,7 +108,42 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
         get_u32(s, "buffer", |v| config.server.buffer_ms = v);
     }
 
+    if let Some(s) = ini.section(Some("streaming_client")) {
+        get_duration(s, "idle_timeout", |v| config.server.client_idle_timeout = v);
+        get_duration(s, "remove_disconnected_after", |v| {
+            config.server.remove_disconnected_clients_after = v;
+        });
+    }
+
     config
+}
+
+/// Parse a duration such as `10`, `10s`, `5m`, `12h` or `2d` (bare numbers
+/// are seconds). `0` means "disabled" and yields `Some(None)`.
+fn parse_duration(value: &str) -> Option<Option<std::time::Duration>> {
+    let value = value.trim();
+    let (number, unit_secs) = match value.char_indices().last()? {
+        (i, 's') => (&value[..i], 1),
+        (i, 'm') => (&value[..i], 60),
+        (i, 'h') => (&value[..i], 3600),
+        (i, 'd') => (&value[..i], 86_400),
+        _ => (value, 1),
+    };
+    let secs = number.trim().parse::<u64>().ok()?.checked_mul(unit_secs)?;
+    Some((secs > 0).then(|| std::time::Duration::from_secs(secs)))
+}
+
+fn get_duration<F: FnOnce(Option<std::time::Duration>)>(
+    section: &ini::Properties,
+    key: &str,
+    f: F,
+) {
+    if let Some(v) = section.get(key) {
+        match parse_duration(v) {
+            Some(d) => f(d),
+            None => tracing::warn!(key, value = v, "Ignoring invalid duration"),
+        }
+    }
 }
 
 fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
@@ -393,6 +428,65 @@ mod tests {
         assert_eq!(config.server.codec, "pcm");
         assert_eq!(config.server.sample_format, "44100:24:2");
         assert_eq!(config.server.buffer_ms, 2000);
+    }
+
+    // ---- Streaming client timeouts ----
+
+    #[test]
+    fn streaming_client_timeouts_default_to_10s_and_2d() {
+        let config = BinaryConfig::default();
+        assert_eq!(
+            config.server.client_idle_timeout,
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            config.server.remove_disconnected_clients_after,
+            Some(std::time::Duration::from_secs(2 * 86_400))
+        );
+    }
+
+    #[test]
+    fn streaming_client_timeouts_parse_units_and_zero_disables() {
+        let config = config_from(
+            "[streaming_client]\nidle_timeout = 30s\nremove_disconnected_after = 12h\n",
+        );
+        assert_eq!(
+            config.server.client_idle_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            config.server.remove_disconnected_clients_after,
+            Some(std::time::Duration::from_secs(12 * 3600))
+        );
+
+        let config =
+            config_from("[streaming_client]\nidle_timeout = 0\nremove_disconnected_after = 0\n");
+        assert_eq!(config.server.client_idle_timeout, None);
+        assert_eq!(config.server.remove_disconnected_clients_after, None);
+    }
+
+    #[test]
+    fn parse_duration_forms() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("15"), Some(Some(Duration::from_secs(15))));
+        assert_eq!(parse_duration("5m"), Some(Some(Duration::from_secs(300))));
+        assert_eq!(
+            parse_duration(" 2d "),
+            Some(Some(Duration::from_secs(172_800)))
+        );
+        assert_eq!(parse_duration("0s"), Some(None));
+        for bad in ["", "d", "-1", "1.5h", "10x", "99999999999999999999d"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn invalid_duration_leaves_default() {
+        let config = config_from("[streaming_client]\nidle_timeout = soon\n");
+        assert_eq!(
+            config.server.client_idle_timeout,
+            Some(std::time::Duration::from_secs(10))
+        );
     }
 
     #[test]

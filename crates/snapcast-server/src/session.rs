@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use snapcast_proto::MessageType;
@@ -71,6 +72,8 @@ struct SessionContext {
     auth: Option<Arc<dyn crate::auth::AuthValidator>>,
     client_filter: Option<Arc<dyn crate::auth::ClientFilter>>,
     send_audio_to_muted: bool,
+    /// Close a session that sends nothing for this long (`None` = never).
+    idle_timeout: Option<Duration>,
     settings_senders: Mutex<HashMap<String, mpsc::Sender<ClientSettingsUpdate>>>,
     routing_senders: Mutex<HashMap<String, watch::Sender<SessionRouting>>>,
     codec_headers: Mutex<HashMap<String, StreamCodecInfo>>,
@@ -223,6 +226,8 @@ pub(crate) struct SessionServerConfig {
     pub default_stream: String,
     /// Whether muted clients still receive audio.
     pub send_audio_to_muted: bool,
+    /// Close a session that sends nothing for this long (`None` = never).
+    pub idle_timeout: Option<Duration>,
 }
 
 impl SessionServer {
@@ -234,6 +239,7 @@ impl SessionServer {
                 auth: config.auth,
                 client_filter: config.client_filter,
                 send_audio_to_muted: config.send_audio_to_muted,
+                idle_timeout: config.idle_timeout,
                 settings_senders: Mutex::new(HashMap::new()),
                 routing_senders: Mutex::new(HashMap::new()),
                 codec_headers: Mutex::new(HashMap::new()),
@@ -359,7 +365,9 @@ where
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut frames = FrameReader::new(reader);
-    let hello_msg = frames.next().await?;
+    let hello_msg = within_idle_timeout(ctx, frames.next())
+        .await
+        .context("waiting for Hello")??;
     let hello_id = hello_msg.base.id;
     let hello = match hello_msg.payload {
         MessagePayload::Hello(h) => h,
@@ -380,7 +388,12 @@ where
     }
 
     if let Some(validator) = &ctx.auth {
-        validate_auth(validator.as_ref(), &hello, &mut writer, &client_id).await?;
+        within_idle_timeout(
+            ctx,
+            validate_auth(validator.as_ref(), &hello, &mut writer, &client_id),
+        )
+        .await
+        .context("authenticating")??;
     }
 
     // Become the client's only live session before registering anything.
@@ -442,32 +455,45 @@ where
         .await;
 
     // From here on the session is registered, so every exit path must run
-    // the release below.
-    let result = match send_initial_messages(
-        &mut writer,
-        ctx,
-        client_settings,
-        hello_id,
-        &initial_stream_id,
-        &client_id,
-    )
-    .await
-    {
-        Ok(()) => {
-            session_loop(SessionLoop {
-                frames,
-                writer,
-                chunk_rx,
-                settings_rx,
-                routing_rx,
-                event_tx: event_tx.clone(),
-                client_id: client_id.clone(),
-                cancelled,
-                ctx,
-            })
-            .await
+    // the release below. The watchdog runs beside the session rather than
+    // inside its loop, so it also fires while a write to a stalled peer is
+    // blocked (nothing is read meanwhile, so activity stops advancing).
+    let activity = Activity::new();
+    let session = async {
+        match send_initial_messages(
+            &mut writer,
+            ctx,
+            client_settings,
+            hello_id,
+            &initial_stream_id,
+            &client_id,
+        )
+        .await
+        {
+            Ok(()) => {
+                session_loop(SessionLoop {
+                    frames,
+                    writer,
+                    chunk_rx,
+                    settings_rx,
+                    routing_rx,
+                    event_tx: event_tx.clone(),
+                    client_id: client_id.clone(),
+                    cancelled,
+                    activity: &activity,
+                    ctx,
+                })
+                .await
+            }
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
+    };
+    let result = tokio::select! {
+        result = session => result,
+        idle = activity.idle_for(ctx.idle_timeout) => {
+            tracing::info!(id = %client_id, idle = ?idle, "Removing inactive session");
+            Err(anyhow::anyhow!("client inactive for {idle:?}"))
+        }
     };
 
     if ctx.release_session(&client_id, generation).await {
@@ -477,6 +503,57 @@ where
     }
 
     result
+}
+
+/// Run `fut`, failing if it takes longer than the idle timeout.
+async fn within_idle_timeout<F: std::future::Future>(
+    ctx: &SessionContext,
+    fut: F,
+) -> Result<F::Output> {
+    match ctx.idle_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, fut)
+            .await
+            .map_err(|_| anyhow::anyhow!("client inactive for {timeout:?}")),
+        None => Ok(fut.await),
+    }
+}
+
+/// When a session last received anything from its client.
+struct Activity {
+    start: tokio::time::Instant,
+    /// Microseconds after `start` of the last received message.
+    last_usec: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            last_usec: AtomicU64::new(0),
+        }
+    }
+
+    /// Record that a message was just received.
+    fn touch(&self) {
+        let usec = self.start.elapsed().as_micros() as u64;
+        self.last_usec.store(usec, Ordering::Relaxed);
+    }
+
+    /// Resolve once nothing was received for `timeout`, with the idle time.
+    /// Never resolves for `None`.
+    async fn idle_for(&self, timeout: Option<Duration>) -> Duration {
+        let Some(timeout) = timeout else {
+            return std::future::pending().await;
+        };
+        loop {
+            let last = self.start + Duration::from_micros(self.last_usec.load(Ordering::Relaxed));
+            let deadline = last + timeout;
+            if tokio::time::Instant::now() >= deadline {
+                return last.elapsed();
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
 }
 
 /// Send the post-Hello handshake: `ServerSettings` (answering the Hello) and
@@ -532,6 +609,8 @@ struct SessionLoop<'a, S> {
     client_id: String,
     /// Resolves when a newer session for the same client id takes over.
     cancelled: oneshot::Receiver<()>,
+    /// Updated on every received message, for the idle watchdog.
+    activity: &'a Activity,
     ctx: &'a SessionContext,
 }
 
@@ -548,6 +627,7 @@ where
         event_tx,
         client_id,
         mut cancelled,
+        activity,
         ctx,
     } = args;
     let mut routing = routing_rx.borrow().clone();
@@ -595,6 +675,7 @@ where
             }
             msg = frames.next() => {
                 let msg = msg?;
+                activity.touch();
                 match msg.payload {
                     MessagePayload::Time(_t) => {
                         if let Some(c) = ctx.shared_state.lock().await.clients.get_mut(&client_id) {
