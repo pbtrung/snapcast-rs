@@ -1,6 +1,10 @@
 //! Stream URI parser matching C++ `source=` config syntax.
 //!
-//! Format: `scheme:///path?key=value&key=value`
+//! Format: `scheme:///path?key=value&key=value#fragment`
+//!
+//! Scheme, query and fragment come from the status parser
+//! ([`snapcast_proto::status::StreamUri`]) and the path uses the same percent
+//! decoder, so the source this binary opens is the one the status reports.
 //! Examples:
 //! - `pipe:///tmp/snapfifo?name=Radio&sampleformat=48000:16:2`
 //! - `process:///usr/bin/mpd?name=MPD`
@@ -10,6 +14,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use snapcast_proto::status::percent_decode;
 
 /// Parsed stream URI.
 #[derive(Debug, Clone)]
@@ -34,19 +39,10 @@ impl StreamUri {
         let (scheme, rest) = uri
             .split_once("://")
             .with_context(|| format!("invalid stream URI: {uri}"))?;
+        let shared = snapcast_proto::status::StreamUri::parse(uri);
 
-        // Split path and query
-        let (path_part, query_str) = rest.split_once('?').unwrap_or((rest, ""));
-
-        // Parse query parameters
-        let mut query = HashMap::new();
-        for pair in query_str.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                // URL-decode %XX sequences
-                let v = url_decode(v);
-                query.insert(k.to_string(), v);
-            }
-        }
+        let rest = rest.split_once('#').map_or(rest, |(r, _)| r);
+        let path_part = rest.split_once('?').map_or(rest, |(p, _)| p);
 
         // Parse host:port for tcp scheme
         let (host, port, path) = if scheme == "tcp" {
@@ -55,7 +51,7 @@ impl StreamUri {
         } else {
             // For pipe/file/process: path starts after ://
             // Typically pipe:///tmp/snapfifo → path = /tmp/snapfifo
-            let path = url_decode(path_part.strip_prefix("//").unwrap_or(path_part));
+            let path = percent_decode(path_part.strip_prefix("//").unwrap_or(path_part));
             (String::new(), 0, path)
         };
 
@@ -64,7 +60,7 @@ impl StreamUri {
             host,
             port,
             path,
-            query,
+            query: shared.query,
         })
     }
 
@@ -121,31 +117,6 @@ fn parse_port(port_str: &str) -> Result<u16> {
         .with_context(|| format!("invalid TCP stream port: {port_str}"))
 }
 
-fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next().unwrap_or(b'0');
-            let lo = chars.next().unwrap_or(b'0');
-            let val = hex_val(hi) * 16 + hex_val(lo);
-            result.push(val as char);
-        } else {
-            result.push(b as char);
-        }
-    }
-    result
-}
-
-fn hex_val(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +169,31 @@ mod tests {
         assert_eq!(u.scheme, "file");
         assert_eq!(u.path, "/home/user/Musik/Some wave file.wav");
         assert_eq!(u.param("name"), Some("File"));
+    }
+
+    #[test]
+    fn parse_decodes_utf8_paths_and_keeps_malformed_escapes() {
+        let u = StreamUri::parse("file:///music/Über%20Alles/caf%C3%A9.wav?name=File").unwrap();
+        assert_eq!(u.path, "/music/Über Alles/café.wav");
+        let u = StreamUri::parse("pipe:///tmp/a%zzb%2?name=x").unwrap();
+        assert_eq!(u.path, "/tmp/a%zzb%2", "malformed escapes stay literal");
+    }
+
+    #[test]
+    fn parse_decodes_query_keys_and_drops_fragment() {
+        let u = StreamUri::parse("pipe:///tmp/f?na%6De=Radio%20One&x=%E2%82%AC#frag").unwrap();
+        assert_eq!(u.param("name"), Some("Radio One"));
+        assert_eq!(u.param("x"), Some("€"), "fragment is not part of the value");
+        assert_eq!(u.path, "/tmp/f");
+    }
+
+    #[test]
+    fn parse_agrees_with_status_parser() {
+        let raw = "pipe:///tmp/sn%C3%A4p?name=K%C3%BCche&sampleformat=48000:16:2#f";
+        let ours = StreamUri::parse(raw).unwrap();
+        let status = snapcast_proto::status::StreamUri::parse(raw);
+        assert_eq!(ours.path, status.path);
+        assert_eq!(ours.query, status.query);
     }
 
     #[test]

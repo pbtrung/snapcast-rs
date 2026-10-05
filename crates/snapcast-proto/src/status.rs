@@ -315,18 +315,27 @@ impl StreamUri {
     }
 }
 
-/// Decode `%XX` escapes; malformed escapes are kept verbatim.
-fn percent_decode(s: &str) -> String {
+/// Decode `%XX` escapes in a URI component.
+///
+/// Escapes are decoded to bytes and the whole result is then read as UTF-8
+/// once, so both literal and percent-encoded multi-byte characters survive
+/// (invalid UTF-8 becomes U+FFFD). A `%` not followed by two hex digits is
+/// kept verbatim. `+` is not treated as a space.
+pub fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        char::from(b).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && let Some(b) = s
-                .get(i + 1..i + 3)
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
         {
-            out.push(b);
+            out.push(hi << 4 | lo);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -377,5 +386,30 @@ mod tests {
     fn percent_decode_malformed_kept() {
         assert_eq!(percent_decode("a%2"), "a%2");
         assert_eq!(percent_decode("%zz%41"), "%zzA");
+        assert_eq!(
+            percent_decode("%+1%-1"),
+            "%+1%-1",
+            "signs are not hex digits"
+        );
+        assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn percent_decode_utf8() {
+        assert_eq!(
+            percent_decode("/Musik/Über"),
+            "/Musik/Über",
+            "literal UTF-8"
+        );
+        assert_eq!(percent_decode("%C3%9Cber"), "Über", "encoded UTF-8");
+        assert_eq!(percent_decode("caf%C3%A9%20bar"), "café bar");
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}", "invalid UTF-8");
+    }
+
+    #[test]
+    fn stream_uri_parse_decodes_query_keys() {
+        let uri = StreamUri::parse("pipe:///x?na%6De=a%26b&flag");
+        assert_eq!(uri.query["name"], "a&b");
+        assert_eq!(uri.query["flag"], "");
     }
 }
