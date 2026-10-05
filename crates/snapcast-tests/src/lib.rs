@@ -101,3 +101,142 @@ where
         }
     }
 }
+
+/// A bare binary-protocol connection, for tests that need control over what
+/// the client sends (or that it sends nothing) beyond what `SnapClient` does.
+pub struct RawClient {
+    stream: tokio::net::TcpStream,
+    buf: Vec<u8>,
+}
+
+impl RawClient {
+    /// Connect and send a `Hello` with client id `id`.
+    pub async fn connect(port: u16, id: &str) -> Self {
+        use snapcast_proto::message::factory::MessagePayload;
+        use snapcast_proto::message::hello::Hello;
+
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut client = Self {
+            stream,
+            buf: Vec::new(),
+        };
+        let hello = Hello {
+            mac: "00:00:00:00:00:00".into(),
+            host_name: format!("raw-{id}"),
+            version: "0.0.0".into(),
+            client_name: "RawClient".into(),
+            os: "test".into(),
+            arch: "test".into(),
+            instance: 1,
+            id: id.into(),
+            snap_stream_protocol_version: snapcast_proto::PROTOCOL_VERSION,
+            auth: None,
+        };
+        client
+            .send(
+                snapcast_proto::MessageType::Hello,
+                &MessagePayload::Hello(hello),
+            )
+            .await;
+        client
+    }
+
+    /// Send one message.
+    pub async fn send(
+        &mut self,
+        msg_type: snapcast_proto::MessageType,
+        payload: &snapcast_proto::message::factory::MessagePayload,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut base = snapcast_proto::BaseMessage {
+            msg_type,
+            id: 1,
+            refers_to: 0,
+            sent: Default::default(),
+            received: Default::default(),
+            size: 0,
+        };
+        let frame = snapcast_proto::message::factory::serialize(&mut base, payload).unwrap();
+        self.stream.write_all(&frame).await.unwrap();
+    }
+
+    /// Receive the next message, or `None` once the server closed the
+    /// connection (or `timeout_ms` passed without a message).
+    pub async fn recv(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Option<snapcast_proto::message::factory::TypedMessage> {
+        use tokio::io::AsyncReadExt;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(msg) = snapcast_proto::message::factory::take_frame(&mut self.buf).unwrap()
+            {
+                return Some(msg);
+            }
+            self.buf.reserve(8192);
+            match tokio::time::timeout_at(deadline, self.stream.read_buf(&mut self.buf)).await {
+                Ok(Ok(n)) if n > 0 => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether the server closed this connection within `timeout_ms`,
+    /// discarding any messages received before that.
+    pub async fn closed_within(&mut self, timeout_ms: u64) -> bool {
+        use tokio::io::AsyncReadExt;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let mut scratch = [0u8; 8192];
+        loop {
+            match tokio::time::timeout_at(deadline, self.stream.read(&mut scratch)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+}
+
+/// Server-side analogue of [`expect_event`]: wait for a matching `ServerEvent`.
+pub async fn expect_server_event<F, T>(
+    events: &mut mpsc::Receiver<ServerEvent>,
+    timeout_ms: u64,
+    mut f: F,
+) -> T
+where
+    F: FnMut(ServerEvent) -> Option<T>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(event)) => {
+                if let Some(val) = f(event) {
+                    return val;
+                }
+            }
+            Ok(None) => panic!("Server event channel closed"),
+            _ => panic!("Timed out waiting for expected server event"),
+        }
+    }
+}
+
+/// Look up whether `client_id` is reported connected in the server status.
+pub async fn client_connected(
+    cmd: &mpsc::Sender<snapcast_server::ServerCommand>,
+    client_id: &str,
+) -> Option<bool> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd.send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+        .await
+        .unwrap();
+    let status = rx.await.unwrap();
+    status
+        .server
+        .groups
+        .iter()
+        .flat_map(|g| &g.clients)
+        .find(|c| c.id == client_id)
+        .map(|c| c.connected)
+}

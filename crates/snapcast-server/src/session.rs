@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use snapcast_proto::MessageType;
@@ -14,7 +15,7 @@ use snapcast_proto::message::time::Time;
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 
 use crate::ClientSettingsUpdate;
 use crate::ServerEvent;
@@ -51,6 +52,7 @@ pub struct StreamCodecInfo {
 ///
 /// When acquiring multiple locks, always follow this order to prevent deadlocks:
 ///
+/// 0. `sessions` (active session per client id)
 /// 1. `shared_state` (server state — groups, clients, streams)
 /// 2. `routing_senders` (per-client watch channels)
 /// 3. `settings_senders` / `custom_senders` (per-client mpsc channels)
@@ -61,7 +63,9 @@ pub struct StreamCodecInfo {
 /// - Routing updates: `shared_state` → `routing_senders`
 /// - Settings push: `settings_senders` only
 /// - Codec lookup: `codec_headers` only
-/// - Client registration: `shared_state`, then separately `routing_senders`
+/// - Client registration: `sessions`, then separately `shared_state`, then
+///   separately `routing_senders`
+/// - Client cleanup: `sessions` held while releasing everything else
 struct SessionContext {
     buffer_ms: i32,
     auth: Option<Arc<dyn crate::auth::AuthValidator>>,
@@ -70,11 +74,67 @@ struct SessionContext {
     settings_senders: Mutex<HashMap<String, mpsc::Sender<ClientSettingsUpdate>>>,
     routing_senders: Mutex<HashMap<String, watch::Sender<SessionRouting>>>,
     codec_headers: Mutex<HashMap<String, StreamCodecInfo>>,
+    /// The one live session per client id. A reconnect with the same id
+    /// replaces (and cancels) the previous session.
+    sessions: Mutex<HashMap<String, ActiveSession>>,
+    next_generation: AtomicU64,
     shared_state: Arc<tokio::sync::Mutex<crate::state::ServerState>>,
     default_stream: String,
 }
 
+/// Ownership record for a client's live session.
+struct ActiveSession {
+    /// Distinguishes this session from earlier/later ones with the same id.
+    generation: u64,
+    /// Fired (or dropped) to stop the session when it is replaced.
+    cancel: oneshot::Sender<()>,
+}
+
 impl SessionContext {
+    /// Make a new session the owner of `client_id`, cancelling any previous
+    /// session for that id. Returns the new session's generation and its
+    /// cancellation signal.
+    async fn claim_session(&self, client_id: &str) -> (u64, oneshot::Receiver<()>) {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let (cancel, cancelled) = oneshot::channel();
+        let previous = self
+            .sessions
+            .lock()
+            .await
+            .insert(client_id.to_string(), ActiveSession { generation, cancel });
+        if let Some(previous) = previous {
+            tracing::info!(id = %client_id, "Client reconnected, replacing previous session");
+            let _ = previous.cancel.send(());
+        }
+        (generation, cancelled)
+    }
+
+    /// Release a session's registrations. Only the session that still owns
+    /// `client_id` touches the shared maps and state, so a replaced session
+    /// ending late cannot unregister its successor. Returns whether this
+    /// session was the owner (and so should report the disconnect).
+    async fn release_session(&self, client_id: &str, generation: u64) -> bool {
+        // Held throughout so a successor cannot register in between.
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(client_id)
+            .is_none_or(|s| s.generation != generation)
+        {
+            return false;
+        }
+        sessions.remove(client_id);
+        {
+            let mut s = self.shared_state.lock().await;
+            if let Some(c) = s.clients.get_mut(client_id) {
+                c.connected = false;
+                c.touch();
+            }
+        }
+        self.routing_senders.lock().await.remove(client_id);
+        self.settings_senders.lock().await.remove(client_id);
+        true
+    }
+
     /// Build routing for a single client from server state.
     /// State lock must be held by caller.
     fn build_routing(state: &crate::state::ServerState, client_id: &str) -> Option<SessionRouting> {
@@ -177,6 +237,8 @@ impl SessionServer {
                 settings_senders: Mutex::new(HashMap::new()),
                 routing_senders: Mutex::new(HashMap::new()),
                 codec_headers: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::new()),
+                next_generation: AtomicU64::new(0),
                 shared_state: config.shared_state,
                 default_stream: config.default_stream,
             }),
@@ -321,6 +383,9 @@ where
         validate_auth(validator.as_ref(), &hello, &mut writer, &client_id).await?;
     }
 
+    // Become the client's only live session before registering anything.
+    let (generation, cancelled) = ctx.claim_session(&client_id).await;
+
     // Register channels
     let (settings_tx, settings_rx) = mpsc::channel(16);
 
@@ -376,21 +441,69 @@ where
         })
         .await;
 
+    // From here on the session is registered, so every exit path must run
+    // the release below.
+    let result = match send_initial_messages(
+        &mut writer,
+        ctx,
+        client_settings,
+        hello_id,
+        &initial_stream_id,
+        &client_id,
+    )
+    .await
+    {
+        Ok(()) => {
+            session_loop(SessionLoop {
+                frames,
+                writer,
+                chunk_rx,
+                settings_rx,
+                routing_rx,
+                event_tx: event_tx.clone(),
+                client_id: client_id.clone(),
+                cancelled,
+                ctx,
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+
+    if ctx.release_session(&client_id, generation).await {
+        let _ = event_tx
+            .send(ServerEvent::ClientDisconnected { id: client_id })
+            .await;
+    }
+
+    result
+}
+
+/// Send the post-Hello handshake: `ServerSettings` (answering the Hello) and
+/// the codec header of the client's initial stream.
+async fn send_initial_messages<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    ctx: &SessionContext,
+    client_settings: ServerSettings,
+    hello_id: u16,
+    initial_stream_id: &str,
+    client_id: &str,
+) -> Result<()> {
     // ServerSettings (refers_to must match Hello id for client's pending request)
     let ss_frame = serialize_msg(
         MessageType::ServerSettings,
         &MessagePayload::ServerSettings(client_settings),
         hello_id,
     )?;
-    write_frame(&mut writer, &ss_frame)
+    write_frame(writer, &ss_frame)
         .await
         .context("write server settings")?;
 
     // CodecHeader for client's stream
-    match ctx.codec_header_for(&initial_stream_id).await {
+    match ctx.codec_header_for(initial_stream_id).await {
         Some(info) => {
             send_msg(
-                &mut writer,
+                writer,
                 MessageType::CodecHeader,
                 &MessagePayload::CodecHeader(CodecHeader {
                     codec: info.codec,
@@ -404,34 +517,7 @@ where
         }
     }
 
-    // Main loop
-    let result = session_loop(SessionLoop {
-        frames,
-        writer,
-        chunk_rx,
-        settings_rx,
-        routing_rx,
-        event_tx: event_tx.clone(),
-        client_id: client_id.clone(),
-        ctx,
-    })
-    .await;
-
-    // Cleanup
-    ctx.settings_senders.lock().await.remove(&client_id);
-    ctx.routing_senders.lock().await.remove(&client_id);
-    {
-        let mut s = ctx.shared_state.lock().await;
-        if let Some(c) = s.clients.get_mut(&client_id) {
-            c.connected = false;
-            c.touch();
-        }
-    }
-    let _ = event_tx
-        .send(ServerEvent::ClientDisconnected { id: client_id })
-        .await;
-
-    result
+    Ok(())
 }
 
 // ── Session loop ──
@@ -444,6 +530,8 @@ struct SessionLoop<'a, S> {
     routing_rx: watch::Receiver<SessionRouting>,
     event_tx: mpsc::Sender<ServerEvent>,
     client_id: String,
+    /// Resolves when a newer session for the same client id takes over.
+    cancelled: oneshot::Receiver<()>,
     ctx: &'a SessionContext,
 }
 
@@ -459,12 +547,17 @@ where
         mut routing_rx,
         event_tx,
         client_id,
+        mut cancelled,
         ctx,
     } = args;
     let mut routing = routing_rx.borrow().clone();
 
     loop {
         tokio::select! {
+            _ = &mut cancelled => {
+                tracing::debug!(id = %client_id, "Session replaced by a newer connection");
+                return Ok(());
+            }
             chunk = chunk_rx.recv() => {
                 let chunk = match chunk {
                     Ok(c) => c,
