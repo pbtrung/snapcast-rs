@@ -1,9 +1,142 @@
-//! JSON-RPC notification builders — the `(method, params)` shape of each
-//! control notification, used by `main.rs` when it fans an internal
-//! `ServerEvent` out to the control clients. Note the field-name trap these
-//! pin down: `Client.OnVolumeChanged` uses `muted`, `Group.OnMute` uses `mute`.
+//! JSON-RPC notifications — [`forward_events`] turns each library
+//! `ServerEvent` into the control notification broadcast to the control
+//! connections, built by the `(method, params)` builders below. Note the
+//! field-name trap these pin down: `Client.OnVolumeChanged` uses `muted`,
+//! `Group.OnMute` uses `mute`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
+use snapcast_server::{ServerCommand, ServerEvent};
+use tokio::sync::{broadcast, mpsc};
+
+/// A notification broadcast to the control connections.
+#[derive(Debug, Clone)]
+pub(crate) struct Notification {
+    /// The control connection whose request caused it ([`connection_id`]),
+    /// which already has the response and skips it, as C++ snapserver does.
+    /// `None` for changes no control connection asked for (audio clients
+    /// connecting, idle removal, HTTP requests).
+    pub origin: Option<u64>,
+    /// The JSON-RPC notification.
+    pub message: Value,
+}
+
+/// A new id for a TCP or WebSocket control connection, unique for the
+/// server's lifetime and across both transports.
+pub(crate) fn connection_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Broadcast server events as JSON-RPC notifications until the event channel
+/// closes. This is the only source of change notifications: the library
+/// emits an event for every mutating control command as well as for
+/// audio-client activity.
+pub(crate) async fn forward_events(
+    mut events: mpsc::Receiver<ServerEvent>,
+    cmd_tx: mpsc::Sender<ServerCommand>,
+    notify_tx: broadcast::Sender<Notification>,
+) {
+    while let Some(event) = events.recv().await {
+        let (origin, event) = event.split_origin();
+        if let Some(message) = notification_for(event, &cmd_tx).await {
+            let _ = notify_tx.send(Notification { origin, message });
+        }
+    }
+}
+
+/// The notification for one (untagged) event, if it has one.
+async fn notification_for(
+    event: ServerEvent,
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Option<Value> {
+    match event {
+        ServerEvent::ClientConnected { id, .. } => {
+            let client_json = get_client_from_status(cmd_tx, &id).await;
+            Some(notification(
+                "Client.OnConnect",
+                json!({"id": id, "client": client_json}),
+            ))
+        }
+        ServerEvent::ClientDisconnected { id } => {
+            let client_json = get_client_from_status(cmd_tx, &id).await;
+            Some(notification(
+                "Client.OnDisconnect",
+                json!({"id": id, "client": client_json}),
+            ))
+        }
+        ServerEvent::ClientVolumeChanged {
+            client_id,
+            volume,
+            muted,
+        } => Some(client_on_volume_changed(&client_id, volume, muted)),
+        ServerEvent::ClientLatencyChanged { client_id, latency } => {
+            Some(client_on_latency_changed(&client_id, latency))
+        }
+        ServerEvent::ClientNameChanged { client_id, name } => {
+            Some(client_on_name_changed(&client_id, &name))
+        }
+        ServerEvent::GroupStreamChanged {
+            group_id,
+            stream_id,
+        } => Some(group_on_stream_changed(&group_id, &stream_id)),
+        ServerEvent::GroupMuteChanged { group_id, muted } => Some(group_on_mute(&group_id, muted)),
+        ServerEvent::GroupNameChanged { group_id, name } => {
+            Some(group_on_name_changed(&group_id, &name))
+        }
+        ServerEvent::StreamStatus { stream_id, status } => {
+            tracing::info!(stream_id, status, "Stream status");
+            // Fetch full stream object for the notification
+            let full_status = get_full_status(cmd_tx).await;
+            let stream_json = full_status["server"]["streams"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|s| s["id"].as_str() == Some(&stream_id))
+                .cloned()
+                .unwrap_or_default();
+            Some(notification(
+                "Stream.OnUpdate",
+                json!({"id": stream_id, "stream": stream_json}),
+            ))
+        }
+        ServerEvent::StreamMetaChanged {
+            stream_id,
+            metadata,
+        } => Some(notification(
+            "Stream.OnProperties",
+            json!({"id": stream_id, "properties": metadata}),
+        )),
+        ServerEvent::ServerUpdated => {
+            let status = get_full_status(cmd_tx).await;
+            Some(notification("Server.OnUpdate", status))
+        }
+        _ => None,
+    }
+}
+
+/// Fetch full server status as JSON via GetStatus command.
+async fn get_full_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Value {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if cmd_tx
+        .send(ServerCommand::GetStatus { response_tx: tx })
+        .await
+        .is_ok()
+        && let Ok(status) = rx.await
+    {
+        return serde_json::to_value(status).unwrap_or_default();
+    }
+    Value::Null
+}
+
+/// Find a client in the current status by ID.
+async fn get_client_from_status(cmd_tx: &mpsc::Sender<ServerCommand>, client_id: &str) -> Value {
+    let status = get_full_status(cmd_tx).await;
+    crate::jsonrpc::find_client(&status, client_id)
+        .cloned()
+        .unwrap_or_default()
+}
 
 fn notification(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})

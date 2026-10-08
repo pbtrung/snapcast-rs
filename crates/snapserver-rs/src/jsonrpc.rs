@@ -2,8 +2,11 @@
 //!
 //! Change notifications (`Client.OnVolumeChanged`, `Server.OnUpdate`, ...)
 //! are not built here: every mutating command makes the library emit a
-//! `ServerEvent`, which `main.rs` turns into the notification for all control
-//! clients. Building them here as well delivered each notification twice.
+//! `ServerEvent`, which `notify::forward_events` turns into the notification
+//! for the control clients. Building them here as well delivered each
+//! notification twice. Mutating commands are tagged with the requesting
+//! connection's id, so that connection gets the response but not the
+//! notification, as in C++ snapserver.
 
 use serde_json::{Value, json};
 use snapcast_server::ServerCommand;
@@ -45,11 +48,16 @@ macro_rules! require_str {
 /// dispatched, and a successful `Server.Authenticate` sets it. Batches are answered with an
 /// array. Notifications (requests without an `id`) are ignored without a
 /// reply, as in C++ snapserver.
+///
+/// `origin` is the connection's id from [`crate::notify::connection_id`]
+/// (`None` for HTTP): it tags the mutating commands, so the connection is
+/// not sent the notifications its own requests cause.
 pub(crate) async fn handle_message(
     text: &str,
     authenticated: &mut bool,
     auth_config: &AuthConfig,
     cmd_tx: &mpsc::Sender<ServerCommand>,
+    origin: Option<u64>,
 ) -> Option<Value> {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return Some(err(&Value::Null, PARSE_ERROR, "Parse error"));
@@ -62,14 +70,14 @@ pub(crate) async fn handle_message(
             let mut responses = Vec::new();
             for entry in &batch {
                 if let Some(response) =
-                    handle_entry(entry, authenticated, auth_config, cmd_tx).await
+                    handle_entry(entry, authenticated, auth_config, cmd_tx, origin).await
                 {
                     responses.push(response);
                 }
             }
             (!responses.is_empty()).then_some(Value::Array(responses))
         }
-        single => handle_entry(&single, authenticated, auth_config, cmd_tx).await,
+        single => handle_entry(&single, authenticated, auth_config, cmd_tx, origin).await,
     }
 }
 
@@ -79,6 +87,7 @@ async fn handle_entry(
     authenticated: &mut bool,
     auth_config: &AuthConfig,
     cmd_tx: &mpsc::Sender<ServerCommand>,
+    origin: Option<u64>,
 ) -> Option<Value> {
     let Some(object) = request.as_object() else {
         return Some(err(&Value::Null, INVALID_REQUEST, "Invalid Request"));
@@ -98,7 +107,7 @@ async fn handle_entry(
     {
         return Some(err(id, UNAUTHORIZED, UNAUTHORIZED_MESSAGE));
     }
-    let response = handle_request(request, auth_config, cmd_tx).await;
+    let response = handle_request(request, auth_config, cmd_tx, origin).await;
     if method == "Server.Authenticate" && response["result"] == "ok" {
         *authenticated = true;
     }
@@ -126,12 +135,25 @@ pub(crate) fn find_client<'a>(status: &'a Value, client_id: &str) -> Option<&'a 
         .find(|c| c["id"].as_str() == Some(client_id))
 }
 
+/// Tag a mutating command with the requesting connection (see
+/// [`handle_message`]).
+fn tagged(origin: Option<u64>, command: ServerCommand) -> ServerCommand {
+    match origin {
+        Some(origin) => ServerCommand::FromControl {
+            origin,
+            command: Box::new(command),
+        },
+        None => command,
+    }
+}
+
 /// Handle a JSON-RPC request object and return its response. All state
-/// access goes through ServerCommand.
+/// access goes through ServerCommand; `origin` as in [`handle_message`].
 pub(crate) async fn handle_request(
     request: &Value,
     auth_config: &AuthConfig,
     cmd_tx: &mpsc::Sender<ServerCommand>,
+    origin: Option<u64>,
 ) -> Value {
     let id = &request["id"];
     let method = request["method"].as_str().unwrap_or("");
@@ -147,9 +169,12 @@ pub(crate) async fn handle_request(
         "Server.DeleteClient" => {
             let client_id = require_str!(params, "id", id);
             let _ = cmd_tx
-                .send(ServerCommand::DeleteClient {
-                    client_id: client_id.to_string(),
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::DeleteClient {
+                        client_id: client_id.to_string(),
+                    },
+                ))
                 .await;
             // Like C++ snapserver, the result is the updated server status.
             match get_status(cmd_tx).await {
@@ -186,11 +211,14 @@ pub(crate) async fn handle_request(
             }
             let (volume, muted) = (percent.unwrap_or(100), muted.unwrap_or(false));
             let _ = cmd_tx
-                .send(ServerCommand::SetClientVolume {
-                    client_id: client_id.to_string(),
-                    volume,
-                    muted,
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetClientVolume {
+                        client_id: client_id.to_string(),
+                        volume,
+                        muted,
+                    },
+                ))
                 .await;
             ok(id, json!({"volume": {"percent": volume, "muted": muted}}))
         }
@@ -203,10 +231,13 @@ pub(crate) async fn handle_request(
                 return err(id, INVALID_PARAMS, "missing or invalid 'latency'");
             };
             let _ = cmd_tx
-                .send(ServerCommand::SetClientLatency {
-                    client_id: client_id.to_string(),
-                    latency,
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetClientLatency {
+                        client_id: client_id.to_string(),
+                        latency,
+                    },
+                ))
                 .await;
             ok(id, json!({"latency": latency}))
         }
@@ -214,10 +245,13 @@ pub(crate) async fn handle_request(
             let client_id = require_str!(params, "id", id);
             let name = require_str!(params, "name", id);
             let _ = cmd_tx
-                .send(ServerCommand::SetClientName {
-                    client_id: client_id.to_string(),
-                    name: name.to_string(),
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetClientName {
+                        client_id: client_id.to_string(),
+                        name: name.to_string(),
+                    },
+                ))
                 .await;
             ok(id, json!({"name": name}))
         }
@@ -244,10 +278,13 @@ pub(crate) async fn handle_request(
                 return err(id, INVALID_PARAMS, "missing 'mute'");
             };
             let _ = cmd_tx
-                .send(ServerCommand::SetGroupMute {
-                    group_id: group_id.to_string(),
-                    muted,
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetGroupMute {
+                        group_id: group_id.to_string(),
+                        muted,
+                    },
+                ))
                 .await;
             ok(id, json!({"mute": muted}))
         }
@@ -255,10 +292,13 @@ pub(crate) async fn handle_request(
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
             let _ = cmd_tx
-                .send(ServerCommand::SetGroupStream {
-                    group_id: group_id.to_string(),
-                    stream_id: stream_id.to_string(),
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetGroupStream {
+                        group_id: group_id.to_string(),
+                        stream_id: stream_id.to_string(),
+                    },
+                ))
                 .await;
             ok(id, json!({"stream_id": stream_id}))
         }
@@ -272,10 +312,13 @@ pub(crate) async fn handle_request(
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
             let _ = cmd_tx
-                .send(ServerCommand::SetGroupClients {
-                    group_id: group_id.to_string(),
-                    clients: client_ids,
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetGroupClients {
+                        group_id: group_id.to_string(),
+                        clients: client_ids,
+                    },
+                ))
                 .await;
             match get_status(cmd_tx).await {
                 Some(status) => ok(id, status),
@@ -286,10 +329,13 @@ pub(crate) async fn handle_request(
             let group_id = require_str!(params, "id", id);
             let name = require_str!(params, "name", id);
             let _ = cmd_tx
-                .send(ServerCommand::SetGroupName {
-                    group_id: group_id.to_string(),
-                    name: name.to_string(),
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetGroupName {
+                        group_id: group_id.to_string(),
+                        name: name.to_string(),
+                    },
+                ))
                 .await;
             ok(id, json!({"name": name}))
         }
@@ -302,10 +348,13 @@ pub(crate) async fn handle_request(
                 .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
             let _ = cmd_tx
-                .send(ServerCommand::SetStreamMeta {
-                    stream_id: stream_id.to_string(),
-                    metadata,
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::SetStreamMeta {
+                        stream_id: stream_id.to_string(),
+                        metadata,
+                    },
+                ))
                 .await;
             ok(
                 id,
@@ -342,9 +391,12 @@ pub(crate) async fn handle_request(
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
             let _ = cmd_tx
-                .send(ServerCommand::RemoveStream {
-                    stream_id: stream_id.to_string(),
-                })
+                .send(tagged(
+                    origin,
+                    ServerCommand::RemoveStream {
+                        stream_id: stream_id.to_string(),
+                    },
+                ))
                 .await;
             ok(id, json!({"stream_id": stream_id}))
         }
@@ -470,7 +522,7 @@ mod tests {
     async fn server_get_status() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetStatus", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert!(response["result"]["server"]["groups"].is_array());
     }
 
@@ -482,7 +534,7 @@ mod tests {
             "method": "Client.SetVolume",
             "params": {"id": "c1", "volume": {"percent": 50, "muted": true}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["volume"]["percent"], 50);
 
         // Verify state updated via GetStatus
@@ -498,7 +550,7 @@ mod tests {
     async fn unknown_method_is_method_not_found() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 3, "method": "Client.SetEq", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(response["id"], 3);
     }
@@ -511,7 +563,7 @@ mod tests {
             "method": "Group.SetStream",
             "params": {"id": "g1", "stream_id": "music"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["stream_id"], "music");
     }
 
@@ -589,7 +641,7 @@ mod tests {
     async fn server_get_rpc_version() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 10, "method": "Server.GetRPCVersion"});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(
             response["result"],
             json!({"major": 2, "minor": 0, "patch": 0})
@@ -603,7 +655,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 11,
             "method": "Server.DeleteClient", "params": {"id": "c1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         // C++ snapserver answers with the updated status, not the id.
         assert!(response["result"]["server"]["groups"].is_array());
         assert_eq!(response["id"], 11);
@@ -614,7 +666,7 @@ mod tests {
         let (auth_config, cmd_tx) = mock_server();
         let req =
             json!({"jsonrpc": "2.0", "id": 12, "method": "Server.DeleteClient", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
@@ -628,7 +680,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 20,
             "method": "Client.GetStatus", "params": {"id": "c1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["client"]["id"], "c1");
     }
 
@@ -639,7 +691,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 21,
             "method": "Client.GetStatus", "params": {"id": "nope"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], INTERNAL_ERROR);
         assert_eq!(response["error"]["message"], "client not found");
     }
@@ -648,7 +700,7 @@ mod tests {
     async fn client_get_status_missing_id() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 22, "method": "Client.GetStatus", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
 
@@ -660,7 +712,7 @@ mod tests {
             "method": "Client.SetVolume",
             "params": {"id": "c1", "volume": {"percent": 250, "muted": false}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         // percent > 100 is clamped to 100.
         assert_eq!(response["result"]["volume"]["percent"], 100);
     }
@@ -674,16 +726,26 @@ mod tests {
                 "method": "Client.SetVolume", "params": {"id": "c1", "volume": volume}
             })
         };
-        let response =
-            handle_request(&set(24, json!({"percent": 30})), &auth_config, &cmd_tx).await;
+        let response = handle_request(
+            &set(24, json!({"percent": 30})),
+            &auth_config,
+            &cmd_tx,
+            None,
+        )
+        .await;
         assert_eq!(
             response["result"]["volume"],
             json!({"percent": 30, "muted": false})
         );
 
         // Muting alone must not reset the level (regression: it went to 100).
-        let response =
-            handle_request(&set(25, json!({"muted": true})), &auth_config, &cmd_tx).await;
+        let response = handle_request(
+            &set(25, json!({"muted": true})),
+            &auth_config,
+            &cmd_tx,
+            None,
+        )
+        .await;
         assert_eq!(
             response["result"]["volume"],
             json!({"percent": 30, "muted": true})
@@ -694,6 +756,7 @@ mod tests {
             &set(26, json!({"percent": 40, "muted": "no"})),
             &auth_config,
             &cmd_tx,
+            None,
         )
         .await;
         assert_eq!(
@@ -706,7 +769,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 27,
             "method": "Client.SetVolume", "params": {"id": "ghost"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(
             response["result"]["volume"],
             json!({"percent": 100, "muted": false})
@@ -720,7 +783,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 26,
             "method": "Client.SetVolume", "params": {"volume": {"percent": 10}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
 
@@ -731,7 +794,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 27,
             "method": "Client.SetLatency", "params": {"id": "c1", "latency": 100}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["latency"], 100);
     }
 
@@ -747,7 +810,7 @@ mod tests {
                 "jsonrpc": "2.0", "id": 28,
                 "method": "Client.SetLatency", "params": params
             });
-            let response = handle_request(&req, &auth_config, &cmd_tx).await;
+            let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
             assert_eq!(response["error"]["code"], INVALID_PARAMS, "{params}");
         }
     }
@@ -759,7 +822,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 29,
             "method": "Client.SetName", "params": {"id": "c1", "name": "Kitchen"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["name"], "Kitchen");
     }
 
@@ -770,7 +833,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 30,
             "method": "Client.SetName", "params": {"id": "c1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'name'");
 
         // An empty name is still a valid name.
@@ -778,7 +841,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 31,
             "method": "Client.SetName", "params": {"id": "c1", "name": ""}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["name"], "");
     }
 
@@ -791,7 +854,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 40,
             "method": "Group.GetStatus", "params": {"id": "g1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["group"]["id"], "g1");
     }
 
@@ -802,7 +865,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 41,
             "method": "Group.GetStatus", "params": {"id": "ghost"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "group not found");
     }
 
@@ -813,7 +876,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 42,
             "method": "Group.SetMute", "params": {"id": "g1", "mute": true}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         // Group uses the "mute" key (not "muted").
         assert_eq!(response["result"]["mute"], true);
     }
@@ -825,7 +888,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 43,
             "method": "Group.SetMute", "params": {"id": "g1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'mute'");
     }
 
@@ -836,7 +899,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 44,
             "method": "Group.SetStream", "params": {"id": "g1"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'stream_id'");
     }
 
@@ -848,7 +911,7 @@ mod tests {
             "method": "Group.SetClients",
             "params": {"id": "g1", "clients": ["c1", "c2"]}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         // Result is the fresh full status.
         assert!(response["result"]["server"]["groups"].is_array());
     }
@@ -862,7 +925,7 @@ mod tests {
             "method": "Group.SetClients",
             "params": {"id": "g1", "clients": {"not": "an array"}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'clients'");
     }
 
@@ -873,7 +936,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 47,
             "method": "Group.SetName", "params": {"id": "g1", "name": "Main Room"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["name"], "Main Room");
     }
 
@@ -887,7 +950,7 @@ mod tests {
             "method": "Stream.SetProperty",
             "params": {"id": "default", "properties": {"artist": "Test"}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["id"], "default");
         assert_eq!(response["result"]["properties"]["artist"], "Test");
     }
@@ -899,7 +962,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 51,
             "method": "Stream.SetProperty", "params": {"properties": {}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
 
@@ -911,7 +974,7 @@ mod tests {
             "method": "Stream.Control",
             "params": {"id": "default", "command": "next", "params": {}}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["id"], "default");
     }
 
@@ -922,7 +985,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 53,
             "method": "Stream.Control", "params": {"id": "default"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'command'");
     }
 
@@ -934,7 +997,7 @@ mod tests {
             "method": "Stream.AddStream",
             "params": {"streamUri": "pipe:///tmp/snapfifo?name=default"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["stream_id"], "stream-42");
     }
 
@@ -945,7 +1008,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 55,
             "method": "Stream.AddStream", "params": {"streamUri": "bogus://x"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "bad uri");
     }
@@ -954,7 +1017,7 @@ mod tests {
     async fn stream_add_stream_missing_uri() {
         let (auth_config, cmd_tx) = mock_server_addstream(Ok("unused".into()));
         let req = json!({"jsonrpc": "2.0", "id": 56, "method": "Stream.AddStream", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["message"], "missing 'streamUri'");
     }
 
@@ -965,7 +1028,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 57,
             "method": "Stream.RemoveStream", "params": {"id": "default"}
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["stream_id"], "default");
     }
 
@@ -993,14 +1056,16 @@ mod tests {
                 json!({"username": username, "password": password}),
             )
         };
-        let response = handle_request(&get_token("alice", "se:cret"), &auth_config, &cmd_tx).await;
+        let response =
+            handle_request(&get_token("alice", "se:cret"), &auth_config, &cmd_tx, None).await;
         let token = response["result"]["token"].as_str().expect("token issued");
         // Round-trip: the issued token validates back to the requested subject.
         assert_eq!(auth::validate_token(&auth_config, token).unwrap(), "alice");
 
         // Unknown user and wrong password get the same answer.
         for (user, password) in [("alice", "wrong"), ("mallory", "se:cret"), ("bob", "")] {
-            let response = handle_request(&get_token(user, password), &auth_config, &cmd_tx).await;
+            let response =
+                handle_request(&get_token(user, password), &auth_config, &cmd_tx, None).await;
             assert_unauthorized(&response);
         }
 
@@ -1008,6 +1073,7 @@ mod tests {
             &request(61, "Server.GetToken", json!({"username": "alice"})),
             &auth_config,
             &cmd_tx,
+            None,
         )
         .await;
         assert_eq!(response["error"]["message"], "missing 'password'");
@@ -1022,7 +1088,7 @@ mod tests {
             "Server.GetToken",
             json!({"username": "bob", "password": "pw"}),
         );
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], INTERNAL_ERROR);
         assert_eq!(response["error"]["message"], "No auth secret configured");
     }
@@ -1044,6 +1110,7 @@ mod tests {
                 &request(63, "Server.Authenticate", params.clone()),
                 &auth_config,
                 &cmd_tx,
+                None,
             )
             .await;
             assert_eq!(response["result"], "ok", "{params}");
@@ -1068,6 +1135,7 @@ mod tests {
                 &request(64, "Server.Authenticate", params.clone()),
                 &auth_config,
                 &cmd_tx,
+                None,
             )
             .await;
             assert_unauthorized(&response);
@@ -1085,6 +1153,7 @@ mod tests {
             ),
             &auth_config,
             &cmd_tx,
+            None,
         )
         .await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
@@ -1093,6 +1162,7 @@ mod tests {
             &request(66, "Server.Authenticate", json!({})),
             &auth_config,
             &cmd_tx,
+            None,
         )
         .await;
         assert_eq!(response["error"]["message"], "missing 'scheme'");
@@ -1106,8 +1176,93 @@ mod tests {
             "Server.Authenticate",
             json!({"scheme": "Plain", "param": "anyone:anything"}),
         );
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"], "ok");
+    }
+
+    /// Record every command except `GetStatus`, which gets an empty status.
+    fn recording_server() -> (
+        tokio::sync::mpsc::Sender<ServerCommand>,
+        std::sync::Arc<std::sync::Mutex<Vec<ServerCommand>>>,
+    ) {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(16);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    ServerCommand::GetStatus { response_tx } => {
+                        let _ = response_tx.send(status::ServerStatus::default());
+                    }
+                    cmd => record.lock().unwrap().push(cmd),
+                }
+            }
+        });
+        (cmd_tx, seen)
+    }
+
+    #[tokio::test]
+    async fn mutating_commands_are_tagged_with_the_connection() {
+        let (cmd_tx, seen) = recording_server();
+        let auth_config = AuthConfig::default();
+        let requests = [
+            (
+                "Client.SetVolume",
+                json!({"id": "c1", "volume": {"percent": 5, "muted": false}}),
+            ),
+            ("Client.SetLatency", json!({"id": "c1", "latency": 5})),
+            ("Client.SetName", json!({"id": "c1", "name": "n"})),
+            ("Group.SetMute", json!({"id": "g1", "mute": true})),
+            ("Group.SetStream", json!({"id": "g1", "stream_id": "s"})),
+            ("Group.SetName", json!({"id": "g1", "name": "n"})),
+            ("Group.SetClients", json!({"id": "g1", "clients": ["c1"]})),
+            ("Server.DeleteClient", json!({"id": "c1"})),
+            ("Stream.RemoveStream", json!({"id": "s"})),
+        ];
+        for (method, params) in &requests {
+            let req = request(1, method, params.clone());
+            handle_request(&req, &auth_config, &cmd_tx, Some(9)).await;
+        }
+        // Commands that are answered (GetStatus) are taken in order, so
+        // everything sent before the last request has been recorded.
+        handle_request(
+            &request(2, "Server.GetStatus", json!({})),
+            &auth_config,
+            &cmd_tx,
+            Some(9),
+        )
+        .await;
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        assert_eq!(seen.len(), requests.len());
+        for cmd in seen {
+            assert!(
+                matches!(cmd, ServerCommand::FromControl { origin: 9, ref command }
+                    if !matches!(**command, ServerCommand::FromControl { .. })),
+                "{cmd:?}"
+            );
+        }
+
+        // Without an origin (HTTP) commands go out untagged.
+        let (cmd_tx, seen) = recording_server();
+        let (method, params) = &requests[0];
+        handle_request(
+            &request(3, method, params.clone()),
+            &auth_config,
+            &cmd_tx,
+            None,
+        )
+        .await;
+        handle_request(
+            &request(4, "Server.GetStatus", json!({})),
+            &auth_config,
+            &cmd_tx,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            seen.lock().unwrap()[..],
+            [ServerCommand::SetClientVolume { .. }]
+        ));
     }
 
     // --- Dispatch edge cases --------------------------------------------
@@ -1120,7 +1275,7 @@ mod tests {
             r#"{"jsonrpc": "2.0", "id": 70, "params": {}}"#,
             r#"{"jsonrpc": "2.0", "id": 71, "method": 12345}"#,
         ] {
-            let reply = handle_message(text, &mut authenticated, &auth_config, &cmd_tx)
+            let reply = handle_message(text, &mut authenticated, &auth_config, &cmd_tx, None)
                 .await
                 .unwrap();
             assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{text}");
@@ -1135,7 +1290,7 @@ mod tests {
             "jsonrpc": "2.0", "id": "req-abc",
             "method": "Server.GetRPCVersion"
         });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["id"], "req-abc");
     }
 
@@ -1144,7 +1299,7 @@ mod tests {
         let (auth_config, cmd_tx) = mock_server();
         // Missing id -> Value::Null; an error response must still carry it.
         let req = json!({"method": "Server.DeleteClient", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert!(response["id"].is_null());
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
@@ -1154,7 +1309,7 @@ mod tests {
     #[tokio::test]
     async fn message_parse_error_has_null_id() {
         let (auth_config, cmd_tx) = mock_server();
-        let reply = handle_message("{not json", &mut true, &auth_config, &cmd_tx)
+        let reply = handle_message("{not json", &mut true, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], PARSE_ERROR);
@@ -1166,7 +1321,7 @@ mod tests {
         let (auth_config, cmd_tx) = mock_server();
         let text = r#"{"jsonrpc": "2.0", "method": "Server.GetRPCVersion"}"#;
         assert!(
-            handle_message(text, &mut true, &auth_config, &cmd_tx)
+            handle_message(text, &mut true, &auth_config, &cmd_tx, None)
                 .await
                 .is_none()
         );
@@ -1176,7 +1331,7 @@ mod tests {
     async fn message_unknown_method_echoes_id() {
         let (auth_config, cmd_tx) = mock_server();
         let text = r#"{"jsonrpc": "2.0", "id": 9, "method": "Custom.DoThing"}"#;
-        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx)
+        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
@@ -1188,7 +1343,7 @@ mod tests {
         let (auth_config, cmd_tx) = auth_enabled();
         let mut authenticated = false;
         let status = r#"{"jsonrpc": "2.0", "id": 1, "method": "Server.GetStatus"}"#;
-        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
+        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert_unauthorized(&reply);
@@ -1196,25 +1351,25 @@ mod tests {
 
         // Allowed before authentication.
         let version = r#"{"jsonrpc": "2.0", "id": 2, "method": "Server.GetRPCVersion"}"#;
-        let reply = handle_message(version, &mut authenticated, &auth_config, &cmd_tx)
+        let reply = handle_message(version, &mut authenticated, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert_eq!(reply["result"]["major"], 2);
         let token = r#"{"jsonrpc": "2.0", "id": 3, "method": "Server.GetToken", "params": {"username": "bob", "password": "pw"}}"#;
-        let reply = handle_message(token, &mut authenticated, &auth_config, &cmd_tx)
+        let reply = handle_message(token, &mut authenticated, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert!(reply["result"]["token"].is_string());
         assert!(!authenticated, "a token alone does not authenticate");
 
         let bad = r#"{"jsonrpc": "2.0", "id": 4, "method": "Server.Authenticate", "params": {"scheme": "Plain", "param": "bob:nope"}}"#;
-        handle_message(bad, &mut authenticated, &auth_config, &cmd_tx).await;
+        handle_message(bad, &mut authenticated, &auth_config, &cmd_tx, None).await;
         assert!(!authenticated, "bad credentials must not open the gate");
 
         let good = r#"{"jsonrpc": "2.0", "id": 5, "method": "Server.Authenticate", "params": {"scheme": "Plain", "param": "bob:pw"}}"#;
-        handle_message(good, &mut authenticated, &auth_config, &cmd_tx).await;
+        handle_message(good, &mut authenticated, &auth_config, &cmd_tx, None).await;
         assert!(authenticated);
-        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
+        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert!(reply["result"]["server"].is_object());
@@ -1228,7 +1383,7 @@ mod tests {
             {"jsonrpc": "2.0", "method": "Server.GetRPCVersion"},
             {"jsonrpc": "2.0", "id": 2, "method": "Nope"}
         ]"#;
-        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx)
+        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         let replies = reply.as_array().unwrap();
@@ -1236,7 +1391,7 @@ mod tests {
         assert_eq!(replies[0]["id"], 1);
         assert_eq!(replies[1]["error"]["code"], METHOD_NOT_FOUND);
 
-        let reply = handle_message("[]", &mut true, &auth_config, &cmd_tx)
+        let reply = handle_message("[]", &mut true, &auth_config, &cmd_tx, None)
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], INVALID_REQUEST);

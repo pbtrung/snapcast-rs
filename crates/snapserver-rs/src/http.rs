@@ -14,16 +14,16 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::auth::AuthConfig;
 use crate::jsonrpc::{self, MAX_REQUEST_LEN};
+use crate::notify::{self, Notification};
 
 /// Shared state for axum handlers.
 #[derive(Clone)]
 struct AppState {
-    notify_tx: broadcast::Sender<Value>,
+    notify_tx: broadcast::Sender<Notification>,
     auth_config: Arc<AuthConfig>,
     cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
     client_acceptor: snapcast_server::ClientAcceptor,
@@ -38,7 +38,7 @@ pub(crate) struct HttpConfig {
     /// Snapweb document root (None = disabled).
     pub doc_root: Option<String>,
     /// Notification broadcast sender.
-    pub notify_tx: broadcast::Sender<Value>,
+    pub notify_tx: broadcast::Sender<Notification>,
     /// Auth configuration.
     pub auth_config: Arc<AuthConfig>,
     /// Server command sender.
@@ -134,7 +134,8 @@ async fn http_jsonrpc_handler(
             .into_response();
     }
 
-    match jsonrpc::handle_message(&body, &mut true, &app.auth_config, &app.cmd_tx).await {
+    // Untagged: an HTTP client has no notification stream to keep clean.
+    match jsonrpc::handle_message(&body, &mut true, &app.auth_config, &app.cmd_tx, None).await {
         Some(reply) => axum::Json(reply).into_response(),
         // Only notifications: nothing to answer.
         None => StatusCode::NO_CONTENT.into_response(),
@@ -151,6 +152,7 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
     let mut notify_rx = app.notify_tx.subscribe();
     // Per-connection auth state, same policy as the TCP control server.
     let mut authenticated = !app.auth_config.enabled;
+    let connection_id = notify::connection_id();
 
     loop {
         tokio::select! {
@@ -158,7 +160,7 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
                 let Some(Ok(msg)) = msg else { break };
                 let Message::Text(text) = msg else { continue };
                 if let Some(reply) =
-                    jsonrpc::handle_message(&text, &mut authenticated, &app.auth_config, &app.cmd_tx).await
+                    jsonrpc::handle_message(&text, &mut authenticated, &app.auth_config, &app.cmd_tx, Some(connection_id)).await
                     && socket.send(Message::Text(reply.to_string().into())).await.is_err()
                 {
                     break;
@@ -167,10 +169,11 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
             notification = notify_rx.recv() => {
                 match notification {
                     // Notifications carry server state: only for
-                    // authenticated connections.
-                    Ok(_) if !authenticated => {}
+                    // authenticated connections. Our own requests' were
+                    // answered by their responses.
+                    Ok(n) if !authenticated || n.origin == Some(connection_id) => {}
                     Ok(n) => {
-                        if socket.send(Message::Text(n.to_string().into())).await.is_err() { break }
+                        if socket.send(Message::Text(n.message.to_string().into())).await.is_err() { break }
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "WebSocket control client missed notifications");
@@ -185,13 +188,14 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use snapcast_server::ServerCommand;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Build an `AppState` with real (but unread) channels, matching how
     /// `run_http` wires one.
     fn make_state(auth_config: AuthConfig) -> (AppState, mpsc::Receiver<ServerCommand>) {
-        let (notify_tx, _) = broadcast::channel::<Value>(16);
+        let (notify_tx, _) = broadcast::channel::<Notification>(16);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ServerCommand>(16);
         let state = AppState {
             notify_tx,
@@ -366,7 +370,7 @@ mod tests {
     }
 
     /// Wait until every subscriber has taken the queued notifications.
-    async fn wait_delivered(notify_tx: &broadcast::Sender<Value>) {
+    async fn wait_delivered(notify_tx: &broadcast::Sender<Notification>) {
         while !notify_tx.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -390,7 +394,10 @@ mod tests {
         assert_eq!(ws_next(&mut ws).await["result"]["major"], 2);
 
         notify_tx
-            .send(serde_json::json!({"method": "Test.Hidden"}))
+            .send(Notification {
+                origin: None,
+                message: serde_json::json!({"method": "Test.Hidden"}),
+            })
             .unwrap();
         wait_delivered(&notify_tx).await;
 
@@ -405,9 +412,74 @@ mod tests {
         assert_eq!(ws_next(&mut ws).await["result"], "ok");
 
         notify_tx
-            .send(serde_json::json!({"method": "Test.Shown"}))
+            .send(Notification {
+                origin: None,
+                message: serde_json::json!({"method": "Test.Shown"}),
+            })
             .unwrap();
         assert_eq!(ws_next(&mut ws).await["method"], "Test.Shown");
+    }
+
+    /// Like C++ snapserver, a control connection gets the response to its own
+    /// change request but not the notification; the others get it, and
+    /// changes made over HTTP are announced to every connection.
+    #[tokio::test]
+    async fn websocket_requester_gets_no_echo_of_its_change() {
+        let (mut server, events) =
+            snapcast_server::SnapServer::new(snapcast_server::ServerConfig::default());
+        let _audio_tx = server.add_stream("default");
+        let audio_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut state, _c) = make_state(AuthConfig::default());
+        state.cmd_tx = server.command_sender();
+        tokio::spawn(notify::forward_events(
+            events,
+            server.command_sender(),
+            state.notify_tx.clone(),
+        ));
+        tokio::spawn(async move { server.serve(audio_listener).await });
+        let port = serve(state).await;
+
+        let mut a = ws_connect(port).await;
+        let mut b = ws_connect(port).await;
+        for ws in [&mut a, &mut b] {
+            // A reply proves the connection is set up and subscribed.
+            ws_send(
+                ws,
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetRPCVersion"}),
+            )
+            .await;
+            assert_eq!(ws_next(ws).await["id"], 1);
+        }
+
+        ws_send(
+            &mut a,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "Client.SetVolume",
+                "params": {"id": "c1", "volume": {"percent": 30, "muted": false}}
+            }),
+        )
+        .await;
+        let reply = ws_next(&mut a).await;
+        assert_eq!(reply["id"], 2);
+        assert_eq!(reply["result"]["volume"]["percent"], 30);
+        let n = ws_next(&mut b).await;
+        assert_eq!(n["method"], "Client.OnVolumeChanged");
+        assert_eq!(n["params"]["volume"]["percent"], 30);
+
+        // Notifications are delivered in order: had A been sent its own
+        // Client.OnVolumeChanged, it would come before this one.
+        let (status, _) = post(
+            port,
+            r#"{"jsonrpc":"2.0","id":3,"method":"Client.SetName","params":{"id":"c1","name":"Den"}}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        for ws in [&mut a, &mut b] {
+            let n = ws_next(ws).await;
+            assert_eq!(n["method"], "Client.OnNameChanged");
+            assert_eq!(n["params"]["name"], "Den");
+        }
     }
 
     // --- WebSocket streaming endpoint (end-to-end) ---------------------------

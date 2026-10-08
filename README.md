@@ -74,7 +74,18 @@ remove_disconnected_after = 2d
 Library users set `ServerConfig::client_idle_timeout` and
 `ServerConfig::remove_disconnected_clients_after`.
 
-## Control API Authentication
+## Control API
+
+JSON-RPC 2.0 as in C++ snapserver, over TCP (port 1705, one message per line),
+WebSocket (`ws://host:1780/jsonrpc`) and HTTP `POST /jsonrpc`. Change
+notifications (`Client.OnVolumeChanged`, `Server.OnUpdate`, ...) go to every
+TCP and WebSocket connection except the one whose request caused the change,
+which gets the response instead. Changes made over HTTP, by audio clients or
+by the server itself are announced to all of them. Library users get the same
+through `ServerCommand::FromControl`, whose notifications come back as
+`ServerEvent::FromControl`.
+
+### Authentication
 
 Off by default: anyone who can reach ports 1705/1780 can control the server.
 To require a login on the JSON-RPC control API (TCP 1705, WebSocket and HTTP

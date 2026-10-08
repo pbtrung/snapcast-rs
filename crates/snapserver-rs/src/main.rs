@@ -8,7 +8,7 @@ mod stream;
 mod ws_transport;
 
 use clap::Parser;
-use snapcast_server::{ServerCommand, ServerEvent, SnapServer};
+use snapcast_server::{ServerCommand, SnapServer};
 
 /// Snapcast server — synchronized multiroom audio server.
 #[derive(Parser, Debug)]
@@ -155,7 +155,7 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let (mut server, mut events) = SnapServer::new(server_config.server);
+        let (mut server, events) = SnapServer::new(server_config.server);
 
         // Ctrl-C handler — must be first so it works even if setup fails
         let cmd = server.command_sender();
@@ -228,7 +228,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // JSON-RPC control servers
-        let (notify_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+        let (notify_tx, _) = tokio::sync::broadcast::channel::<notify::Notification>(256);
         let auth_cfg = std::sync::Arc::new(server_config.auth.clone());
 
         // TCP JSON-RPC control
@@ -261,91 +261,12 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Broadcast server events as JSON-RPC notifications. This is the only
-        // source of change notifications: the library emits an event for every
-        // mutating control command as well as for audio-client activity.
-        let event_notify_tx = notify_tx.clone();
-        let event_cmd_tx = server.command_sender();
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                let notification: Option<serde_json::Value> = match event {
-                    ServerEvent::ClientConnected { id, .. } => {
-                        let client_json = get_client_from_status(&event_cmd_tx, &id).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Client.OnConnect",
-                            "params": {"id": id, "client": client_json}
-                        }))
-                    }
-                    ServerEvent::ClientDisconnected { id } => {
-                        let client_json = get_client_from_status(&event_cmd_tx, &id).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Client.OnDisconnect",
-                            "params": {"id": id, "client": client_json}
-                        }))
-                    }
-                    ServerEvent::ClientVolumeChanged {
-                        client_id,
-                        volume,
-                        muted,
-                    } => Some(notify::client_on_volume_changed(&client_id, volume, muted)),
-                    ServerEvent::ClientLatencyChanged { client_id, latency } => {
-                        Some(notify::client_on_latency_changed(&client_id, latency))
-                    }
-                    ServerEvent::ClientNameChanged { client_id, name } => {
-                        Some(notify::client_on_name_changed(&client_id, &name))
-                    }
-                    ServerEvent::GroupStreamChanged {
-                        group_id,
-                        stream_id,
-                    } => Some(notify::group_on_stream_changed(&group_id, &stream_id)),
-                    ServerEvent::GroupMuteChanged { group_id, muted } => {
-                        Some(notify::group_on_mute(&group_id, muted))
-                    }
-                    ServerEvent::GroupNameChanged { group_id, name } => {
-                        Some(notify::group_on_name_changed(&group_id, &name))
-                    }
-                    ServerEvent::StreamStatus { stream_id, status } => {
-                        tracing::info!(stream_id, status, "Stream status");
-                        // Fetch full stream object for the notification
-                        let full_status = get_full_status(&event_cmd_tx).await;
-                        let stream_json = full_status["server"]["streams"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .find(|s| s["id"].as_str() == Some(&stream_id))
-                            .cloned()
-                            .unwrap_or_default();
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Stream.OnUpdate",
-                            "params": {"id": stream_id, "stream": stream_json}
-                        }))
-                    }
-                    ServerEvent::StreamMetaChanged {
-                        stream_id,
-                        metadata,
-                    } => Some(serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "method": "Stream.OnProperties",
-                        "params": {"id": stream_id, "properties": metadata}
-                    })),
-                    ServerEvent::ServerUpdated => {
-                        let status = get_full_status(&event_cmd_tx).await;
-                        Some(serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "Server.OnUpdate",
-                            "params": status
-                        }))
-                    }
-                    _ => None,
-                };
-                if let Some(n) = notification {
-                    let _ = event_notify_tx.send(n);
-                }
-            }
-        });
+        // Broadcast server events as JSON-RPC notifications.
+        tokio::spawn(notify::forward_events(
+            events,
+            server.command_sender(),
+            notify_tx.clone(),
+        ));
 
         // The library owns no port; the binary binds the audio listener and
         // hands it to serve().
@@ -356,31 +277,6 @@ fn main() -> anyhow::Result<()> {
         .await?;
         server.serve(listener).await
     })
-}
-
-/// Fetch full server status as JSON via GetStatus command.
-async fn get_full_status(cmd_tx: &tokio::sync::mpsc::Sender<ServerCommand>) -> serde_json::Value {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if cmd_tx
-        .send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .is_ok()
-        && let Ok(status) = rx.await
-    {
-        return serde_json::to_value(status).unwrap_or_default();
-    }
-    serde_json::Value::Null
-}
-
-/// Find a client in the current status by ID.
-async fn get_client_from_status(
-    cmd_tx: &tokio::sync::mpsc::Sender<ServerCommand>,
-    client_id: &str,
-) -> serde_json::Value {
-    let status = get_full_status(cmd_tx).await;
-    jsonrpc::find_client(&status, client_id)
-        .cloned()
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

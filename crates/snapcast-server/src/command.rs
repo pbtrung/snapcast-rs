@@ -51,24 +51,43 @@ impl Dispatcher {
             after = ?after,
             "Removed clients disconnected for too long"
         );
-        self.announce_removed_clients(snapshot).await;
+        self.announce_removed_clients(snapshot, None).await;
         stale
     }
 
     /// Report a structural change after clients were deleted.
-    async fn announce_removed_clients(&self, snapshot: ServerState) {
+    async fn announce_removed_clients(&self, snapshot: ServerState, origin: Option<u64>) {
         let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
         // Mirrors Server.OnUpdate in C++ snapserver after Server.DeleteClient.
-        let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+        self.notify(origin, ServerEvent::ServerUpdated);
         self.session_srv.update_routing_all().await;
     }
 
-    /// Handle one command.
+    /// Emit a change notification, wrapped in [`ServerEvent::FromControl`]
+    /// when the command came from a control connection.
+    fn notify(&self, origin: Option<u64>, event: ServerEvent) {
+        let event = match origin {
+            Some(origin) => ServerEvent::FromControl {
+                origin,
+                event: Box::new(event),
+            },
+            None => event,
+        };
+        let _ = self.event_tx.try_send(event);
+    }
+
+    /// Handle one command, already taken out of its
+    /// [`ServerCommand::FromControl`] wrapper (see
+    /// [`ServerCommand::split_origin`]): `origin` tags the notifications it
+    /// causes. [`ServerEvent::StateChanged`] snapshots are never tagged.
     ///
     /// `Stop`/`None` are handled by the run loop and never reach here.
-    pub(crate) async fn dispatch(&self, cmd: ServerCommand) {
+    pub(crate) async fn dispatch(&self, origin: Option<u64>, cmd: ServerCommand) {
         match cmd {
             ServerCommand::Stop => unreachable!("Stop is handled by the run loop"),
+            ServerCommand::FromControl { .. } => {
+                unreachable!("the run loop unwraps FromControl")
+            }
             ServerCommand::SetClientVolume {
                 client_id,
                 volume,
@@ -96,11 +115,14 @@ impl Dispatcher {
                         muted,
                     })
                     .await;
-                let _ = self.event_tx.try_send(ServerEvent::ClientVolumeChanged {
-                    client_id: client_id.clone(),
-                    volume,
-                    muted,
-                });
+                self.notify(
+                    origin,
+                    ServerEvent::ClientVolumeChanged {
+                        client_id: client_id.clone(),
+                        volume,
+                        muted,
+                    },
+                );
                 self.session_srv.update_routing_for_client(&client_id).await;
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
@@ -122,9 +144,10 @@ impl Dispatcher {
                 if let Some(update) = settings_update {
                     self.session_srv.push_settings(update).await;
                 }
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::ClientLatencyChanged { client_id, latency });
+                self.notify(
+                    origin,
+                    ServerEvent::ClientLatencyChanged { client_id, latency },
+                );
             }
             ServerCommand::SetClientName { client_id, name } => {
                 let mut s = self.shared_state.lock().await;
@@ -134,9 +157,7 @@ impl Dispatcher {
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::ClientNameChanged { client_id, name });
+                self.notify(origin, ServerEvent::ClientNameChanged { client_id, name });
             }
             ServerCommand::SetGroupStream {
                 group_id,
@@ -147,10 +168,13 @@ impl Dispatcher {
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::GroupStreamChanged {
-                    group_id: group_id.clone(),
-                    stream_id,
-                });
+                self.notify(
+                    origin,
+                    ServerEvent::GroupStreamChanged {
+                        group_id: group_id.clone(),
+                        stream_id,
+                    },
+                );
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupMute { group_id, muted } => {
@@ -161,10 +185,13 @@ impl Dispatcher {
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::GroupMuteChanged {
-                    group_id: group_id.clone(),
-                    muted,
-                });
+                self.notify(
+                    origin,
+                    ServerEvent::GroupMuteChanged {
+                        group_id: group_id.clone(),
+                        muted,
+                    },
+                );
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupName { group_id, name } => {
@@ -175,9 +202,7 @@ impl Dispatcher {
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self
-                    .event_tx
-                    .try_send(ServerEvent::GroupNameChanged { group_id, name });
+                self.notify(origin, ServerEvent::GroupNameChanged { group_id, name });
             }
             ServerCommand::SetGroupClients { group_id, clients } => {
                 let mut s = self.shared_state.lock().await;
@@ -186,7 +211,7 @@ impl Dispatcher {
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
                 // Structural change — mirrors Server.OnUpdate in C++ snapserver
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+                self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::DeleteClient { client_id } => {
@@ -194,7 +219,7 @@ impl Dispatcher {
                 s.remove_client(&client_id);
                 let snapshot = s.clone();
                 drop(s);
-                self.announce_removed_clients(snapshot).await;
+                self.announce_removed_clients(snapshot, origin).await;
             }
             ServerCommand::SetStreamMeta {
                 stream_id,
@@ -205,10 +230,13 @@ impl Dispatcher {
                     stream.properties = metadata.clone();
                 }
                 drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StreamMetaChanged {
-                    stream_id,
-                    metadata,
-                });
+                self.notify(
+                    origin,
+                    ServerEvent::StreamMetaChanged {
+                        stream_id,
+                        metadata,
+                    },
+                );
             }
             ServerCommand::AddStream { uri, response_tx } => {
                 tracing::warn!(
@@ -231,7 +259,7 @@ impl Dispatcher {
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                let _ = self.event_tx.try_send(ServerEvent::ServerUpdated);
+                self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::StreamControl {
@@ -363,11 +391,14 @@ mod tests {
     async fn set_client_volume_mutates_state_and_emits_events() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetClientVolume {
-            client_id: "c1".into(),
-            volume: 42,
-            muted: true,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetClientVolume {
+                client_id: "c1".into(),
+                volume: 42,
+                muted: true,
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -394,11 +425,14 @@ mod tests {
     #[tokio::test]
     async fn set_client_volume_unknown_client_is_noop_but_still_notifies() {
         let (d, mut rx) = dispatcher_with(ServerState::default());
-        d.dispatch(ServerCommand::SetClientVolume {
-            client_id: "ghost".into(),
-            volume: 10,
-            muted: false,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetClientVolume {
+                client_id: "ghost".into(),
+                volume: 10,
+                muted: false,
+            },
+        )
         .await;
         assert!(
             drain(&mut rx)
@@ -411,10 +445,13 @@ mod tests {
     async fn set_client_latency_updates_config() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetClientLatency {
-            client_id: "c1".into(),
-            latency: 33,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetClientLatency {
+                client_id: "c1".into(),
+                latency: 33,
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -431,10 +468,13 @@ mod tests {
     async fn set_client_name_updates_config() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetClientName {
-            client_id: "c1".into(),
-            name: "Kitchen".into(),
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetClientName {
+                client_id: "c1".into(),
+                name: "Kitchen".into(),
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -451,10 +491,13 @@ mod tests {
     async fn set_group_stream_reassigns_and_emits() {
         let (state, gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetGroupStream {
-            group_id: gid.clone(),
-            stream_id: "living-room".into(),
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetGroupStream {
+                group_id: gid.clone(),
+                stream_id: "living-room".into(),
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -472,15 +515,21 @@ mod tests {
     async fn set_group_mute_and_name() {
         let (state, gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetGroupMute {
-            group_id: gid.clone(),
-            muted: true,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetGroupMute {
+                group_id: gid.clone(),
+                muted: true,
+            },
+        )
         .await;
-        d.dispatch(ServerCommand::SetGroupName {
-            group_id: gid.clone(),
-            name: "Upstairs".into(),
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetGroupName {
+                group_id: gid.clone(),
+                name: "Upstairs".into(),
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -505,9 +554,12 @@ mod tests {
     async fn delete_client_removes_from_state_and_groups() {
         let (state, _gid) = state_with_client();
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::DeleteClient {
-            client_id: "c1".into(),
-        })
+        d.dispatch(
+            None,
+            ServerCommand::DeleteClient {
+                client_id: "c1".into(),
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -533,10 +585,13 @@ mod tests {
         let gid = state.group_for_client("c1", "default").id.clone();
         state.group_for_client("c2", "default");
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::SetGroupClients {
-            group_id: gid.clone(),
-            clients: vec!["c1".into(), "c2".into()],
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetGroupClients {
+                group_id: gid.clone(),
+                clients: vec!["c1".into(), "c2".into()],
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -562,10 +617,13 @@ mod tests {
         let (d, mut rx) = dispatcher_with(state);
         let mut meta = HashMap::new();
         meta.insert("title".to_string(), serde_json::json!("Song"));
-        d.dispatch(ServerCommand::SetStreamMeta {
-            stream_id: "default".into(),
-            metadata: meta,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::SetStreamMeta {
+                stream_id: "default".into(),
+                metadata: meta,
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -583,10 +641,13 @@ mod tests {
     async fn add_stream_is_rejected_for_embeddable_server() {
         let (d, _rx) = dispatcher_with(ServerState::default());
         let (tx, rx) = tokio::sync::oneshot::channel();
-        d.dispatch(ServerCommand::AddStream {
-            uri: "pipe:///tmp/x".into(),
-            response_tx: tx,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::AddStream {
+                uri: "pipe:///tmp/x".into(),
+                response_tx: tx,
+            },
+        )
         .await;
         assert!(rx.await.unwrap().is_err());
     }
@@ -603,9 +664,12 @@ mod tests {
             properties: Default::default(),
         });
         let (d, mut rx) = dispatcher_with(state);
-        d.dispatch(ServerCommand::RemoveStream {
-            stream_id: "s1".into(),
-        })
+        d.dispatch(
+            None,
+            ServerCommand::RemoveStream {
+                stream_id: "s1".into(),
+            },
+        )
         .await;
         {
             let s = d.shared_state.lock().await;
@@ -623,11 +687,14 @@ mod tests {
     #[tokio::test]
     async fn stream_control_is_forwarded_as_event() {
         let (d, mut rx) = dispatcher_with(ServerState::default());
-        d.dispatch(ServerCommand::StreamControl {
-            stream_id: "s1".into(),
-            command: "next".into(),
-            params: serde_json::Value::Null,
-        })
+        d.dispatch(
+            None,
+            ServerCommand::StreamControl {
+                stream_id: "s1".into(),
+                command: "next".into(),
+                params: serde_json::Value::Null,
+            },
+        )
         .await;
         assert!(drain(&mut rx).iter().any(|e| matches!(
             e,
@@ -640,9 +707,84 @@ mod tests {
         let (state, _gid) = state_with_client();
         let (d, _rx) = dispatcher_with(state);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        d.dispatch(ServerCommand::GetStatus { response_tx: tx })
+        d.dispatch(None, ServerCommand::GetStatus { response_tx: tx })
             .await;
         let status = rx.await.unwrap();
         assert_eq!(status.server.groups.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tagged_command_wraps_its_notifications_only() {
+        let (state, gid) = state_with_client();
+        let (d, mut rx) = dispatcher_with(state);
+        let tagged = ServerCommand::FromControl {
+            origin: 7,
+            command: Box::new(ServerCommand::SetClientVolume {
+                client_id: "c1".into(),
+                volume: 42,
+                muted: false,
+            }),
+        };
+        let (origin, cmd) = tagged.split_origin();
+        assert_eq!(origin, Some(7));
+        d.dispatch(origin, cmd).await;
+        let events = drain(&mut rx);
+        assert!(
+            matches!(events[0], ServerEvent::StateChanged(_)),
+            "untagged"
+        );
+        assert!(matches!(
+            &events[1],
+            ServerEvent::FromControl { origin: 7, event }
+                if matches!(**event, ServerEvent::ClientVolumeChanged { volume: 42, .. })
+        ));
+        assert_eq!(events.len(), 2);
+
+        // Structural changes tag their Server.OnUpdate.
+        d.dispatch(
+            Some(8),
+            ServerCommand::SetGroupClients {
+                group_id: gid,
+                clients: vec!["c1".into()],
+            },
+        )
+        .await;
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ServerEvent::FromControl { origin: 8, event }
+                if matches!(**event, ServerEvent::ServerUpdated)
+        )));
+
+        // An untagged command is reported as before.
+        d.dispatch(
+            None,
+            ServerCommand::SetClientName {
+                client_id: "c1".into(),
+                name: "Kitchen".into(),
+            },
+        )
+        .await;
+        let (origin, event) = drain(&mut rx).pop().unwrap().split_origin();
+        assert_eq!(origin, None);
+        assert!(matches!(event, ServerEvent::ClientNameChanged { .. }));
+    }
+
+    #[test]
+    fn split_origin_unwraps_nested_tags() {
+        let cmd = ServerCommand::FromControl {
+            origin: 1,
+            command: Box::new(ServerCommand::FromControl {
+                origin: 2,
+                command: Box::new(ServerCommand::Stop),
+            }),
+        };
+        let (origin, cmd) = cmd.split_origin();
+        assert_eq!(origin, Some(2));
+        assert!(matches!(cmd, ServerCommand::Stop));
+        assert!(matches!(
+            ServerCommand::Stop.split_origin(),
+            (None, ServerCommand::Stop)
+        ));
     }
 }

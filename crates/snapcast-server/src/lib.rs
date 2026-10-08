@@ -301,6 +301,34 @@ pub enum ServerEvent {
         /// Optional parameters.
         params: serde_json::Value,
     },
+    /// A change notification caused by a [`ServerCommand::FromControl`]
+    /// command, tagged with that command's `origin`.
+    ///
+    /// Lets an embedder that serves several control connections answer the
+    /// requesting connection with the response only and notify the others,
+    /// as C++ snapserver does. Wraps the notification events
+    /// (`ClientVolumeChanged`, `ClientLatencyChanged`, `ClientNameChanged`,
+    /// `GroupStreamChanged`, `GroupMuteChanged`, `GroupNameChanged`,
+    /// `StreamMetaChanged`, `ServerUpdated`); `StateChanged` snapshots and
+    /// `StreamControl` are never wrapped. Embedders that never send
+    /// `FromControl` never see this variant.
+    FromControl {
+        /// The `origin` of the command that caused the event.
+        origin: u64,
+        /// The event itself.
+        event: Box<ServerEvent>,
+    },
+}
+
+impl ServerEvent {
+    /// Take the event out of its [`ServerEvent::FromControl`] wrapper, if
+    /// any, returning the origin it was tagged with.
+    pub fn split_origin(self) -> (Option<u64>, ServerEvent) {
+        match self {
+            Self::FromControl { origin, event } => (Some(origin), *event),
+            event => (None, event),
+        }
+    }
 }
 
 /// Commands the consumer sends to the server.
@@ -402,6 +430,34 @@ pub enum ServerCommand {
     },
     /// Stop the server gracefully.
     Stop,
+    /// Run `command` on behalf of a control connection identified by
+    /// `origin` (any id the embedder chooses): the change notifications it
+    /// causes arrive wrapped in [`ServerEvent::FromControl`] with the same
+    /// `origin`, so the embedder can skip echoing them to that connection.
+    FromControl {
+        /// Embedder-chosen id of the requesting control connection.
+        origin: u64,
+        /// The command to run.
+        command: Box<ServerCommand>,
+    },
+}
+
+impl ServerCommand {
+    /// Take the command out of its [`ServerCommand::FromControl`] wrapper(s),
+    /// returning the origin it was tagged with (the innermost, if nested).
+    pub(crate) fn split_origin(self) -> (Option<u64>, ServerCommand) {
+        let mut origin = None;
+        let mut cmd = self;
+        while let Self::FromControl {
+            origin: tag,
+            command,
+        } = cmd
+        {
+            origin = Some(tag);
+            cmd = *command;
+        }
+        (origin, cmd)
+    }
 }
 
 /// Default codec based on compiled features.
@@ -855,13 +911,13 @@ impl SnapServer {
                     }
                 }
                 cmd = command_rx.recv() => {
-                    match cmd {
-                        Some(ServerCommand::Stop) | None => {
+                    match cmd.map(ServerCommand::split_origin) {
+                        Some((_, ServerCommand::Stop)) | None => {
                             tracing::info!("Server stopped");
                             session_handle.abort();
                             return Ok(());
                         }
-                        Some(cmd) => dispatcher.dispatch(cmd).await,
+                        Some((origin, cmd)) => dispatcher.dispatch(origin, cmd).await,
                     }
                 }
             }

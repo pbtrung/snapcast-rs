@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::auth::AuthConfig;
 use crate::jsonrpc::{self, MAX_REQUEST_LEN};
+use crate::notify::{self, Notification};
 
 /// Configuration for the control server.
 pub(crate) struct ControlConfig {
@@ -18,7 +19,7 @@ pub(crate) struct ControlConfig {
     /// TCP port.
     pub port: u16,
     /// Notification broadcast sender.
-    pub notify_tx: broadcast::Sender<Value>,
+    pub notify_tx: broadcast::Sender<Notification>,
     /// Auth configuration.
     pub auth_config: Arc<AuthConfig>,
     /// Server command sender.
@@ -45,6 +46,7 @@ async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
         let mut notify_rx = cfg.notify_tx.subscribe();
         let auth_config = Arc::clone(&cfg.auth_config);
         let cmd_tx = cfg.cmd_tx.clone();
+        let connection_id = notify::connection_id();
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
@@ -65,7 +67,7 @@ async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
                         };
                         if text.trim().is_empty() { continue; }
                         if let Some(reply) =
-                            jsonrpc::handle_message(&text, &mut authenticated, &auth_config, &cmd_tx).await
+                            jsonrpc::handle_message(&text, &mut authenticated, &auth_config, &cmd_tx, Some(connection_id)).await
                             && send_json(&mut writer, &reply).await.is_err()
                         {
                             break;
@@ -74,10 +76,11 @@ async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
                     notification = notify_rx.recv() => {
                         match notification {
                             // Notifications carry server state: only for
-                            // authenticated connections.
-                            Ok(_) if !authenticated => {}
+                            // authenticated connections. Our own requests'
+                            // were answered by their responses.
+                            Ok(n) if !authenticated || n.origin == Some(connection_id) => {}
                             Ok(n) => {
-                                if send_json(&mut writer, &n).await.is_err() { break; }
+                                if send_json(&mut writer, &n.message).await.is_err() { break; }
                             }
                             Err(broadcast::error::RecvError::Lagged(missed)) => {
                                 tracing::warn!(%peer, missed, "Control client missed notifications");
@@ -264,11 +267,18 @@ mod tests {
         assert!(buf.len() <= MAX_REQUEST_LEN + 1, "buffer stayed bounded");
     }
 
+    fn test_notification(method: &str) -> Notification {
+        Notification {
+            origin: None,
+            message: serde_json::json!({"method": method}),
+        }
+    }
+
     /// Regression: an unauthenticated TCP control connection received every
     /// change notification.
     #[tokio::test]
     async fn notifications_need_authentication() {
-        let (notify_tx, _) = broadcast::channel::<Value>(16);
+        let (notify_tx, _) = broadcast::channel::<Notification>(16);
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -305,9 +315,7 @@ mod tests {
         send_json(&mut writer, &version).await.unwrap();
         assert_eq!(next().await["result"]["major"], 2);
 
-        notify_tx
-            .send(serde_json::json!({"method": "Test.Hidden"}))
-            .unwrap();
+        notify_tx.send(test_notification("Test.Hidden")).unwrap();
         while !notify_tx.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -319,9 +327,7 @@ mod tests {
         send_json(&mut writer, &authenticate).await.unwrap();
         assert_eq!(next().await["result"], "ok");
 
-        notify_tx
-            .send(serde_json::json!({"method": "Test.Shown"}))
-            .unwrap();
+        notify_tx.send(test_notification("Test.Shown")).unwrap();
         assert_eq!(next().await["method"], "Test.Shown");
     }
 }
