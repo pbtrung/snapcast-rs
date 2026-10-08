@@ -1,5 +1,7 @@
 //! Integration test helpers.
 
+pub mod sync;
+
 use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
 use snapcast_server::{ServerConfig, ServerEvent, SnapServer};
 use tokio::sync::mpsc;

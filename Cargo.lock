@@ -2311,6 +2311,7 @@ dependencies = [
  "snapcast-client",
  "snapcast-proto",
  "snapcast-server",
+ "socket2",
  "tokio",
 ]
 

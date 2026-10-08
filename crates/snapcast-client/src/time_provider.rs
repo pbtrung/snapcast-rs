@@ -4,18 +4,24 @@
 //! latency pairs, computes the clock difference via a median buffer, and provides
 //! `server_now()` — the estimated current server time.
 
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, Instant};
-
 use snapcast_proto::Timeval;
 
 use crate::double_buffer::DoubleBuffer;
 
+#[cfg(test)]
+mod sim;
+
+/// Samples older than this are discarded before a new one is added (µs).
+const RESET_AFTER_USEC: i64 = 60_000_000;
+
 /// Provides the estimated server time based on time sync messages.
 pub struct TimeProvider {
     diff_buffer: DoubleBuffer,
-    diff_to_server_usec: AtomicI64,
-    last_sync: Option<Instant>,
+    diff_to_server_usec: i64,
+    /// Local time of the last sample, on the [`now_usec`] clock.
+    ///
+    /// [`now_usec`]: snapcast_proto::time::now_usec
+    last_sync_usec: Option<i64>,
 }
 
 impl Default for TimeProvider {
@@ -29,8 +35,8 @@ impl TimeProvider {
     pub fn new() -> Self {
         Self {
             diff_buffer: DoubleBuffer::new(200),
-            diff_to_server_usec: AtomicI64::new(0),
-            last_sync: None,
+            diff_to_server_usec: 0,
+            last_sync_usec: None,
         }
     }
 
@@ -39,33 +45,53 @@ impl TimeProvider {
     /// The diff is computed as `(c2s - s2c) / 2` which cancels out the symmetric
     /// network latency, leaving only the clock difference.
     pub fn set_diff(&mut self, c2s: &Timeval, s2c: &Timeval) {
-        let diff_ms = (f64::from(c2s.sec) / 2.0 - f64::from(s2c.sec) / 2.0) * 1000.0
-            + (f64::from(c2s.usec) / 2.0 - f64::from(s2c.usec) / 2.0) / 1000.0;
-        tracing::trace!(diff_ms, "set_diff");
-        self.set_diff_ms(diff_ms);
+        self.add_sample_at(
+            snapcast_proto::time::now_usec(),
+            c2s.to_usec(),
+            s2c.to_usec(),
+        );
+    }
+
+    /// Add one time exchange measured at local time `local_usec`.
+    ///
+    /// `c2s_usec` is the server receive time minus the client send time and
+    /// `s2c_usec` the client receive time minus the server send time, each
+    /// mixing one-way latency with the clock difference. [`set_diff`]
+    /// calls this with the current time; tests and simulations pass their own.
+    ///
+    /// [`set_diff`]: Self::set_diff
+    pub fn add_sample_at(&mut self, local_usec: i64, c2s_usec: i64, s2c_usec: i64) {
+        let diff_usec = (c2s_usec - s2c_usec) / 2;
+        tracing::trace!(diff_usec, c2s_usec, s2c_usec, "time sample");
+
+        // Clear buffer if last sync was more than 60 seconds ago
+        if let Some(last) = self.last_sync_usec
+            && local_usec - last > RESET_AFTER_USEC
+        {
+            self.diff_buffer.clear();
+        }
+        self.last_sync_usec = Some(local_usec);
+
+        self.diff_buffer.add(diff_usec);
+        // Plain median, as C++ `TimeProvider::setDiffToServer`.
+        self.diff_to_server_usec = self.diff_buffer.median_simple();
     }
 
     /// Set the time diff directly in milliseconds.
     pub fn set_diff_ms(&mut self, ms: f64) {
-        let now = Instant::now();
-
-        // Clear buffer if last sync was more than 60 seconds ago
-        if let Some(last) = self.last_sync
-            && now.duration_since(last) > Duration::from_secs(60)
-        {
-            self.diff_buffer.clear();
-        }
-        self.last_sync = Some(now);
-
-        self.diff_buffer.add((ms * 1000.0) as i64);
-        // Plain median, as C++ `TimeProvider::setDiffToServer`.
-        let median = self.diff_buffer.median_simple();
-        self.diff_to_server_usec.store(median, Ordering::Relaxed);
+        let usec = (ms * 1000.0) as i64;
+        // c2s - s2c = 2 * diff
+        self.add_sample_at(snapcast_proto::time::now_usec(), 2 * usec, 0);
     }
 
     /// Get the current diff to server in microseconds.
     pub fn diff_to_server_usec(&self) -> i64 {
-        self.diff_to_server_usec.load(Ordering::Relaxed)
+        self.diff_to_server_usec_at(snapcast_proto::time::now_usec())
+    }
+
+    /// The diff to server in microseconds at local time `local_usec`.
+    pub fn diff_to_server_usec_at(&self, _local_usec: i64) -> i64 {
+        self.diff_to_server_usec
     }
 }
 
