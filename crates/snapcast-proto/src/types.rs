@@ -45,17 +45,27 @@ impl Timeval {
     }
 }
 
+// The operands may come straight off the wire (`BaseMessage::sent` is set by
+// the peer), so the arithmetic must not panic on overflow. It is done in i64,
+// the microseconds are normalized into `0..1_000_000`, and the seconds wrap
+// on overflow (as release-mode `i32` arithmetic, and the C++ `tv`, would).
+impl Timeval {
+    fn normalized(sec: i64, usec: i64) -> Self {
+        Self {
+            sec: (sec + usec.div_euclid(1_000_000)) as i32,
+            usec: usec.rem_euclid(1_000_000) as i32,
+        }
+    }
+}
+
 impl std::ops::Add for Timeval {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self {
-        let mut sec = self.sec + rhs.sec;
-        let mut usec = self.usec + rhs.usec;
-        if usec >= 1_000_000 {
-            sec += usec / 1_000_000;
-            usec %= 1_000_000;
-        }
-        Self { sec, usec }
+        Self::normalized(
+            i64::from(self.sec) + i64::from(rhs.sec),
+            i64::from(self.usec) + i64::from(rhs.usec),
+        )
     }
 }
 
@@ -63,13 +73,10 @@ impl std::ops::Sub for Timeval {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self {
-        let mut sec = self.sec - rhs.sec;
-        let mut usec = self.usec - rhs.usec;
-        while usec < 0 {
-            sec -= 1;
-            usec += 1_000_000;
-        }
-        Self { sec, usec }
+        Self::normalized(
+            i64::from(self.sec) - i64::from(rhs.sec),
+            i64::from(self.usec) - i64::from(rhs.usec),
+        )
     }
 }
 
@@ -115,6 +122,33 @@ mod tests {
                 usec: 200_000
             }
         );
+    }
+
+    #[test]
+    fn timeval_arithmetic_on_extreme_wire_values_does_not_panic() {
+        // Regression: `received - sent` with a peer-supplied `sent` used to
+        // overflow `i32` (a panic in debug builds).
+        let min = Timeval {
+            sec: i32::MIN,
+            usec: i32::MIN,
+        };
+        let max = Timeval {
+            sec: i32::MAX,
+            usec: i32::MAX,
+        };
+        for (a, b) in [(max, min), (min, max), (max, max), (min, min)] {
+            for r in [a - b, a + b] {
+                assert!((0..1_000_000).contains(&r.usec), "{r:?}");
+            }
+        }
+        // In-range results stay exact.
+        let a = Timeval { sec: 5, usec: 0 };
+        let b = Timeval {
+            sec: 0,
+            usec: -2_500_000,
+        };
+        assert_eq!((a + b).to_usec(), 2_500_000);
+        assert_eq!((a - b).to_usec(), 7_500_000);
     }
 
     #[test]

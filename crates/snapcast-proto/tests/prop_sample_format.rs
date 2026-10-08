@@ -37,7 +37,7 @@ fn arb_field_token() -> impl Strategy<Value = String> {
         // Values guaranteed to overflow u32.
         Just("4294967296".to_string()),
         Just("99999999999999999999".to_string()),
-        // Values > u16::MAX but <= u32::MAX (u32 parse OK, truncated to u16).
+        // Values > u16::MAX but <= u32::MAX (valid u32, rejected for bits/channels).
         Just("70000".to_string()),
         Just("65536".to_string()),
         // Unicode / non-ASCII digits and symbols.
@@ -82,9 +82,8 @@ proptest! {
     /// ROUND-TRIP: `Display` then `from_str` reproduces an equal value.
     ///
     /// `bits`/`channels` are kept within `u16` and `rate` within `u32`
-    /// (their storage widths) so no truncation occurs; the `as u16` cast in
-    /// the parser is only lossy for the >65535 tokens exercised separately in
-    /// the no-panic properties.
+    /// (their storage widths); out-of-range tokens are rejected by the parser
+    /// and exercised separately in the no-panic properties.
     #[test]
     fn display_round_trip(
         rate in any::<u32>(),
@@ -103,8 +102,8 @@ proptest! {
     }
 
     /// ROUND-TRIP via a hand-built `"rate:bits:channels"` string: parsing
-    /// yields the expected accessors. Values kept in-range so the `as u16`
-    /// cast is not lossy.
+    /// yields the expected accessors. Values are kept within the storage
+    /// widths, which the parser accepts.
     #[test]
     fn parse_decimal_triplet_accessors(
         rate in any::<u32>(),

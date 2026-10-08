@@ -3,7 +3,9 @@
 //! Sent by the client to the server and echoed back. Used to compute
 //! the clock difference between client and server.
 //!
-//! Payload: a single [`Timeval`] representing the round-trip latency.
+//! Payload: a single [`Timeval`]. The client sends it zeroed; the server's
+//! reply carries `received - sent` of the request, i.e. the client-to-server
+//! delta (one-way latency plus clock offset), not a round-trip time.
 
 use std::io::{Read, Write};
 
@@ -13,7 +15,8 @@ use crate::types::Timeval;
 /// Time sync message payload (8 bytes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Time {
-    /// Round-trip latency measurement.
+    /// Client-to-server delta (`received - sent` of the request) in the
+    /// server's reply; zero in the client's request.
     pub latency: Timeval,
 }
 

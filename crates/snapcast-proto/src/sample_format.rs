@@ -75,6 +75,9 @@ impl SampleFormat {
     }
 
     /// Size in bytes of one frame (all channels combined).
+    ///
+    /// Only meaningful for formats that pass [`Self::validate_concrete_pcm`];
+    /// an unvalidated channel count above 16383 overflows `u16`.
     pub fn frame_size(&self) -> u16 {
         self.channels * self.sample_size()
     }

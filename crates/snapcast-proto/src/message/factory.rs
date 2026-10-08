@@ -38,7 +38,8 @@ pub enum MessagePayload {
     ClientInfo(ClientInfo),
     /// Error payload.
     Error(Error),
-    /// Stream tags (type 6, deprecated). Raw bytes.
+    /// Raw, unparsed payload bytes: stream tags (type 6, deprecated), and
+    /// also the payload of `Base` (type 0) and unknown message types.
     StreamTags(Vec<u8>),
 }
 
@@ -57,8 +58,9 @@ pub fn deserialize(base: BaseMessage, payload: &[u8]) -> Result<TypedMessage, Pr
         MessageType::WireChunk => MessagePayload::WireChunk(WireChunk::read_from(&mut cursor)?),
         MessageType::ClientInfo => MessagePayload::ClientInfo(ClientInfo::read_from(&mut cursor)?),
         MessageType::Error => MessagePayload::Error(Error::read_from(&mut cursor)?),
-        MessageType::StreamTags => MessagePayload::StreamTags(payload.to_vec()),
-        MessageType::Base | MessageType::Unknown(_) => MessagePayload::StreamTags(payload.to_vec()),
+        MessageType::StreamTags | MessageType::Base | MessageType::Unknown(_) => {
+            MessagePayload::StreamTags(payload.to_vec())
+        }
     };
     Ok(TypedMessage { base, payload: msg })
 }

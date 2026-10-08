@@ -14,9 +14,9 @@
 //!    `factory::serialize` -> `factory::deserialize`, reproducing the fields.
 //!
 //! A dedicated property also asserts the *bounded-allocation* guard: a frame
-//! that declares a multi-gigabyte internal length prefix must be rejected with
-//! [`ProtoError::PayloadTooLarge`] (or a truncation I/O error) rather than
-//! attempting a giant allocation that would hang/OOM.
+//! that declares an over-cap internal length prefix must be rejected with
+//! [`ProtoError::PayloadTooLarge`] rather than attempting a giant allocation
+//! that would hang/OOM.
 
 use std::io::Cursor;
 
@@ -142,13 +142,13 @@ proptest! {
 
     /// Focused guard check: build a *well-formed* frame prefix for a
     /// length-prefixed message type (CodecHeader/Error/WireChunk) whose first
-    /// internal u32 length prefix claims a multi-gigabyte size. The wire reader
-    /// must reject it with `PayloadTooLarge` (or, for a sub-cap-but-truncated
-    /// value, an I/O error) instead of trying to allocate gigabytes.
+    /// internal u32 length prefix claims more than the cap (up to 4 GiB). The
+    /// wire reader must reject it with `PayloadTooLarge` instead of trying to
+    /// allocate it. (Exactly the cap passes the guard; see `wire.rs` tests.)
     #[test]
     fn prop_oversized_internal_length_is_bounded(
         which in 0u8..3,
-        claimed_len in DEFAULT_MAX_PAYLOAD_SIZE..=u32::MAX,
+        claimed_len in DEFAULT_MAX_PAYLOAD_SIZE + 1..=u32::MAX,
     ) {
         // CodecHeader: [u32 codec_len][..]; a huge codec_len must be rejected.
         // Error:       [u32 code][u32 error_len][..]; huge error_len rejected.

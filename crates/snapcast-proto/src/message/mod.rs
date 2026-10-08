@@ -26,14 +26,13 @@ pub enum MessageType {
     Time,
     /// Client hello (type 5).
     Hello,
-    // 6 = StreamTags (deprecated, but C++ server still sends it)
-    /// Stream tags / metadata (type 6, deprecated).
+    /// Stream tags / metadata (type 6, deprecated, but C++ server still sends it).
     StreamTags,
     /// Client info (type 7).
     ClientInfo,
     /// Error (type 8).
     Error,
-    /// Unrecognized message type — payload is skipped/ignored.
+    /// Unrecognized message type; its payload is passed through as raw bytes.
     Unknown(u16),
 }
 
@@ -85,6 +84,7 @@ mod tests {
             MessageType::ServerSettings,
             MessageType::Time,
             MessageType::Hello,
+            MessageType::StreamTags,
             MessageType::ClientInfo,
             MessageType::Error,
         ];
