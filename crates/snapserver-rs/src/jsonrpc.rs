@@ -24,6 +24,8 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
+/// The stream can't be controlled (C++ snapserver's `ControlErrc::can_not_control`).
+const CAN_NOT_CONTROL: i64 = 1;
 /// Not authenticated, or the credentials were rejected (as C++ snapserver).
 pub(crate) const UNAUTHORIZED: i64 = 401;
 pub(crate) const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
@@ -133,6 +135,27 @@ pub(crate) fn find_client<'a>(status: &'a Value, client_id: &str) -> Option<&'a 
         .flatten()
         .flat_map(|g| g["clients"].as_array().into_iter().flatten())
         .find(|c| c["id"].as_str() == Some(client_id))
+}
+
+/// Check that stream `stream_id` exists, or return the error response.
+async fn require_stream(
+    id: &Value,
+    stream_id: &str,
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Result<(), Value> {
+    let Some(status) = get_status(cmd_tx).await else {
+        return Err(err(id, INTERNAL_ERROR, "status unavailable"));
+    };
+    let found = status["server"]["streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|s| s["id"].as_str() == Some(stream_id));
+    if found {
+        Ok(())
+    } else {
+        Err(err(id, INTERNAL_ERROR, "Stream not found"))
+    }
 }
 
 /// Tag a mutating command with the requesting connection (see
@@ -343,16 +366,28 @@ pub(crate) async fn handle_request(
         // --- Stream ---
         "Stream.SetProperty" => {
             let stream_id = require_str!(params, "id", id);
-            let metadata = params["properties"]
-                .as_object()
-                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default();
+            // C++ snapserver's {"id", "property", "value"} sets one property
+            // of a controllable stream; none of ours is. {"id", "properties"}
+            // (ours) replaces the properties, e.g. to publish metadata.
+            let properties = params["properties"].as_object();
+            if properties.is_none() {
+                require_str!(params, "property", id);
+            }
+            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
+                return response;
+            }
+            let Some(properties) = properties else {
+                return err(id, CAN_NOT_CONTROL, "Stream can not be controlled");
+            };
             let _ = cmd_tx
                 .send(tagged(
                     origin,
                     ServerCommand::SetStreamMeta {
                         stream_id: stream_id.to_string(),
-                        metadata,
+                        metadata: properties
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                 ))
                 .await;
@@ -363,15 +398,12 @@ pub(crate) async fn handle_request(
         }
         "Stream.Control" => {
             let stream_id = require_str!(params, "id", id);
-            let command = require_str!(params, "command", id);
-            let _ = cmd_tx
-                .send(ServerCommand::StreamControl {
-                    stream_id: stream_id.to_string(),
-                    command: command.to_string(),
-                    params: params["params"].clone(),
-                })
-                .await;
-            ok(id, json!({"id": stream_id}))
+            require_str!(params, "command", id);
+            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
+                return response;
+            }
+            // No stream source of ours takes play/pause/next/... commands.
+            err(id, CAN_NOT_CONTROL, "Stream can not be controlled")
         }
         "Stream.AddStream" => {
             let stream_uri = require_str!(params, "streamUri", id);
@@ -967,15 +999,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_control_happy_path() {
+    async fn stream_set_property_unknown_stream_is_not_found() {
+        let (auth_config, cmd_tx) = mock_server();
+        for params in [
+            json!({"id": "ghost", "properties": {"metadata": {}}}),
+            json!({"id": "ghost", "property": "volume", "value": 10}),
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 58, "method": "Stream.SetProperty", "params": params
+            });
+            let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+            assert_eq!(
+                response["error"],
+                json!({"code": INTERNAL_ERROR, "message": "Stream not found"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_set_single_property_can_not_control() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
-            "jsonrpc": "2.0", "id": 52,
-            "method": "Stream.Control",
-            "params": {"id": "default", "command": "next", "params": {}}
+            "jsonrpc": "2.0", "id": 59, "method": "Stream.SetProperty",
+            "params": {"id": "default", "property": "loopStatus", "value": "track"}
         });
         let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
-        assert_eq!(response["result"]["id"], "default");
+        assert_eq!(
+            response["error"],
+            json!({"code": 1, "message": "Stream can not be controlled"})
+        );
+
+        let req = json!({
+            "jsonrpc": "2.0", "id": 60, "method": "Stream.SetProperty",
+            "params": {"id": "default", "value": "track"}
+        });
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+        assert_eq!(response["error"]["message"], "missing 'property'");
+    }
+
+    /// Regression: Stream.Control answered success while doing nothing.
+    #[tokio::test]
+    async fn stream_control_can_not_control() {
+        let (auth_config, cmd_tx) = mock_server();
+        let control = |stream: &str| {
+            json!({
+                "jsonrpc": "2.0", "id": 52,
+                "method": "Stream.Control",
+                "params": {"id": stream, "command": "next", "params": {}}
+            })
+        };
+        let response = handle_request(&control("default"), &auth_config, &cmd_tx, None).await;
+        assert_eq!(
+            response["error"],
+            json!({"code": 1, "message": "Stream can not be controlled"})
+        );
+        let response = handle_request(&control("ghost"), &auth_config, &cmd_tx, None).await;
+        assert_eq!(response["error"]["message"], "Stream not found");
     }
 
     #[tokio::test]

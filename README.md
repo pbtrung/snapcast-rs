@@ -85,6 +85,16 @@ by the server itself are announced to all of them. Library users get the same
 through `ServerCommand::FromControl`, whose notifications come back as
 `ServerEvent::FromControl`.
 
+None of the stream sources can be controlled (play, pause, next, ...), so
+`Stream.Control` and the C++ form of `Stream.SetProperty`
+(`{"id", "property", "value"}`) answer `{"code": 1, "message": "Stream can not
+be controlled"}` (`-32603` `Stream not found` for an unknown stream). Our own
+form `Stream.SetProperty` with `{"id", "properties": {...}}` replaces a
+stream's properties, e.g. for a script publishing what is playing; use the
+`Server.GetStatus` shape (`{"metadata": {"title": ...}, "playbackStatus":
+"playing", ...}`). `Stream.OnProperties` then carries `{"id", "properties"}`
+with the properties exactly as `Server.GetStatus` shows them.
+
 ### Authentication
 
 Off by default: anyone who can reach ports 1705/1780 can control the server.
@@ -194,7 +204,7 @@ ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
 
 - Control API passwords are stored in plain text in the config file, and there is no TLS: credentials and tokens cross the network unencrypted. Audio streaming clients connect without a login.
 - Server state (client names, groups, latency) is kept in memory only; it is not saved across restarts.
-- `Stream.AddStream` is rejected (streams are fixed at startup), and `Stream.Control` is accepted but not acted on.
+- `Stream.AddStream` is rejected (streams are fixed at startup), and no stream can be controlled (`Stream.Control`, `Stream.SetProperty` with a single property).
 - No mDNS: the server doesn't advertise itself and the client needs a server URL.
 
 ## License

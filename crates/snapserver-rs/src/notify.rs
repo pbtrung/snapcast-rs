@@ -89,11 +89,7 @@ async fn notification_for(
             tracing::info!(stream_id, status, "Stream status");
             // Fetch full stream object for the notification
             let full_status = get_full_status(cmd_tx).await;
-            let stream_json = full_status["server"]["streams"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|s| s["id"].as_str() == Some(&stream_id))
+            let stream_json = find_stream(&full_status, &stream_id)
                 .cloned()
                 .unwrap_or_default();
             Some(notification(
@@ -101,13 +97,12 @@ async fn notification_for(
                 json!({"id": stream_id, "stream": stream_json}),
             ))
         }
-        ServerEvent::StreamMetaChanged {
-            stream_id,
-            metadata,
-        } => Some(notification(
-            "Stream.OnProperties",
-            json!({"id": stream_id, "properties": metadata}),
-        )),
+        ServerEvent::StreamMetaChanged { stream_id, .. } => {
+            // The event carries the raw map; the notification needs the
+            // parsed properties, as Server.GetStatus shows them.
+            let full_status = get_full_status(cmd_tx).await;
+            Some(stream_on_properties(&stream_id, &full_status))
+        }
         ServerEvent::ServerUpdated => {
             let status = get_full_status(cmd_tx).await;
             Some(notification("Server.OnUpdate", status))
@@ -128,6 +123,15 @@ async fn get_full_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Value {
         return serde_json::to_value(status).unwrap_or_default();
     }
     Value::Null
+}
+
+/// Find a stream in a serialized server status by ID.
+fn find_stream<'a>(status: &'a Value, stream_id: &str) -> Option<&'a Value> {
+    status["server"]["streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["id"].as_str() == Some(stream_id))
 }
 
 /// Find a client in the current status by ID.
@@ -176,6 +180,24 @@ pub(crate) fn group_on_stream_changed(group_id: &str, stream_id: &str) -> Value 
     notification(
         "Group.OnStreamChanged",
         json!({"id": group_id, "stream_id": stream_id}),
+    )
+}
+
+/// `Stream.OnProperties` — a stream's properties changed. `properties` is
+/// the stream's properties object from `status` (a serialized
+/// `Server.GetStatus`), the default (nothing playing, nothing controllable)
+/// for a stream without any.
+pub(crate) fn stream_on_properties(stream_id: &str, status: &Value) -> Value {
+    let properties = find_stream(status, stream_id)
+        .and_then(|s| s.get("properties"))
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::to_value(snapcast_proto::status::StreamProperties::default())
+                .unwrap_or_default()
+        });
+    notification(
+        "Stream.OnProperties",
+        json!({"id": stream_id, "properties": properties}),
     )
 }
 
@@ -244,6 +266,10 @@ mod tests {
         assert_notification_envelope(
             &group_on_name_changed("g1", "Living Room"),
             "Group.OnNameChanged",
+        );
+        assert_notification_envelope(
+            &stream_on_properties("s1", &Value::Null),
+            "Stream.OnProperties",
         );
     }
 
@@ -407,5 +433,73 @@ mod tests {
         assert_ne!(g["method"], c["method"]);
         // params are structurally identical — only the method disambiguates.
         assert_eq!(g["params"], c["params"]);
+    }
+
+    // ---- stream_on_properties ----------------------------------------------
+
+    #[test]
+    fn stream_properties_come_from_the_status() {
+        let status = json!({"server": {"streams": [
+            {"id": "a", "status": "idle"},
+            {"id": "b", "properties": {"canControl": false, "metadata": {"title": "T"}}},
+        ]}});
+        let n = stream_on_properties("b", &status);
+        assert_eq!(
+            n["params"],
+            json!({"id": "b", "properties": {"canControl": false, "metadata": {"title": "T"}}})
+        );
+
+        // A stream without properties (or an unknown one) gets the default.
+        let n = stream_on_properties("a", &status);
+        assert_eq!(n["params"]["id"], "a");
+        assert_eq!(n["params"]["properties"]["canControl"], false);
+        assert_eq!(n["params"]["properties"]["canGoNext"], false);
+        assert!(n["params"]["properties"].get("metadata").is_none());
+    }
+
+    /// Regression: Stream.OnProperties carried the raw property map instead
+    /// of the properties object Server.GetStatus shows.
+    #[tokio::test]
+    async fn stream_on_properties_matches_get_status() {
+        let (mut server, events) =
+            snapcast_server::SnapServer::new(snapcast_server::ServerConfig::default());
+        let _audio_tx = server.add_stream("default");
+        let cmd_tx = server.command_sender();
+        let (notify_tx, mut notify_rx) = broadcast::channel(16);
+        tokio::spawn(forward_events(events, cmd_tx.clone(), notify_tx));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        tokio::spawn(async move { server.serve(listener).await });
+
+        let metadata = [
+            (
+                "metadata".to_string(),
+                json!({"title": "Song", "artist": ["A"]}),
+            ),
+            ("playbackStatus".to_string(), json!("playing")),
+        ];
+        cmd_tx
+            .send(ServerCommand::SetStreamMeta {
+                stream_id: "default".into(),
+                metadata: metadata.into_iter().collect(),
+            })
+            .await
+            .unwrap();
+        let n = loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), notify_rx.recv())
+                .await
+                .expect("no notification")
+                .unwrap();
+            if n.message["method"] == "Stream.OnProperties" {
+                break n.message;
+            }
+        };
+
+        let status = get_full_status(&cmd_tx).await;
+        let properties = &find_stream(&status, "default").unwrap()["properties"];
+        assert_eq!(n["params"]["id"], "default");
+        assert_eq!(&n["params"]["properties"], properties);
+        assert_eq!(properties["metadata"]["title"], "Song");
+        assert_eq!(properties["playbackStatus"], "playing");
+        assert_eq!(properties["canControl"], false);
     }
 }
