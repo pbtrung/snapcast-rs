@@ -95,6 +95,13 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     if let Some(s) = ini.section(Some("auth")) {
         get_bool(s, "enabled", |v| config.auth.enabled = v);
         get_str(s, "secret", |v| config.auth.secret = v.to_string());
+        for v in s.get_all("user") {
+            match v.parse() {
+                Ok(user) => config.auth.users.push(user),
+                // Never log the value: it holds a password.
+                Err(e) => tracing::warn!("Ignoring invalid [auth] user: {e}"),
+            }
+        }
     }
 
     if let Some(s) = ini.section(Some("tcp-streaming")) {
@@ -203,6 +210,8 @@ pub(crate) struct CliOverrides {
     pub auth_enabled: bool,
     /// Override the auth secret.
     pub auth_secret: Option<String>,
+    /// Control-API users; replace the config file's when non-empty.
+    pub auth_users: Vec<crate::auth::AuthUser>,
 }
 
 /// Merge CLI overrides into config.
@@ -246,6 +255,9 @@ pub(crate) fn merge_cli(mut config: BinaryConfig, cli: CliOverrides) -> BinaryCo
     if let Some(v) = cli.auth_secret {
         config.auth.secret = v;
     }
+    if !cli.auth_users.is_empty() {
+        config.auth.users = cli.auth_users;
+    }
 
     config
 }
@@ -286,11 +298,31 @@ mod tests {
     #[test]
     fn parse_auth_section() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "[auth]\nenabled = true\nsecret = my-strong-secret").unwrap();
+        writeln!(
+            tmp,
+            "[auth]\nenabled = true\nsecret = my-strong-secret\n\
+             user = alice:pa:ss=word\nuser = bob:hunter2\nuser = no-password"
+        )
+        .unwrap();
         let config = parse_config_file(tmp.path().to_str().unwrap());
         assert!(config.auth.enabled);
         assert_eq!(config.auth.secret, "my-strong-secret");
+        // Split at the first ':'; the malformed entry is skipped.
+        let users: Vec<_> = config
+            .auth
+            .users
+            .iter()
+            .map(|u| (u.name.as_str(), u.password.as_str()))
+            .collect();
+        assert_eq!(users, [("alice", "pa:ss=word"), ("bob", "hunter2")]);
         assert!(config.auth.validate().is_ok());
+    }
+
+    #[test]
+    fn auth_enabled_without_users_fails_validation() {
+        let config = config_from("[auth]\nenabled = true\nsecret = s\n");
+        assert!(config.auth.users.is_empty());
+        assert!(config.auth.validate().is_err());
     }
 
     #[test]
@@ -312,6 +344,7 @@ mod tests {
                 sources: vec![],
                 auth_enabled: false,
                 auth_secret: None,
+                auth_users: vec![],
             },
         );
         assert_eq!(merged.stream_bind_address, "::1");
@@ -338,6 +371,7 @@ mod tests {
             sources: vec![],
             auth_enabled: false,
             auth_secret: None,
+            auth_users: vec![],
         }
     }
 
@@ -691,6 +725,25 @@ mod tests {
             },
         );
         assert_eq!(merged.auth.secret, "cli-secret");
+    }
+
+    #[test]
+    fn merge_cli_auth_users_replace_config_users() {
+        let config = config_from("[auth]\nuser = file:pw\n");
+        let kept = merge_cli(config, empty_cli());
+        assert_eq!(kept.auth.users.len(), 1);
+        assert_eq!(kept.auth.users[0].name, "file");
+
+        let merged = merge_cli(
+            kept,
+            CliOverrides {
+                auth_users: vec!["cli:pw:x".parse().unwrap()],
+                ..empty_cli()
+            },
+        );
+        assert_eq!(merged.auth.users.len(), 1);
+        assert_eq!(merged.auth.users[0].name, "cli");
+        assert_eq!(merged.auth.users[0].password, "pw:x");
     }
 
     // ---- combined config + CLI precedence ----

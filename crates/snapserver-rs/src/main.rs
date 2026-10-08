@@ -70,6 +70,11 @@ struct Cli {
     #[arg(long = "auth-secret")]
     auth_secret: Option<String>,
 
+    /// Control-API user as <name>:<password> (repeatable; replaces the config
+    /// file's users). Visible in the process list: prefer the config file
+    #[arg(long = "auth-user", value_name = "NAME:PASSWORD")]
+    auth_users: Vec<auth::AuthUser>,
+
     /// Log filter
     #[arg(long, default_value = "info")]
     logfilter: String,
@@ -124,14 +129,19 @@ fn main() -> anyhow::Result<()> {
             sources: cli.sources,
             auth_enabled: cli.auth,
             auth_secret: cli.auth_secret,
+            auth_users: cli.auth_users,
         },
     );
 
-    // Validate auth before doing anything else: refuse to start an enabled-but-
-    // secretless config that would otherwise sign tokens with an empty key.
+    // Validate auth before doing anything else: refuse to start an enabled
+    // config without a secret (tokens would be signed with an empty key) or
+    // without a user to log in as.
     server_config.auth.validate()?;
     if server_config.auth.enabled {
-        tracing::info!("Control API authentication: ENABLED");
+        tracing::info!(
+            users = server_config.auth.users.len(),
+            "Control API authentication: ENABLED"
+        );
     } else {
         tracing::warn!(
             "Control API authentication: DISABLED — anyone who can reach the \

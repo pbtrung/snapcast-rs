@@ -108,7 +108,9 @@ async fn stream_ws_handler(
 }
 
 /// HTTP POST /jsonrpc handler. Stateless: when auth is enabled every request
-/// must carry a valid `Authorization: Bearer` token.
+/// must carry a valid `Authorization` header, `Bearer <token>` or
+/// `Basic <base64(name:password)>`; otherwise the answer is HTTP 401 with a
+/// JSON-RPC 401 error.
 async fn http_jsonrpc_handler(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -117,12 +119,19 @@ async fn http_jsonrpc_handler(
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-    if let Err(e) = crate::auth::validate_bearer(&app.auth_config, auth_header) {
-        return axum::Json(serde_json::json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32000, "message": format!("Unauthorized: {e}")}
-        }))
-        .into_response();
+    if let Err(e) = crate::auth::validate_authorization(&app.auth_config, auth_header) {
+        tracing::debug!(error = %e, "Rejecting unauthenticated HTTP JSON-RPC request");
+        // A Bearer challenge: a Basic one would make browsers open a login
+        // dialog over Snapweb.
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            axum::Json(serde_json::json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": {"code": jsonrpc::UNAUTHORIZED, "message": jsonrpc::UNAUTHORIZED_MESSAGE}
+            })),
+        )
+            .into_response();
     }
 
     match jsonrpc::handle_message(&body, &mut true, &app.auth_config, &app.cmd_tx).await {
@@ -157,6 +166,9 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
             }
             notification = notify_rx.recv() => {
                 match notification {
+                    // Notifications carry server state: only for
+                    // authenticated connections.
+                    Ok(_) if !authenticated => {}
                     Ok(n) => {
                         if socket.send(Message::Text(n.to_string().into())).await.is_err() { break }
                     }
@@ -192,11 +204,12 @@ mod tests {
         (state, cmd_rx)
     }
 
-    /// A config with auth enabled and a usable signing secret.
+    /// A config with auth enabled, a usable signing secret and user `bob:pw`.
     fn enabled_auth() -> AuthConfig {
         AuthConfig {
             enabled: true,
             secret: "test-secret-must-be-32-bytes-long".into(),
+            users: vec!["bob:pw".parse().unwrap()],
         }
     }
 
@@ -245,31 +258,6 @@ mod tests {
         assert!(Arc::ptr_eq(&state.auth_config, &clone.auth_config));
     }
 
-    // --- Bearer auth check run by `http_jsonrpc_handler` ------------------
-
-    #[test]
-    fn bearer_check_allows_all_when_auth_disabled() {
-        let cfg = AuthConfig::default();
-        assert!(crate::auth::validate_bearer(&cfg, None).is_ok());
-        assert!(crate::auth::validate_bearer(&cfg, Some("garbage")).is_ok());
-    }
-
-    #[test]
-    fn bearer_check_rejects_missing_and_malformed_header_when_enabled() {
-        let cfg = enabled_auth();
-        assert!(crate::auth::validate_bearer(&cfg, None).is_err());
-        assert!(crate::auth::validate_bearer(&cfg, Some("Basic abc")).is_err());
-        assert!(crate::auth::validate_bearer(&cfg, Some("Bearer not-a-jwt")).is_err());
-    }
-
-    #[test]
-    fn bearer_check_accepts_valid_token_when_enabled() {
-        let cfg = enabled_auth();
-        let token = crate::auth::generate_token(&cfg, "alice").unwrap();
-        let subject = crate::auth::validate_bearer(&cfg, Some(&format!("Bearer {token}"))).unwrap();
-        assert_eq!(subject, "alice");
-    }
-
     // --- POST /jsonrpc (end-to-end) ---------------------------------------
 
     /// Regression: an unknown method was answered with `"id": null`.
@@ -304,19 +292,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_requires_bearer_token_when_auth_enabled() {
+    async fn post_requires_credentials_when_auth_enabled() {
         let (state, _c) = make_state(enabled_auth());
         let token = crate::auth::generate_token(&state.auth_config, "bob").unwrap();
         let port = serve(state).await;
         let request = r#"{"jsonrpc":"2.0","id":1,"method":"Server.GetRPCVersion"}"#;
 
-        let (_, body) = post(port, request, None).await;
-        let reply: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(reply["error"]["code"], -32000);
+        // "Ym9iOnB3" is base64("bob:pw"), "Ym9iOng=" base64("bob:x").
+        for auth in [None, Some("Bearer not-a-jwt"), Some("Basic Ym9iOng=")] {
+            let (status, body) = post(port, request, auth).await;
+            assert_eq!(status, 401, "{auth:?}");
+            let reply: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                reply["error"],
+                serde_json::json!({"code": 401, "message": "Unauthorized"})
+            );
+        }
 
-        let (_, body) = post(port, request, Some(&format!("Bearer {token}"))).await;
-        let reply: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(reply["result"]["major"], 2);
+        for auth in [format!("Bearer {token}"), "Basic Ym9iOnB3".to_string()] {
+            let (status, body) = post(port, request, Some(&auth)).await;
+            assert_eq!(status, 200, "{auth}");
+            let reply: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(reply["result"]["major"], 2);
+        }
+    }
+
+    /// Open a WebSocket control connection to /jsonrpc.
+    async fn ws_connect(
+        port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/jsonrpc"))
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// The next text message on a WebSocket control connection, as JSON.
+    async fn ws_next<S>(ws: &mut S) -> Value
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use futures_util::StreamExt;
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            let msg = tokio::time::timeout(deadline, ws.next())
+                .await
+                .expect("no message on the WebSocket")
+                .expect("WebSocket closed")
+                .unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+    }
+
+    async fn ws_send<S>(ws: &mut S, request: Value)
+    where
+        S: futures_util::Sink<tokio_tungstenite::tungstenite::Message> + Unpin,
+        S::Error: std::fmt::Debug,
+    {
+        use futures_util::SinkExt;
+        ws.send(tokio_tungstenite::tungstenite::Message::text(
+            request.to_string(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Wait until every subscriber has taken the queued notifications.
+    async fn wait_delivered(notify_tx: &broadcast::Sender<Value>) {
+        while !notify_tx.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Regression: an unauthenticated WebSocket control connection received
+    /// every change notification.
+    #[tokio::test]
+    async fn websocket_notifications_need_authentication() {
+        let (state, _c) = make_state(enabled_auth());
+        let notify_tx = state.notify_tx.clone();
+        let port = serve(state).await;
+        let mut ws = ws_connect(port).await;
+
+        // A reply proves the connection is set up and subscribed.
+        ws_send(
+            &mut ws,
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetRPCVersion"}),
+        )
+        .await;
+        assert_eq!(ws_next(&mut ws).await["result"]["major"], 2);
+
+        notify_tx
+            .send(serde_json::json!({"method": "Test.Hidden"}))
+            .unwrap();
+        wait_delivered(&notify_tx).await;
+
+        ws_send(
+            &mut ws,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate",
+                "params": {"scheme": "Plain", "param": "bob:pw"}
+            }),
+        )
+        .await;
+        assert_eq!(ws_next(&mut ws).await["result"], "ok");
+
+        notify_tx
+            .send(serde_json::json!({"method": "Test.Shown"}))
+            .unwrap();
+        assert_eq!(ws_next(&mut ws).await["method"], "Test.Shown");
     }
 
     // --- WebSocket streaming endpoint (end-to-end) ---------------------------

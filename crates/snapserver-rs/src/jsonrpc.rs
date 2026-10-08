@@ -21,8 +21,9 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
-/// Server-defined: the connection has not authenticated yet.
-const UNAUTHORIZED: i64 = -32000;
+/// Not authenticated, or the credentials were rejected (as C++ snapserver).
+pub(crate) const UNAUTHORIZED: i64 = 401;
+pub(crate) const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
 /// Bind a required string parameter, or return an `INVALID_PARAMS` error naming
 /// the missing field. Replaces the `let Some(x) = params["k"].as_str() else {
@@ -40,8 +41,8 @@ macro_rules! require_str {
 /// WebSocket text message or an HTTP body) and return the reply, if any.
 ///
 /// `authenticated` is the connection's auth state: until it is set, only
-/// `Server.GetToken` and `Server.Authenticate` are dispatched, and a
-/// successful `Server.Authenticate` sets it. Batches are answered with an
+/// `Server.Authenticate`, `Server.GetToken` and `Server.GetRPCVersion` are
+/// dispatched, and a successful `Server.Authenticate` sets it. Batches are answered with an
 /// array. Notifications (requests without an `id`) are ignored without a
 /// reply, as in C++ snapserver.
 pub(crate) async fn handle_message(
@@ -89,15 +90,16 @@ async fn handle_entry(
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         return Some(err(id, INVALID_REQUEST, "Invalid Request"));
     };
-    if !*authenticated && method != "Server.GetToken" && method != "Server.Authenticate" {
-        return Some(err(
-            id,
-            UNAUTHORIZED,
-            "Unauthorized — call Server.Authenticate first",
-        ));
+    if !*authenticated
+        && !matches!(
+            method,
+            "Server.Authenticate" | "Server.GetToken" | "Server.GetRPCVersion"
+        )
+    {
+        return Some(err(id, UNAUTHORIZED, UNAUTHORIZED_MESSAGE));
     }
     let response = handle_request(request, auth_config, cmd_tx).await;
-    if method == "Server.Authenticate" && response["result"]["ok"] == true {
+    if method == "Server.Authenticate" && response["result"] == "ok" {
         *authenticated = true;
     }
     Some(response)
@@ -349,23 +351,44 @@ pub(crate) async fn handle_request(
 
         // --- Auth ---
         "Server.GetToken" => {
-            // SECURITY (known gap): this mints a valid token for ANY username
-            // with no credential check. The auth gate (TCP/WS/HTTP) is therefore
-            // necessary but not sufficient — real security needs GetToken to
-            // verify credentials against a user store before issuing a token.
-            // Tracked separately; do not treat enabled auth as a security
-            // boundary until this is implemented.
-            let username = params["username"].as_str().unwrap_or("anonymous");
+            let username = require_str!(params, "username", id);
+            let password = require_str!(params, "password", id);
+            if auth_config.secret.is_empty() {
+                return err(id, INTERNAL_ERROR, "No auth secret configured");
+            }
+            if !auth::verify_credentials(auth_config, username, password) {
+                return err(id, UNAUTHORIZED, UNAUTHORIZED_MESSAGE);
+            }
             match auth::generate_token(auth_config, username) {
                 Ok(token) => ok(id, json!({"token": token})),
-                Err(e) => err(id, INVALID_PARAMS, &format!("token generation failed: {e}")),
+                Err(e) => err(id, INTERNAL_ERROR, &format!("token generation failed: {e}")),
             }
         }
         "Server.Authenticate" => {
-            let token = require_str!(params, "token", id);
-            match auth::validate_token(auth_config, token) {
-                Ok(subject) => ok(id, json!({"ok": true, "subject": subject})),
-                Err(_) => err(id, INVALID_PARAMS, "invalid token"),
+            // C++ snapserver's {"scheme", "param"}; a bare {"token"} is the
+            // earlier form of a Bearer token.
+            let (scheme, param) = match params["token"].as_str() {
+                Some(token) if params.get("scheme").is_none() => ("Bearer", token),
+                _ => (
+                    require_str!(params, "scheme", id),
+                    require_str!(params, "param", id),
+                ),
+            };
+            if !auth_config.enabled {
+                // Nothing to check: the connection is already authenticated.
+                return ok(id, json!("ok"));
+            }
+            match auth::authenticate(auth_config, scheme, param) {
+                Ok(user) => {
+                    tracing::info!(user, "Control client authenticated");
+                    ok(id, json!("ok"))
+                }
+                Err(auth::AuthFailure::Unauthorized) => err(id, UNAUTHORIZED, UNAUTHORIZED_MESSAGE),
+                Err(auth::AuthFailure::UnsupportedScheme) => err(
+                    id,
+                    INVALID_PARAMS,
+                    "unsupported scheme (expected Basic, Plain or Bearer)",
+                ),
             }
         }
 
@@ -527,12 +550,14 @@ mod tests {
         (AuthConfig::default(), cmd_tx)
     }
 
-    /// An auth-enabled config with a real secret, plus a matching valid token.
+    /// An auth-enabled config with a real secret and the users `alice:se:cret`
+    /// and `bob:pw`.
     fn auth_enabled() -> (AuthConfig, tokio::sync::mpsc::Sender<ServerCommand>) {
         let (_disabled, cmd_tx) = mock_server();
         let config = AuthConfig {
             enabled: true,
             secret: "wave4-test-secret-at-least-32-bytes!".into(),
+            users: vec!["alice:se:cret".parse().unwrap(), "bob:pw".parse().unwrap()],
         };
         (config, cmd_tx)
     }
@@ -946,82 +971,143 @@ mod tests {
 
     // --- Auth ------------------------------------------------------------
 
-    #[tokio::test]
-    async fn server_get_token_with_enabled_auth() {
-        let (auth_config, cmd_tx) = auth_enabled();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 60,
-            "method": "Server.GetToken", "params": {"username": "bob"}
-        });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
-        let token = response["result"]["token"].as_str().expect("token issued");
-        assert!(!token.is_empty());
-        // Round-trip: the issued token validates back to the requested subject.
-        assert_eq!(auth::validate_token(&auth_config, token).unwrap(), "bob");
+    fn request(id: u64, method: &str, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+    }
+
+    fn assert_unauthorized(response: &Value) {
+        assert_eq!(
+            response["error"],
+            json!({"code": 401, "message": "Unauthorized"}),
+            "{response}"
+        );
     }
 
     #[tokio::test]
-    async fn server_get_token_defaults_to_anonymous() {
+    async fn server_get_token_checks_credentials() {
         let (auth_config, cmd_tx) = auth_enabled();
-        let req = json!({"jsonrpc": "2.0", "id": 61, "method": "Server.GetToken", "params": {}});
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let get_token = |username: &str, password: &str| {
+            request(
+                60,
+                "Server.GetToken",
+                json!({"username": username, "password": password}),
+            )
+        };
+        let response = handle_request(&get_token("alice", "se:cret"), &auth_config, &cmd_tx).await;
         let token = response["result"]["token"].as_str().expect("token issued");
-        assert_eq!(
-            auth::validate_token(&auth_config, token).unwrap(),
-            "anonymous"
-        );
+        // Round-trip: the issued token validates back to the requested subject.
+        assert_eq!(auth::validate_token(&auth_config, token).unwrap(), "alice");
+
+        // Unknown user and wrong password get the same answer.
+        for (user, password) in [("alice", "wrong"), ("mallory", "se:cret"), ("bob", "")] {
+            let response = handle_request(&get_token(user, password), &auth_config, &cmd_tx).await;
+            assert_unauthorized(&response);
+        }
+
+        let response = handle_request(
+            &request(61, "Server.GetToken", json!({"username": "alice"})),
+            &auth_config,
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(response["error"]["message"], "missing 'password'");
     }
 
     #[tokio::test]
     async fn server_get_token_fails_without_secret() {
-        // Default AuthConfig has an empty secret -> generate_token errors.
+        // Default AuthConfig: auth disabled, no secret, no users.
         let (auth_config, cmd_tx) = mock_server();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 62,
-            "method": "Server.GetToken", "params": {"username": "bob"}
-        });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
-        assert_eq!(response["error"]["code"], INVALID_PARAMS);
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("token generation failed")
+        let req = request(
+            62,
+            "Server.GetToken",
+            json!({"username": "bob", "password": "pw"}),
         );
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(response["error"]["message"], "No auth secret configured");
     }
 
     #[tokio::test]
-    async fn server_authenticate_valid_token() {
+    async fn server_authenticate_accepts_basic_plain_and_bearer() {
+        use base64::Engine;
         let (auth_config, cmd_tx) = auth_enabled();
         let token = auth::generate_token(&auth_config, "alice").unwrap();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 63,
-            "method": "Server.Authenticate", "params": {"token": token}
-        });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
-        assert_eq!(response["result"]["ok"], true);
-        assert_eq!(response["result"]["subject"], "alice");
+        let basic = base64::engine::general_purpose::STANDARD.encode("alice:se:cret");
+        for params in [
+            json!({"scheme": "Basic", "param": basic}),
+            json!({"scheme": "basic", "param": basic}),
+            json!({"scheme": "Plain", "param": "bob:pw"}),
+            json!({"scheme": "Bearer", "param": token}),
+            json!({"token": token}),
+        ] {
+            let response = handle_request(
+                &request(63, "Server.Authenticate", params.clone()),
+                &auth_config,
+                &cmd_tx,
+            )
+            .await;
+            assert_eq!(response["result"], "ok", "{params}");
+        }
     }
 
     #[tokio::test]
-    async fn server_authenticate_invalid_token() {
+    async fn server_authenticate_rejects_bad_credentials_alike() {
+        use base64::Engine;
         let (auth_config, cmd_tx) = auth_enabled();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 64,
-            "method": "Server.Authenticate", "params": {"token": "not.a.jwt"}
-        });
-        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        for params in [
+            json!({"scheme": "Basic", "param": b64("alice:wrong")}),
+            json!({"scheme": "Basic", "param": b64("mallory:se:cret")}),
+            json!({"scheme": "Basic", "param": "%%% not base64"}),
+            json!({"scheme": "Plain", "param": "bob:wrong"}),
+            json!({"scheme": "Plain", "param": "nobody"}),
+            json!({"scheme": "Bearer", "param": "not.a.jwt"}),
+            json!({"token": "not.a.jwt"}),
+        ] {
+            let response = handle_request(
+                &request(64, "Server.Authenticate", params.clone()),
+                &auth_config,
+                &cmd_tx,
+            )
+            .await;
+            assert_unauthorized(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn server_authenticate_param_errors() {
+        let (auth_config, cmd_tx) = auth_enabled();
+        let response = handle_request(
+            &request(
+                65,
+                "Server.Authenticate",
+                json!({"scheme": "Digest", "param": "x"}),
+            ),
+            &auth_config,
+            &cmd_tx,
+        )
+        .await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
-        assert_eq!(response["error"]["message"], "invalid token");
+
+        let response = handle_request(
+            &request(66, "Server.Authenticate", json!({})),
+            &auth_config,
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(response["error"]["message"], "missing 'scheme'");
     }
 
     #[tokio::test]
-    async fn server_authenticate_missing_token() {
-        let (auth_config, cmd_tx) = auth_enabled();
-        let req =
-            json!({"jsonrpc": "2.0", "id": 65, "method": "Server.Authenticate", "params": {}});
+    async fn server_authenticate_is_ok_when_auth_disabled() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = request(
+            67,
+            "Server.Authenticate",
+            json!({"scheme": "Plain", "param": "anyone:anything"}),
+        );
         let response = handle_request(&req, &auth_config, &cmd_tx).await;
-        assert_eq!(response["error"]["message"], "missing 'token'");
+        assert_eq!(response["result"], "ok");
     }
 
     // --- Dispatch edge cases --------------------------------------------
@@ -1105,20 +1191,28 @@ mod tests {
         let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
             .await
             .unwrap();
-        assert_eq!(reply["error"]["code"], UNAUTHORIZED);
+        assert_unauthorized(&reply);
         assert_eq!(reply["id"], 1);
 
-        let bad = r#"{"jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate", "params": {"token": "x"}}"#;
-        handle_message(bad, &mut authenticated, &auth_config, &cmd_tx).await;
-        assert!(!authenticated, "a bad token must not open the gate");
+        // Allowed before authentication.
+        let version = r#"{"jsonrpc": "2.0", "id": 2, "method": "Server.GetRPCVersion"}"#;
+        let reply = handle_message(version, &mut authenticated, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["major"], 2);
+        let token = r#"{"jsonrpc": "2.0", "id": 3, "method": "Server.GetToken", "params": {"username": "bob", "password": "pw"}}"#;
+        let reply = handle_message(token, &mut authenticated, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert!(reply["result"]["token"].is_string());
+        assert!(!authenticated, "a token alone does not authenticate");
 
-        let token = auth::generate_token(&auth_config, "alice").unwrap();
-        let good = json!({
-            "jsonrpc": "2.0", "id": 3, "method": "Server.Authenticate",
-            "params": {"token": token}
-        })
-        .to_string();
-        handle_message(&good, &mut authenticated, &auth_config, &cmd_tx).await;
+        let bad = r#"{"jsonrpc": "2.0", "id": 4, "method": "Server.Authenticate", "params": {"scheme": "Plain", "param": "bob:nope"}}"#;
+        handle_message(bad, &mut authenticated, &auth_config, &cmd_tx).await;
+        assert!(!authenticated, "bad credentials must not open the gate");
+
+        let good = r#"{"jsonrpc": "2.0", "id": 5, "method": "Server.Authenticate", "params": {"scheme": "Plain", "param": "bob:pw"}}"#;
+        handle_message(good, &mut authenticated, &auth_config, &cmd_tx).await;
         assert!(authenticated);
         let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
             .await

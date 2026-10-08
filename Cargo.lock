@@ -2340,6 +2340,7 @@ version = "0.999.13"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "clap",
  "futures-util",
  "jsonwebtoken",
@@ -2350,8 +2351,10 @@ dependencies = [
  "snapcast-client",
  "snapcast-proto",
  "snapcast-server",
+ "subtle",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tower-http",
  "tracing",
  "tracing-subscriber",

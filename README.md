@@ -74,6 +74,50 @@ remove_disconnected_after = 2d
 Library users set `ServerConfig::client_idle_timeout` and
 `ServerConfig::remove_disconnected_clients_after`.
 
+## Control API Authentication
+
+Off by default: anyone who can reach ports 1705/1780 can control the server.
+To require a login on the JSON-RPC control API (TCP 1705, WebSocket and HTTP
+`POST` on `/jsonrpc`), enable it with a JWT signing secret and at least one
+user (the server refuses to start otherwise):
+
+```ini
+[auth]
+enabled = true
+secret = <a long random string>
+# Repeatable. The name ends at the first ':', so passwords may contain ':'.
+user = alice:correct horse battery staple
+user = bob:s3cret
+```
+
+or `--auth --auth-secret <secret> --auth-user alice:<password>` (repeatable
+`--auth-user` replaces the config file's users; command-line passwords show in
+the process list).
+
+A TCP or WebSocket connection starts unauthenticated: only
+`Server.Authenticate`, `Server.GetToken` and `Server.GetRPCVersion` are
+answered, anything else gets the error `{"code": 401, "message": "Unauthorized"}`,
+and no notifications are sent to it.
+
+- `Server.Authenticate` with `{"scheme": "Basic", "param": base64("name:password")}`,
+  `{"scheme": "Plain", "param": "name:password"}` or
+  `{"scheme": "Bearer", "param": "<token>"}` (scheme case-insensitive; the
+  older `{"token": "<token>"}` is a Bearer token) answers `"ok"` and
+  authenticates the connection. Wrong credentials of any kind get the 401
+  error above; an unknown scheme gets `-32602`.
+- `Server.GetToken` with `{"username", "password"}` answers
+  `{"token": "<JWT>"}`, valid for 24 hours, for use as a Bearer token. Wrong
+  credentials get the 401 error.
+- HTTP `POST /jsonrpc` needs an `Authorization: Bearer <token>` or
+  `Authorization: Basic <base64(name:password)>` header on every request;
+  without a valid one the answer is HTTP 401 with the 401 error as body.
+
+With authentication disabled every connection counts as authenticated:
+`Server.Authenticate` answers `"ok"` without checking, and `Server.GetToken`
+still checks the configured users and fails with `-32603` when no secret is
+set. Audio streaming clients (TCP 1704 and the `/stream` WebSocket) are not
+covered by this login.
+
 ## Codecs
 
 | Codec  | Default | C dep | Precision | Latency |
@@ -137,7 +181,7 @@ ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
 
 ## Known Limitations
 
-- The control API's `--auth` / `[auth]` gate is not access control yet: `Server.GetToken` issues a token for any username without checking credentials.
+- Control API passwords are stored in plain text in the config file, and there is no TLS: credentials and tokens cross the network unencrypted. Audio streaming clients connect without a login.
 - Server state (client names, groups, latency) is kept in memory only; it is not saved across restarts.
 - `Stream.AddStream` is rejected (streams are fixed at startup), and `Stream.Control` is accepted but not acted on.
 - No mDNS: the server doesn't advertise itself and the client needs a server URL.

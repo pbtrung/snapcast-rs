@@ -33,7 +33,11 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
         port = cfg.port,
         "Control server (TCP) listening"
     );
+    serve(listener, cfg).await
+}
 
+/// Accept control connections on `listener`, one task per connection.
+async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         tracing::debug!(%peer, "Control client connected");
@@ -69,6 +73,9 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
                     }
                     notification = notify_rx.recv() => {
                         match notification {
+                            // Notifications carry server state: only for
+                            // authenticated connections.
+                            Ok(_) if !authenticated => {}
                             Ok(n) => {
                                 if send_json(&mut writer, &n).await.is_err() { break; }
                             }
@@ -118,8 +125,9 @@ async fn send_json<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> R
 #[cfg(test)]
 mod tests {
     //! Unit tests for the control-server wire framing: [`read_line`] and
-    //! [`send_json`], against in-memory buffers. Request handling itself lives
-    //! in [`jsonrpc::handle_message`] and is tested there.
+    //! [`send_json`], against in-memory buffers, and for notification
+    //! delivery over a real socket. Request handling itself lives in
+    //! [`jsonrpc::handle_message`] and is tested there.
 
     use super::*;
 
@@ -254,5 +262,66 @@ mod tests {
         let err = read_line(&mut reader, &mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(buf.len() <= MAX_REQUEST_LEN + 1, "buffer stayed bounded");
+    }
+
+    /// Regression: an unauthenticated TCP control connection received every
+    /// change notification.
+    #[tokio::test]
+    async fn notifications_need_authentication() {
+        let (notify_tx, _) = broadcast::channel::<Value>(16);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = ControlConfig {
+            bind_address: "127.0.0.1".into(),
+            port,
+            notify_tx: notify_tx.clone(),
+            auth_config: Arc::new(AuthConfig {
+                enabled: true,
+                secret: "test-secret-must-be-32-bytes-long".into(),
+                users: vec!["bob:pw".parse().unwrap()],
+            }),
+            cmd_tx,
+        };
+        tokio::spawn(serve(listener, cfg));
+
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let mut next = async || -> Value {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("no line")
+                .unwrap()
+                .expect("connection closed");
+            serde_json::from_str(&line).unwrap()
+        };
+
+        // A reply proves the connection is set up and subscribed.
+        let version =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetRPCVersion"});
+        send_json(&mut writer, &version).await.unwrap();
+        assert_eq!(next().await["result"]["major"], 2);
+
+        notify_tx
+            .send(serde_json::json!({"method": "Test.Hidden"}))
+            .unwrap();
+        while !notify_tx.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let authenticate = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate",
+            "params": {"scheme": "Plain", "param": "bob:pw"}
+        });
+        send_json(&mut writer, &authenticate).await.unwrap();
+        assert_eq!(next().await["result"], "ok");
+
+        notify_tx
+            .send(serde_json::json!({"method": "Test.Shown"}))
+            .unwrap();
+        assert_eq!(next().await["method"], "Test.Shown");
     }
 }
