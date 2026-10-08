@@ -18,6 +18,7 @@ async fn two_clients_play_in_sync_on_a_clean_link() {
         buffer_ms: 1000,
         seed: 1,
         probe: false,
+        drop_every: 0,
     })
     .await;
     println!("{report}");
@@ -28,6 +29,45 @@ async fn two_clients_play_in_sync_on_a_clean_link() {
         assert!(c.playout.p95 < 3_000.0, "{}", c.playout);
     }
     assert!(report.alignment[0].p95 < 3_000.0, "{}", report.alignment[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_chunks_keep_clients_aligned() {
+    // One 20 ms chunk missing every second: clients must play the rest at
+    // its own time (silence in the gap), not 20 ms early.
+    let link = LinkProfile::symmetric(Link::delay(500, 200));
+    let report = run_sync(SyncRun {
+        links: vec![link, link],
+        duration: Duration::from_secs(8),
+        warmup: Duration::from_secs(3),
+        buffer_ms: 1000,
+        seed: 3,
+        probe: false,
+        drop_every: 50,
+    })
+    .await;
+    println!("{report}");
+    for c in &report.clients {
+        assert!(c.playout.count > c.ticks / 2, "clients play audio");
+        assert!(c.playout.p95 < 3_000.0, "{}", c.playout);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "report; ~1 minute; run with --ignored --nocapture"]
+async fn dropped_chunks_report() {
+    let clean = LinkProfile::symmetric(Link::delay(500, 200));
+    let report = run_sync(SyncRun {
+        links: vec![clean, clean],
+        duration: Duration::from_secs(45),
+        warmup: Duration::from_secs(10),
+        buffer_ms: 1000,
+        seed: 7,
+        probe: false,
+        drop_every: 250,
+    })
+    .await;
+    println!("one 20 ms chunk dropped every 5 s, clean links\n{report}");
 }
 
 /// Scenarios of the report: client 0 always has a clean link, client 1 the
@@ -83,6 +123,7 @@ async fn sync_report() {
             buffer_ms: 1000,
             seed: 7,
             probe: true,
+            drop_every: 0,
         })
         .await;
         println!("{name}\n{report}");

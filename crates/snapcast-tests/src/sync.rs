@@ -305,6 +305,9 @@ pub struct SyncRun {
     pub seed: u64,
     /// Also probe raw time exchanges over a copy of the last client's link.
     pub probe: bool,
+    /// Leave out every n-th 20 ms chunk at the source, timestamps going on
+    /// as when the server drops chunks (0 = never).
+    pub drop_every: u32,
 }
 
 /// Results of one client (µs).
@@ -384,8 +387,14 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
     // own timestamper: chunk k plays at start + k * 20 ms (+ buffer).
     let start_usec = now_usec();
     let start = tokio::time::Instant::now();
+    let drop_every = run.drop_every;
     let feeder = tokio::spawn(async move {
         for k in 0u32.. {
+            if drop_every > 0 && k > 0 && k % drop_every == 0 {
+                let next = Duration::from_micros(u64::from(k + 1) * 20_000);
+                tokio::time::sleep_until(start + next).await;
+                continue;
+            }
             let mut pcm = Vec::with_capacity(CHUNK_FRAMES as usize * FRAME_SIZE);
             for i in 0..CHUNK_FRAMES {
                 pcm.extend_from_slice(&counter_frame(k * CHUNK_FRAMES + i));

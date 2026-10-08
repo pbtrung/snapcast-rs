@@ -142,6 +142,13 @@ const SHORT_BUFFER_SIZE: usize = 100;
 const BUFFER_SIZE: usize = 500;
 /// Default buffer in milliseconds.
 const DEFAULT_BUFFER_MS: i64 = 1000;
+/// Consecutive chunks whose timestamps are further apart than this (µs)
+/// are a discontinuity: a gap is filled with silence and an overlap is
+/// skipped, so playback stays sample-aligned. Timestamps carry rounding of
+/// a few µs.
+const DISCONTINUITY_TOLERANCE_USEC: i64 = 500;
+/// A discontinuity larger than this (µs) is resolved by a hard sync.
+const DISCONTINUITY_HARD_SYNC_USEC: i64 = HARD_SYNC_AGE_USEC;
 
 /// Time-synchronized PCM stream buffer.
 ///
@@ -313,7 +320,10 @@ impl Stream {
     ) -> bool {
         let needs_new = self.current.as_ref().is_none_or(|c| c.is_end());
         if needs_new {
-            self.current = self.chunks.pop_front();
+            self.current = match self.current.as_ref() {
+                Some(ended) if !self.hard_sync => self.next_chunk(ended.end_usec()),
+                _ => self.chunks.pop_front(),
+            };
         }
         if self.current.is_none() {
             return false;
@@ -511,17 +521,18 @@ impl Stream {
     /// the server time of the first frame read. On underrun the unfilled tail
     /// of `output` is zeroed so stale buffer contents are never played.
     fn read_next(&mut self, output: &mut [u8], frames: u32) -> Option<i64> {
-        let chunk = self.current.as_mut()?;
         let frame_size = self.format.frame_size() as usize;
-        let ts = chunk.start_usec();
+        let ts = self.current.as_ref()?.start_usec();
         let mut read = 0u32;
         while read < frames {
             let offset = read as usize * frame_size;
+            let chunk = self.current.as_mut()?;
             let n = chunk.read_frames(&mut output[offset..], frames - read);
             read += n;
             if read < frames && chunk.is_end() {
-                match self.chunks.pop_front() {
-                    Some(next) => *chunk = next,
+                let ended = chunk.end_usec();
+                match self.next_chunk(ended) {
+                    Some(next) => self.current = Some(next),
                     None => break,
                 }
             } else if n == 0 {
@@ -535,6 +546,61 @@ impl Stream {
             output[filled..wanted].fill(0);
         }
         Some(ts)
+    }
+
+    /// Take the chunk to play after one that ended at server time
+    /// `prev_end_usec`, keeping playback sample-aligned when the timestamps
+    /// are not contiguous (the server dropped chunks, a chunk failed to
+    /// decode, or the server's timestamps were re-anchored):
+    ///
+    /// - a gap is filled with exactly as much silence (a silent chunk is
+    ///   returned and the next one stays queued);
+    /// - an overlap is skipped, dropping chunks that were entirely played;
+    /// - a jump beyond [`DISCONTINUITY_HARD_SYNC_USEC`] either way starts a
+    ///   hard sync and returns `None`.
+    fn next_chunk(&mut self, prev_end_usec: i64) -> Option<PcmChunk> {
+        let rate = i64::from(self.format.rate());
+        loop {
+            let mut next = self.chunks.pop_front()?;
+            let jump = next.start_usec() - prev_end_usec;
+            if jump.abs() <= DISCONTINUITY_TOLERANCE_USEC || rate == 0 {
+                return Some(next);
+            }
+            if jump.abs() > DISCONTINUITY_HARD_SYNC_USEC {
+                tracing::info!(jump_usec = jump, "Hard sync: chunk timestamps jump");
+                self.chunks.push_front(next);
+                self.hard_sync = true;
+                return None;
+            }
+            let frames = (jump.abs() * rate + 500_000) / 1_000_000;
+            if jump > 0 {
+                tracing::info!(
+                    gap_usec = jump,
+                    frames,
+                    "Gap between chunks, inserting silence"
+                );
+                self.chunks.push_front(next);
+                let bytes = frames as usize * self.format.frame_size() as usize;
+                return Some(PcmChunk::new_with_encoding(
+                    Timeval::from_usec(prev_end_usec),
+                    vec![0; bytes],
+                    self.format,
+                    self.encoding,
+                ));
+            }
+            let remaining = (next.data.len() - next.read_pos) as i64
+                / i64::from(self.format.frame_size().max(1));
+            tracing::info!(
+                overlap_usec = -jump,
+                frames = frames.min(remaining),
+                "Chunks overlap, skipping audio already played"
+            );
+            if frames >= remaining {
+                continue;
+            }
+            next.seek(frames as u32);
+            return Some(next);
+        }
     }
 
     fn read_with_correction(
@@ -884,11 +950,135 @@ mod tests {
         let mut odd = make_chunk(100, 0, 10, f);
         odd.data.extend_from_slice(&[0xEE, 0xEE]);
         s.add_chunk(odd);
-        s.add_chunk(make_chunk(100, 10_000, 10, f));
+        // Contiguous: 10 frames at 48 kHz last 208 µs.
+        s.add_chunk(make_chunk(100, 208, 10, f));
         s.current = s.chunks.pop_front();
         let mut out = vec![0u8; 15 * f.frame_size() as usize];
         assert!(s.read_next(&mut out, 15).is_some());
         assert_eq!(s.current.as_ref().unwrap().read_pos, 5 * 4);
+    }
+
+    // ---- discontinuities ----
+
+    /// A chunk of `frames` frames starting at `ts_usec` whose frames hold
+    /// their index from `first` on (0 is left for silence).
+    fn counter_chunk(ts_usec: i64, first: u32, frames: u32) -> PcmChunk {
+        let data = (first..first + frames)
+            .flat_map(|i| (i + 1).to_le_bytes())
+            .collect();
+        PcmChunk::new(Timeval::from_usec(ts_usec), data, fmt())
+    }
+
+    fn indices(out: &[u8]) -> Vec<u32> {
+        out.chunks(4)
+            .map(|f| u32::from_le_bytes(f.try_into().unwrap()))
+            .collect()
+    }
+
+    /// A stream positioned at the start of the first of `chunks`.
+    fn stream_of(chunks: Vec<PcmChunk>) -> Stream {
+        let mut s = Stream::new(fmt());
+        for c in chunks {
+            s.add_chunk(c);
+        }
+        s.current = s.chunks.pop_front();
+        s.hard_sync = false;
+        s
+    }
+
+    const T: i64 = 100_000_000;
+
+    #[test]
+    fn gap_between_chunks_is_filled_with_silence() {
+        // 480 frames (10 ms), then the next chunk 5 ms (240 frames) late.
+        let mut s = stream_of(vec![
+            counter_chunk(T, 0, 480),
+            counter_chunk(T + 15_000, 720, 480),
+        ]);
+        let mut out = vec![0xAAu8; 1440 * 4];
+        s.read_next(&mut out, 1440);
+        let got = indices(&out);
+        assert_eq!(got[479], 480);
+        assert!(
+            got[480..720].iter().all(|&i| i == 0),
+            "240 frames of silence"
+        );
+        assert_eq!(got[720], 721, "resumes at the late chunk's first frame");
+        assert_eq!(got[1199], 1200);
+        assert!(got[1200..].iter().all(|&i| i == 0), "underrun");
+    }
+
+    #[test]
+    fn overlapping_chunk_skips_audio_already_played() {
+        // The next chunk starts 5 ms (240 frames) before this one ends.
+        let mut s = stream_of(vec![
+            counter_chunk(T, 0, 480),
+            counter_chunk(T + 5_000, 240, 480),
+        ]);
+        let mut out = vec![0u8; 720 * 4];
+        s.read_next(&mut out, 720);
+        let got = indices(&out);
+        assert_eq!(&got[478..482], &[479, 480, 481, 482], "no frame repeated");
+        assert_eq!(got[719], 720);
+    }
+
+    #[test]
+    fn chunk_inside_played_audio_is_dropped() {
+        let mut s = stream_of(vec![
+            counter_chunk(T, 0, 960),
+            counter_chunk(T + 5_000, 240, 240),
+            counter_chunk(T + 20_000, 960, 480),
+        ]);
+        let mut out = vec![0u8; 1440 * 4];
+        s.read_next(&mut out, 1440);
+        let got = indices(&out);
+        assert_eq!(&got[958..962], &[959, 960, 961, 962]);
+        assert!(s.chunks.is_empty());
+    }
+
+    #[test]
+    fn timestamp_jitter_within_tolerance_is_ignored() {
+        let mut s = stream_of(vec![
+            counter_chunk(T, 0, 480),
+            counter_chunk(T + 10_100, 480, 480),
+        ]);
+        let mut out = vec![0u8; 960 * 4];
+        s.read_next(&mut out, 960);
+        let got = indices(&out);
+        assert_eq!(&got[479..481], &[480, 481]);
+    }
+
+    #[test]
+    fn large_timestamp_jump_starts_a_hard_sync() {
+        for next in [T + 10_000_000, T - 10_000_000] {
+            let mut s = stream_of(vec![
+                counter_chunk(T, 0, 480),
+                counter_chunk(next, 480, 480),
+            ]);
+            let mut out = vec![0xAAu8; 960 * 4];
+            s.read_next(&mut out, 960);
+            assert!(s.hard_sync, "jump to {next}");
+            assert!(out[480 * 4..].iter().all(|&b| b == 0));
+            assert_eq!(s.chunks.len(), 1, "the chunk is kept for the hard sync");
+        }
+    }
+
+    #[test]
+    fn gap_after_an_ended_chunk_is_filled_too() {
+        // The current chunk ended exactly at a buffer boundary; the next
+        // get_player_chunk call picks up the late chunk.
+        let f = fmt();
+        let mut s = Stream::new(f);
+        s.set_buffer_ms(1000);
+        s.add_chunk(counter_chunk(T, 0, 480));
+        let mut out = vec![0u8; 480 * 4];
+        assert!(s.get_player_chunk(T + 1_000_000, 0, &mut out, 480));
+        assert!(!s.hard_sync);
+        s.add_chunk(counter_chunk(T + 20_000, 960, 480));
+        assert!(s.get_player_chunk(T + 1_010_000, 0, &mut out, 480));
+        assert!(indices(&out).iter().all(|&i| i == 0), "10 ms of silence");
+        assert!(s.get_player_chunk(T + 1_020_000, 0, &mut out, 480));
+        assert_eq!(indices(&out)[0], 961);
     }
 
     #[test]

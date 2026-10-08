@@ -695,6 +695,7 @@ where
         ctx,
     } = args;
     let mut routing = routing_rx.borrow().clone();
+    let mut audio = AudioCursor::default();
 
     // Reading runs beside writing, so a request is read (and stamped) when
     // it arrives even while a write to a slow client is pending.
@@ -776,7 +777,10 @@ where
                     let chunk = match chunk {
                         Ok(c) => c,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "Broadcast lagged");
+                            // Reported with the audio it cost once the
+                            // next chunk is sent.
+                            tracing::debug!(id = %client_id, skipped = n, "Broadcast lagged");
+                            audio.lagged += n;
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -786,6 +790,14 @@ where
                     };
                     if !should_send_chunk(&chunk, &routing, ctx.send_audio_to_muted) {
                         continue;
+                    }
+                    if let Some((chunks, skipped_usec)) = audio.sent(&chunk) {
+                        tracing::warn!(
+                            id = %client_id,
+                            dropped_chunks = chunks,
+                            skipped_ms = skipped_usec as f64 / 1000.0,
+                            "Broadcast lagged: client too slow, audio skipped"
+                        );
                     }
                     write_chunk(&mut writer, chunk).await?;
                 }
@@ -800,6 +812,45 @@ where
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+/// Timestamps of the audio sent to a session, to tell how much audio a
+/// broadcast lag dropped.
+#[derive(Debug, Default)]
+struct AudioCursor {
+    /// Stream and timestamp of the last chunk sent.
+    last: Option<(String, i64)>,
+    /// Timestamp step between the last two chunks sent: the duration of a
+    /// chunk.
+    step_usec: i64,
+    /// Broadcast messages dropped since the last chunk sent (any stream).
+    lagged: u64,
+}
+
+impl AudioCursor {
+    /// Record that `chunk` is sent. After a lag, returns the number of
+    /// dropped messages and the audio skipped before `chunk` (µs, from the
+    /// timestamps; 0 if it is on another stream than the last one).
+    fn sent(&mut self, chunk: &WireChunkData) -> Option<(u64, i64)> {
+        let ts = chunk.timestamp_usec;
+        let same_stream = self
+            .last
+            .as_ref()
+            .filter(|(stream, _)| *stream == chunk.stream_id)
+            .map(|&(_, last)| last);
+        let lag = std::mem::take(&mut self.lagged);
+        let report = (lag > 0).then(|| {
+            let skipped = same_stream.map_or(0, |last| ts - (last + self.step_usec));
+            (lag, skipped.max(0))
+        });
+        match same_stream {
+            Some(last) if lag == 0 => self.step_usec = ts - last,
+            Some(_) => {}
+            None => self.step_usec = 0,
+        }
+        self.last = Some((chunk.stream_id.clone(), ts));
+        report
+    }
+}
 
 /// Decide whether to send a chunk to this session.
 #[inline]
@@ -1072,6 +1123,38 @@ mod tests {
         };
         assert_eq!(wc.timestamp, Timeval::from_usec(data.timestamp_usec));
         assert_eq!(wc.payload, data.data);
+    }
+
+    // ── AudioCursor ───────────────────────────────────────────
+
+    fn chunk_at(stream_id: &str, timestamp_usec: i64) -> WireChunkData {
+        WireChunkData {
+            stream_id: stream_id.into(),
+            timestamp_usec,
+            data: vec![0u8; 4].into(),
+        }
+    }
+
+    #[test]
+    fn audio_cursor_measures_audio_dropped_by_a_lag() {
+        let mut audio = AudioCursor::default();
+        assert_eq!(audio.sent(&chunk_at("s", 0)), None);
+        assert_eq!(audio.sent(&chunk_at("s", 20_000)), None);
+        // Five 20 ms chunks dropped: the next one is 120 ms after the last.
+        audio.lagged = 5;
+        assert_eq!(audio.sent(&chunk_at("s", 140_000)), Some((5, 100_000)));
+        // The step is still one chunk, not the gap.
+        audio.lagged = 1;
+        assert_eq!(audio.sent(&chunk_at("s", 180_000)), Some((1, 20_000)));
+        assert_eq!(audio.sent(&chunk_at("s", 200_000)), None);
+    }
+
+    #[test]
+    fn audio_cursor_reports_lag_across_stream_switch() {
+        let mut audio = AudioCursor::default();
+        audio.sent(&chunk_at("a", 0));
+        audio.lagged = 3;
+        assert_eq!(audio.sent(&chunk_at("b", 5_000_000)), Some((3, 0)));
     }
 
     // ── should_send_chunk ─────────────────────────────────────
