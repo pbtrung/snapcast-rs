@@ -1,8 +1,12 @@
 [package]
 name = "snapcast-tests"
+description = "Integration tests for the snapcast-rs server and client libraries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 publish = false
 
 [dependencies]

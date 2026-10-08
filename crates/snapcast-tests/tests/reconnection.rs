@@ -1,9 +1,11 @@
 //! Wave-2 integration tests: client reconnection & resync.
 //!
 //! Coverage:
-//!   * `client_stop_cleanly_ends_session` — a client-initiated `Stop` cleanly
-//!     ends the session: the server observes `ClientDisconnected`, and the
-//!     client does *not* surface a spurious `Disconnected` failure event.
+//!   * `client_stop_after_handshake_cleanly_ends_session` — a client-initiated
+//!     `Stop` right after the handshake (before any audio) cleanly ends the
+//!     session: the server observes `ClientDisconnected`, and the client does
+//!     *not* surface a spurious `Disconnected` failure event. (`shutdown.rs`
+//!     covers the same with audio flowing.)
 //!   * `client_to_dead_address_emits_disconnected` — a client pointed at an
 //!     address with no server emits `Disconnected`.
 //!   * `fresh_server_completes_full_handshake_and_sync` — after an old
@@ -28,7 +30,7 @@
 
 use snapcast_client::ClientEvent;
 use snapcast_server::ServerEvent;
-use snapcast_tests::{connect_client, expect_event, start_server};
+use snapcast_tests::{connect_client, expect_event, expect_server_event, start_server};
 use tokio::sync::mpsc;
 
 /// Push `count` short silence frames with monotonically increasing timestamps,
@@ -92,35 +94,12 @@ async fn expect_full_sync(
     .await;
 }
 
-/// Wait for a specific server-side event with a timeout (the harness only ships
-/// a client-side `expect_event`, so we provide the server analogue locally).
-async fn expect_server_event<F, T>(
-    events: &mut mpsc::Receiver<ServerEvent>,
-    timeout_ms: u64,
-    mut f: F,
-) -> T
-where
-    F: FnMut(ServerEvent) -> Option<T>,
-{
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(event)) => {
-                if let Some(val) = f(event) {
-                    return val;
-                }
-            }
-            Ok(None) => panic!("Server event channel closed"),
-            _ => panic!("Timed out waiting for expected server event"),
-        }
-    }
-}
-
-/// Client-initiated `Stop` must cleanly end the session: the server observes a
-/// `ClientDisconnected`, and the client's own run loop returns `Ok` *without*
-/// surfacing a spurious `Disconnected` failure event.
+/// Client-initiated `Stop` right after the handshake must cleanly end the
+/// session: the server observes a `ClientDisconnected`, and the client's own
+/// run loop returns `Ok` *without* surfacing a spurious `Disconnected` failure
+/// event.
 #[tokio::test]
-async fn client_stop_cleanly_ends_session() {
+async fn client_stop_after_handshake_cleanly_ends_session() {
     let mut server = start_server().await;
     let mut client = connect_client(server.port).await;
 

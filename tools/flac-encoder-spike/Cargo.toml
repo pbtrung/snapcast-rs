@@ -5,8 +5,8 @@ edition = "2021"
 publish = false
 
 # Standalone evaluation tool — deliberately its own workspace root so Cargo
-# never infers membership in the parent snapcast-rs workspace. Not built or
-# tested by CI; not a dependency of anything. See ../../docs/flac-encoder-evaluation.md.
+# never infers membership in the parent snapcast-rs workspace.
+# Not a dependency of anything. See ../../docs/flac-encoder-evaluation.md.
 [workspace]
 
 [dependencies]

@@ -144,7 +144,9 @@ integration into `snapcast-server`'s `Encoder` trait.
 Against the real trait we'd implement
 (`crates/snapcast-server/src/encoder/mod.rs`): synchronous, one
 `encode(&mut self, input: &AudioData) -> Result<EncodedChunk>` call per
-chunk, `header() -> &[u8]` borrowed from a stored field.
+chunk, `header() -> &[u8]` borrowed from a stored field. (That was the trait
+at evaluation time; `encode` now returns `Result<Vec<EncodedPacket>>`, one
+packet per completed FLAC frame, each sent as its own `WireChunk`.)
 
 | | `flacenc` | `oxideav-flac` |
 |---|---|---|
@@ -214,8 +216,9 @@ adoption).
 The compression-level option (`0..=8`) is still accepted and validated for
 CLI/API compatibility, but `flacenc` has no libFLAC-style preset ladder, so
 the level is mapped to `flacenc`'s LPC search order rather than reproducing
-libFLAC's exact presets (the server never sets it — it's always empty in
-practice).
+libFLAC's exact presets. It is set via the codec string, e.g.
+`codec = flac:5` or `--codec flac:5`; plain `flac` uses `flacenc`'s default
+profile.
 
 ### Supported format envelope (the one behavioral narrowing)
 

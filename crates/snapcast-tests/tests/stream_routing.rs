@@ -1,31 +1,15 @@
+//! Single-client stream routing: `SetGroupStream` and mute/unmute commands
+//! take effect in the server state while audio flows on both streams.
+//!
+//! These tests check the commands are applied and that pushing audio around
+//! them does not fail; they do not inspect what the client decodes.
+//! `multi_client.rs` asserts on decoded audio per client.
+
 use snapcast_client::ClientEvent;
 use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
-use snapcast_tests::{connect_client, expect_event, spawn_serving};
-use tokio::sync::mpsc;
-
-/// Start a server with two streams.
-async fn start_two_stream_server() -> TwoStreamServer {
-    let (mut server, events) = snapcast_server::SnapServer::new(Default::default());
-    let stream_a = server.add_stream("stream_a");
-    let stream_b = server.add_stream("stream_b");
-    let cmd = server.command_sender();
-    let port = spawn_serving(server).await;
-    TwoStreamServer {
-        events,
-        stream_a,
-        stream_b,
-        cmd,
-        port,
-    }
-}
-
-struct TwoStreamServer {
-    events: mpsc::Receiver<ServerEvent>,
-    stream_a: mpsc::Sender<AudioFrame>,
-    stream_b: mpsc::Sender<AudioFrame>,
-    cmd: mpsc::Sender<ServerCommand>,
-    port: u16,
-}
+use snapcast_tests::{
+    client_group, connect_client, expect_event, expect_server_event, start_two_stream_server,
+};
 
 fn silence_frame() -> AudioFrame {
     AudioFrame {
@@ -41,58 +25,22 @@ fn tone_frame() -> AudioFrame {
     }
 }
 
-/// Helper: get server status and find the group containing a client.
-async fn get_client_group(cmd: &mpsc::Sender<ServerCommand>, client_id: &str) -> (String, String) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cmd.send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .unwrap();
-    let status = rx.await.unwrap();
-    for group in &status.server.groups {
-        for client in &group.clients {
-            if client.id == client_id {
-                return (group.id.clone(), group.stream_id.clone());
-            }
-        }
-    }
-    panic!("Client {client_id} not found in any group");
-}
-
-/// Helper: wait for server ClientConnected event.
-async fn wait_for_connect(events: &mut mpsc::Receiver<ServerEvent>) -> String {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(ServerEvent::ClientConnected { id, .. })) => return id,
-            Ok(Some(_)) => continue,
-            _ => panic!("Timed out waiting for ClientConnected"),
-        }
-    }
-}
-
-/// Helper: wait (event-driven, no sleep) for a specific server event, so a
-/// command's effect is observed before the following assertion runs.
-async fn wait_for_server_event<F>(events: &mut mpsc::Receiver<ServerEvent>, mut pred: F)
-where
-    F: FnMut(&ServerEvent) -> bool,
-{
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(ev)) if pred(&ev) => return,
-            Ok(Some(_)) => continue,
-            _ => panic!("Timed out waiting for server event"),
-        }
-    }
+/// Wait for the server's `ClientConnected` event and return the client id.
+async fn wait_for_connect(server: &mut snapcast_tests::TwoStreamServer) -> String {
+    expect_server_event(&mut server.events, 2000, |e| match e {
+        ServerEvent::ClientConnected { id, .. } => Some(id),
+        _ => None,
+    })
+    .await
 }
 
 #[tokio::test]
-async fn client_receives_audio_only_from_assigned_stream() {
+async fn set_group_stream_reroutes_client_while_audio_flows() {
     let mut server = start_two_stream_server().await;
     let mut client = connect_client(server.port).await;
 
     // Wait for client to connect and stream to start
-    let client_id = wait_for_connect(&mut server.events).await;
+    let client_id = wait_for_connect(&mut server).await;
     expect_event(&mut client.events, 2000, |e| match e {
         ClientEvent::StreamStarted { .. } => Some(()),
         _ => None,
@@ -100,10 +48,10 @@ async fn client_receives_audio_only_from_assigned_stream() {
     .await;
 
     // Client is in group assigned to stream_a (first stream = default)
-    let (group_id, stream_id) = get_client_group(&server.cmd, &client_id).await;
+    let (group_id, stream_id) = client_group(&server.cmd, &client_id).await;
     assert_eq!(stream_id, "stream_a");
 
-    // Exercise the pipeline: assigned stream carries audio, the other does not.
+    // Feed both streams: tone on the assigned one, silence on the other.
     for _ in 0..5 {
         server.stream_a.send(tone_frame()).await.unwrap();
         server.stream_b.send(silence_frame()).await.unwrap();
@@ -118,33 +66,29 @@ async fn client_receives_audio_only_from_assigned_stream() {
         })
         .await
         .unwrap();
-    wait_for_server_event(&mut server.events, |e| {
-        matches!(e, ServerEvent::GroupStreamChanged { .. })
+    expect_server_event(&mut server.events, 2000, |e| {
+        matches!(e, ServerEvent::GroupStreamChanged { .. }).then_some(())
     })
     .await;
 
     // Verify the switch happened
-    let (_, new_stream) = get_client_group(&server.cmd, &client_id).await;
+    let (_, new_stream) = client_group(&server.cmd, &client_id).await;
     assert_eq!(new_stream, "stream_b");
 
-    // Now stream_b audio should reach the client, stream_a should not.
+    // Keep both streams fed after the switch; the server must accept audio on
+    // both regardless of routing.
     for _ in 0..5 {
         server.stream_b.send(tone_frame()).await.unwrap();
         server.stream_a.send(silence_frame()).await.unwrap();
     }
-
-    // If we got here without panics/errors, stream routing works end-to-end:
-    // - Client only received audio from its assigned stream
-    // - SetGroupStream changed the routing
-    // - New stream's audio reaches the client after switch
 }
 
 #[tokio::test]
-async fn muted_client_receives_no_audio() {
+async fn mute_and_unmute_apply_while_audio_flows() {
     let mut server = start_two_stream_server().await;
     let mut client = connect_client(server.port).await;
 
-    let client_id = wait_for_connect(&mut server.events).await;
+    let client_id = wait_for_connect(&mut server).await;
     expect_event(&mut client.events, 2000, |e| match e {
         ClientEvent::StreamStarted { .. } => Some(()),
         _ => None,
@@ -161,12 +105,13 @@ async fn muted_client_receives_no_audio() {
         })
         .await
         .unwrap();
-    wait_for_server_event(&mut server.events, |e| {
-        matches!(e, ServerEvent::ClientVolumeChanged { muted: true, .. })
+    expect_server_event(&mut server.events, 2000, |e| {
+        matches!(e, ServerEvent::ClientVolumeChanged { muted: true, .. }).then_some(())
     })
     .await;
 
-    // Send audio — muted client should not receive chunks (server skips sending)
+    // Send audio while muted (the server skips sending chunks to muted clients;
+    // multi_client.rs asserts that on the decoded output).
     for _ in 0..5 {
         server.stream_a.send(tone_frame()).await.unwrap();
     }
@@ -181,12 +126,12 @@ async fn muted_client_receives_no_audio() {
         })
         .await
         .unwrap();
-    wait_for_server_event(&mut server.events, |e| {
-        matches!(e, ServerEvent::ClientVolumeChanged { muted: false, .. })
+    expect_server_event(&mut server.events, 2000, |e| {
+        matches!(e, ServerEvent::ClientVolumeChanged { muted: false, .. }).then_some(())
     })
     .await;
 
-    // Audio should flow again
+    // Keep audio flowing after unmuting.
     for _ in 0..5 {
         server.stream_a.send(tone_frame()).await.unwrap();
     }

@@ -16,36 +16,12 @@
 //! and mute state, so a filtered client receives literally zero frames.
 
 use snapcast_client::ClientEvent;
-use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent, SnapServer};
-use snapcast_tests::{TestClient, connect_client_with_id, expect_event, spawn_serving};
+use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
+use snapcast_tests::{
+    TestClient, TwoStreamServer, client_group, connect_client_with_id, expect_event,
+    expect_server_event, start_two_stream_server,
+};
 use tokio::sync::mpsc;
-
-// ---------------------------------------------------------------------------
-// Server harness with two named streams (like stream_routing.rs).
-// ---------------------------------------------------------------------------
-
-struct TwoStreamServer {
-    events: mpsc::Receiver<ServerEvent>,
-    stream_a: mpsc::Sender<AudioFrame>,
-    stream_b: mpsc::Sender<AudioFrame>,
-    cmd: mpsc::Sender<ServerCommand>,
-    port: u16,
-}
-
-async fn start_two_stream_server() -> TwoStreamServer {
-    let (mut server, events) = SnapServer::new(Default::default());
-    let stream_a = server.add_stream("stream_a");
-    let stream_b = server.add_stream("stream_b");
-    let cmd = server.command_sender();
-    let port = spawn_serving(server).await;
-    TwoStreamServer {
-        events,
-        stream_a,
-        stream_b,
-        cmd,
-        port,
-    }
-}
 
 /// One non-silent input frame (960 interleaved f32 = 480 stereo sample-frames).
 fn tone_frame(ts: i64) -> AudioFrame {
@@ -68,29 +44,6 @@ async fn push_tone(stream: &mpsc::Sender<AudioFrame>, frames: usize) {
 // ---------------------------------------------------------------------------
 // Event-driven helpers (no fixed sleeps).
 // ---------------------------------------------------------------------------
-
-/// Server-side analogue of `expect_event`: wait for a matching `ServerEvent`.
-async fn expect_server_event<F, T>(
-    events: &mut mpsc::Receiver<ServerEvent>,
-    timeout_ms: u64,
-    mut f: F,
-) -> T
-where
-    F: FnMut(ServerEvent) -> Option<T>,
-{
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(event)) => {
-                if let Some(val) = f(event) {
-                    return val;
-                }
-            }
-            Ok(None) => panic!("Server event channel closed"),
-            _ => panic!("Timed out waiting for expected server event"),
-        }
-    }
-}
 
 /// Collect the ids of the next `n` distinct clients the server sees connect.
 async fn wait_for_n_connects(events: &mut mpsc::Receiver<ServerEvent>, n: usize) -> Vec<String> {
@@ -170,21 +123,6 @@ async fn drain_audio(client: &mut TestClient, min_samples: usize, quiet_ms: u64)
             Err(_) => return total,   // quiet window elapsed: no more audio
         }
     }
-}
-
-/// Look up the group id + stream id of a client via `GetStatus`.
-async fn client_group(cmd: &mpsc::Sender<ServerCommand>, client_id: &str) -> (String, String) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cmd.send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .unwrap();
-    let status = rx.await.unwrap();
-    for group in &status.server.groups {
-        if group.clients.iter().any(|c| c.id == client_id) {
-            return (group.id.clone(), group.stream_id.clone());
-        }
-    }
-    panic!("Client {client_id} not found in any group");
 }
 
 /// Set a group's stream and wait for the `GroupStreamChanged` confirmation.

@@ -20,20 +20,23 @@ fn config(idle: Option<Duration>, remove_after: Option<Duration>) -> ServerConfi
 #[tokio::test]
 async fn silent_session_is_closed_after_idle_timeout() {
     let mut server = start_server_with(config(Some(Duration::from_millis(400)), None)).await;
+    // Taken before connecting: the server's idle clock starts when it reads the
+    // Hello, which is later, so the close can never come sooner than 400 ms
+    // after this, however late the test observes the events below.
+    let started = tokio::time::Instant::now();
     // Sends its Hello, then nothing — like a peer that lost power.
     let mut silent = RawClient::connect(server.port, "silent").await;
     expect_server_event(&mut server.events, 2000, |e| {
         matches!(e, ServerEvent::ClientConnected { ref id, .. } if id == "silent").then_some(())
     })
     .await;
-    let connected_at = tokio::time::Instant::now();
 
     expect_server_event(&mut server.events, 3000, |e| {
         matches!(e, ServerEvent::ClientDisconnected { ref id } if id == "silent").then_some(())
     })
     .await;
     assert!(
-        connected_at.elapsed() >= Duration::from_millis(350),
+        started.elapsed() >= Duration::from_millis(400),
         "not closed before the timeout"
     );
     assert!(silent.closed_within(1000).await, "socket closed by server");

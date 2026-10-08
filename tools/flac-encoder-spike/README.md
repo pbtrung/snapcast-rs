@@ -2,7 +2,7 @@
 
 A standalone verification tool, not part of the snapcast-rs workspace (see
 the `[workspace]` marker in `Cargo.toml` — it deliberately roots its own,
-separate Cargo workspace so it's invisible to the parent build and CI).
+separate Cargo workspace so it's invisible to the parent build).
 
 It answers one question: when fed PCM in the same 1152-frame blocks
 snapserver-rs's FLAC encoder actually uses, with the header emitted once up

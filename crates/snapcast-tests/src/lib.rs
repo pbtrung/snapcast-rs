@@ -6,15 +6,17 @@ use tokio::sync::mpsc;
 
 /// Bind an ephemeral 127.0.0.1 port, spawn `server.serve()` on it, and return
 /// the actual bound port. The library opens no port itself, so tests bind here;
-/// reading the bound port avoids a bind/connect race.
+/// reading the bound port avoids port collisions between parallel tests.
+///
+/// No startup wait is needed: the socket is already listening when this
+/// returns, so a client that connects before the accept loop runs just waits
+/// in the kernel backlog.
 pub async fn spawn_serving(mut server: SnapServer) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         server.serve(listener).await.ok();
     });
-    // Give the accept loop a moment to start.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     port
 }
 
@@ -40,6 +42,32 @@ pub async fn start_server_with(config: ServerConfig) -> TestServer {
     TestServer {
         events,
         audio_tx,
+        cmd,
+        port,
+    }
+}
+
+/// Server handle with two streams, `stream_a` (the default, as the first
+/// registered) and `stream_b`, for routing tests.
+pub struct TwoStreamServer {
+    pub events: mpsc::Receiver<ServerEvent>,
+    pub stream_a: mpsc::Sender<snapcast_server::AudioFrame>,
+    pub stream_b: mpsc::Sender<snapcast_server::AudioFrame>,
+    pub cmd: mpsc::Sender<snapcast_server::ServerCommand>,
+    pub port: u16,
+}
+
+/// Start a default-config server with streams `stream_a` and `stream_b`.
+pub async fn start_two_stream_server() -> TwoStreamServer {
+    let (mut server, events) = SnapServer::new(ServerConfig::default());
+    let stream_a = server.add_stream("stream_a");
+    let stream_b = server.add_stream("stream_b");
+    let cmd = server.command_sender();
+    let port = spawn_serving(server).await;
+    TwoStreamServer {
+        events,
+        stream_a,
+        stream_b,
         cmd,
         port,
     }
@@ -244,4 +272,24 @@ pub async fn client_connected(
         .flat_map(|g| &g.clients)
         .find(|c| c.id == client_id)
         .map(|c| c.connected)
+}
+
+/// Look up the `(group id, stream id)` of the group holding `client_id` in the
+/// server status. Panics if the client is in no group.
+pub async fn client_group(
+    cmd: &mpsc::Sender<snapcast_server::ServerCommand>,
+    client_id: &str,
+) -> (String, String) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd.send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+        .await
+        .unwrap();
+    let status = rx.await.unwrap();
+    status
+        .server
+        .groups
+        .iter()
+        .find(|g| g.clients.iter().any(|c| c.id == client_id))
+        .map(|g| (g.id.clone(), g.stream_id.clone()))
+        .unwrap_or_else(|| panic!("Client {client_id} not found in any group"))
 }

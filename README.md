@@ -7,13 +7,13 @@ A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the
 ## Key Features
 
 - **Dynamic Audio Pipeline**: The client automatically re-initializes the audio device when the server changes sample rate or channels.
-- **Integrated Resampling**: Automatic fallback to `rubato`-based resampling if the local hardware doesn't support the server's native format.
+- **Integrated Resampling**: Optional `rubato`-based resampling (the client's `resampler` feature) when the local hardware doesn't support the server's native format.
 - **Bounded Protocol Reads**: Client and server reject oversized binary-protocol payloads before allocation.
 - **Per-Stream Format Ownership**: Each server stream owns its codec/sample-format encoder state.
 - **Lossless f32 Decode Path**: The FLAC decoder outputs native f32 samples — no intermediate 16-bit quantization.
 - **WebSocket Streaming**: Clients can stream over `ws://host:1780` (the server's `/stream` endpoint on its HTTP port) as well as plain TCP, one binary-protocol frame per WebSocket message, as in C++ Snapcast. Snapweb works against `snapserver-rs` for both control and in-browser playback (FLAC, PCM and Opus). No TLS (`wss://`) support.
 - **Configurable Bind Addresses**: Listeners bind loopback, IPv4, IPv6, or specific interfaces.
-- **Systemd Integration**: Native `sd-notify` support on Linux for service readiness and status reporting.
+- **Systemd Integration**: `snapclient-rs` reports readiness and status via `sd-notify` on Linux.
 
 ## Architecture
 
@@ -29,13 +29,36 @@ snapcast-rs/
 
 Both libraries are pure audio engines — no device I/O, no HTTP, no config files.
 
-## Server Features
+## Cargo Features
+
+Server (`snapserver-rs`; `flac` and `opus` also on the `snapcast-server` library):
 
 | Feature  | Default | C dep     | Description |
 |----------|---------|-----------|-------------|
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
 | `opus`   | —       | libopus   | Opus encoding |
 | `mdns`   | ✅      | avahi     | mDNS service advertisement (binary only) |
+
+Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pure Rust):
+
+| Feature     | Default | C dep | Description |
+|-------------|---------|-------|-------------|
+| `mdns`      | ✅      | none  | mDNS server discovery (mdns-sd) |
+| `websocket` | ✅      | none  | `ws://` streaming transport |
+| `resampler` | —       | none  | Resample when the device can't play the stream format |
+
+## Stream Sources
+
+`--source` (repeatable) or `source = ...` under `[stream]` in `snapserver.conf` (default path `/etc/snapserver.conf`, set with `-c`). Each URI takes `?name=<id>` plus an optional `&sampleformat=<rate>:<bits>:<channels>`; all streams use the server-wide codec:
+
+- `pipe:///path/to/fifo`: named pipe (the default source is `pipe:///tmp/snapfifo?name=default`)
+- `file:///path/to/file.pcm`: raw PCM (or 44-byte-header WAV) file, played in real time and looped
+- `process:///path/to/binary?params=...`: a child process's stdout
+- `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953)
+- `librespot:///?devicename=...`: Spotify Connect via `librespot` (run from `PATH`)
+- `airplay:///?devicename=...`: AirPlay via `shairport-sync` (run from `PATH`)
+
+Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root`).
 
 ## Inactive Clients
 
@@ -87,6 +110,7 @@ git clone https://github.com/pbtrung/snapcast-rs.git
 cd snapcast-rs
 cargo build --release                              # default: flac + mdns
 cargo build --release -p snapserver-rs --features opus  # + Opus
+cargo build --release -p snapclient-rs --features resampler  # + client resampling
 ```
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.
@@ -115,6 +139,13 @@ snapclient-rs --help
 # Feed audio
 ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
 ```
+
+## Known Limitations
+
+- The control API's `--auth` / `[auth]` gate is not access control yet: `Server.GetToken` issues a token for any username without checking credentials.
+- Server state (client names, groups, latency) is kept in memory only; it is not saved across restarts.
+- `Stream.AddStream` is rejected (streams are fixed at startup), and `Stream.Control` is accepted but not acted on.
+- librespot/AirPlay track metadata is not published to control clients.
 
 ## License
 

@@ -24,36 +24,12 @@
 //! connected; both together disconnect it within a few hundred ms.
 //!
 //! All synchronization is event-driven (`expect_event` on the client side and a
-//! local `expect_server_event` helper on the server side), never fixed sleeps.
+//! `expect_server_event` on the server side), never fixed sleeps.
 
 use snapcast_client::ClientEvent;
 use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
-use snapcast_tests::{TestClient, connect_client, expect_event, start_server};
+use snapcast_tests::{TestClient, connect_client, expect_event, expect_server_event, start_server};
 use tokio::sync::mpsc;
-
-/// Server-side analogue of the harness's `expect_event`: wait for a matching
-/// `ServerEvent` with a timeout, discarding events the closure rejects.
-async fn expect_server_event<F, T>(
-    events: &mut mpsc::Receiver<ServerEvent>,
-    timeout_ms: u64,
-    mut f: F,
-) -> T
-where
-    F: FnMut(ServerEvent) -> Option<T>,
-{
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(event)) => {
-                if let Some(val) = f(event) {
-                    return val;
-                }
-            }
-            Ok(None) => panic!("Server event channel closed"),
-            _ => panic!("Timed out waiting for expected server event"),
-        }
-    }
-}
 
 /// One ~10ms chunk of interleaved stereo f32 audio at 48kHz/2ch (960 samples).
 /// Cheap to encode; keeps tests fast.

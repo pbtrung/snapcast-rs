@@ -74,7 +74,7 @@ async fn audio_round_trip() {
         ts += 10_000; // 10ms increment
     }
 
-    // Verify client's stream buffer has data
+    // Collect decoded audio from the client
     let mut total_samples = 0;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 

@@ -1,21 +1,16 @@
-.PHONY: setup check fmt clippy test build
+.PHONY: check fmt clippy test build
 
-## First-time setup: configure git hooks
-setup:
-	git config core.hooksPath .githooks
-	@echo "✅ Git hooks configured"
-
-## Run all checks (same as CI)
+## Run all checks (fmt, clippy, tests)
 check: fmt clippy test
 
 fmt:
-	cargo fmt -- --check
+	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 test:
-	cargo test --all
+	cargo test --workspace
 
 build:
 	cargo build --release
