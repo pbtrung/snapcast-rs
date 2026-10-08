@@ -10,20 +10,6 @@ mod ws_transport;
 use clap::Parser;
 use snapcast_server::{ServerCommand, ServerEvent, SnapServer};
 
-/// JSON-RPC event forwarded from control/HTTP handlers to the binary's event loop.
-#[derive(Debug)]
-pub(crate) enum ControlEvent {
-    /// Unrecognized JSON-RPC method or registered notification.
-    JsonRpc {
-        /// Control client that sent the request.
-        client_id: String,
-        /// The full JSON-RPC request object.
-        request: serde_json::Value,
-        /// Response channel (`Some` for methods, `None` for notifications).
-        response_tx: Option<tokio::sync::oneshot::Sender<serde_json::Value>>,
-    },
-}
-
 /// Snapcast server — synchronized multiroom audio server.
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -107,6 +93,14 @@ fn parse_pcm_format(value: &str) -> anyhow::Result<snapcast_proto::SampleFormat>
         .map_err(|e| anyhow::anyhow!("invalid sample format '{value}': {e}"))?;
     format.validate_concrete_pcm()?;
     Ok(format)
+}
+
+/// Sample format a source scheme always produces, used when its URI sets no
+/// `sampleformat`: librespot and shairport-sync output 44.1 kHz, so the
+/// 48 kHz server default would play them too fast.
+fn default_source_format(scheme: &str) -> Option<snapcast_proto::SampleFormat> {
+    matches!(scheme, "librespot" | "airplay")
+        .then(|| snapcast_proto::SampleFormat::new(44100, 16, 2))
 }
 
 /// Library stream config for a configured source whose reader produces
@@ -214,14 +208,14 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 },
-                None => default_format,
+                None => default_source_format(&parsed.scheme).unwrap_or(default_format),
             };
 
             let tx = server.add_stream_with_config(&name, source_stream_config(source, format));
 
             // Chunk size matches codec block size:
-            // FLAC level 0-2: 1152 frames, level 3+: 4096 frames
-            // Others: 960 frames (20ms at 48kHz)
+            // FLAC: 1152 frames (the encoder's fixed block size)
+            // Others: 20 ms
             const FLAC_BLOCK_FRAMES: usize = 1152;
             const DEFAULT_CHUNK_MS: usize = 20;
             let codec_name = codec
@@ -291,22 +285,14 @@ fn main() -> anyhow::Result<()> {
         // JSON-RPC control servers
         let (notify_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
         let auth_cfg = std::sync::Arc::new(server_config.auth.clone());
-        let methods = std::sync::Arc::new(std::collections::HashSet::<String>::new());
-        let notifications = std::sync::Arc::new(std::collections::HashSet::<String>::new());
-
-        // Event channel for control servers (separate from library events)
-        let (ctrl_event_tx, mut ctrl_event_rx) = tokio::sync::mpsc::channel::<ControlEvent>(256);
 
         // TCP JSON-RPC control
         let control_cfg = control::ControlConfig {
             bind_address: server_config.control_bind_address.clone(),
             port: server_config.control_port,
-            event_tx: ctrl_event_tx.clone(),
             notify_tx: notify_tx.clone(),
             auth_config: std::sync::Arc::clone(&auth_cfg),
             cmd_tx: server.command_sender(),
-            registered_methods: std::sync::Arc::clone(&methods),
-            registered_notifications: std::sync::Arc::clone(&notifications),
         };
         tokio::spawn(async move {
             if let Err(e) = control::run_tcp(control_cfg).await {
@@ -319,7 +305,6 @@ fn main() -> anyhow::Result<()> {
             bind_address: server_config.http_bind_address.clone(),
             port: server_config.http_port,
             doc_root: server_config.doc_root.clone(),
-            event_tx: ctrl_event_tx.clone(),
             notify_tx: notify_tx.clone(),
             auth_config: std::sync::Arc::clone(&auth_cfg),
             cmd_tx: server.command_sender(),
@@ -331,23 +316,9 @@ fn main() -> anyhow::Result<()> {
             }
         });
 
-        // Drain control events (JSON-RPC extension point)
-        tokio::spawn(async move {
-            while let Some(event) = ctrl_event_rx.recv().await {
-                match event {
-                    ControlEvent::JsonRpc {
-                        client_id,
-                        request,
-                        response_tx,
-                    } => {
-                        tracing::debug!(client_id, ?request, "Unhandled JSON-RPC");
-                        drop(response_tx); // explicitly drop — handler will see channel closed
-                    }
-                }
-            }
-        });
-
-        // Broadcast server events as JSON-RPC notifications
+        // Broadcast server events as JSON-RPC notifications. This is the only
+        // source of change notifications: the library emits an event for every
+        // mutating control command as well as for audio-client activity.
         let event_notify_tx = notify_tx.clone();
         let event_cmd_tx = server.command_sender();
         tokio::spawn(async move {
@@ -462,12 +433,7 @@ async fn get_client_from_status(
     client_id: &str,
 ) -> serde_json::Value {
     let status = get_full_status(cmd_tx).await;
-    status["server"]["groups"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|g| g["clients"].as_array().into_iter().flatten())
-        .find(|c| c["id"].as_str() == Some(client_id))
+    jsonrpc::find_client(&status, client_id)
         .cloned()
         .unwrap_or_default()
 }
@@ -485,6 +451,14 @@ mod tests {
         for bad in ["48000:16", "0:16:2", "48000:*:2", "48000:12:2", "garbage"] {
             assert!(parse_pcm_format(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn spotify_and_airplay_default_to_44k1() {
+        let cd = snapcast_proto::SampleFormat::new(44100, 16, 2);
+        assert_eq!(default_source_format("librespot"), Some(cd));
+        assert_eq!(default_source_format("airplay"), Some(cd));
+        assert_eq!(default_source_format("pipe"), None);
     }
 
     #[test]

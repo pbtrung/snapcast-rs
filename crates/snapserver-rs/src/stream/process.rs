@@ -26,21 +26,19 @@ pub fn start(
         let mut ts = ChunkTimestamper::new(format.rate());
         loop {
             tracing::info!(path, params, "Starting process stream");
-            let args: Vec<&str> = if params.is_empty() {
-                vec![]
-            } else {
-                params.split_whitespace().collect()
-            };
-
-            let Ok(mut child) = Command::new(&path)
-                .args(&args)
+            let mut child = match Command::new(&path)
+                .args(params.split_whitespace())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
                 .spawn()
-            else {
-                tracing::error!(path, "Failed to start process");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    tracing::error!(path, error = %e, "Failed to start process");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
             };
 
             let Some(mut stdout) = child.stdout.take() else {

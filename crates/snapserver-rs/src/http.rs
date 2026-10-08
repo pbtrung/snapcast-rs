@@ -10,22 +10,22 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
-use axum::response::IntoResponse;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::auth::AuthConfig;
-use crate::jsonrpc::{self, RpcResult};
+use crate::jsonrpc::{self, MAX_REQUEST_LEN};
 
 /// Shared state for axum handlers.
 #[derive(Clone)]
 struct AppState {
-    event_tx: mpsc::Sender<crate::ControlEvent>,
     notify_tx: broadcast::Sender<Value>,
     auth_config: Arc<AuthConfig>,
-    cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
     client_acceptor: snapcast_server::ClientAcceptor,
 }
 
@@ -37,14 +37,12 @@ pub(crate) struct HttpConfig {
     pub port: u16,
     /// Snapweb document root (None = disabled).
     pub doc_root: Option<String>,
-    /// Event sender for extension point.
-    pub event_tx: mpsc::Sender<crate::ControlEvent>,
     /// Notification broadcast sender.
     pub notify_tx: broadcast::Sender<Value>,
     /// Auth configuration.
     pub auth_config: Arc<AuthConfig>,
     /// Server command sender.
-    pub cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
+    pub cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
     /// Hands WebSocket streaming clients (`/stream`) to the audio server.
     pub client_acceptor: snapcast_server::ClientAcceptor,
 }
@@ -52,7 +50,6 @@ pub(crate) struct HttpConfig {
 /// Start the HTTP server with JSON-RPC + WebSocket + optional Snapweb.
 pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
     let app_state = AppState {
-        event_tx: cfg.event_tx,
         notify_tx: cfg.notify_tx,
         auth_config: cfg.auth_config,
         cmd_tx: cfg.cmd_tx,
@@ -78,7 +75,12 @@ pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
 /// `into_make_service_with_connect_info::<SocketAddr>()` (`/stream` logs the peer).
 fn router(app_state: AppState, doc_root: Option<&str>) -> Router {
     let mut app = Router::new()
-        .route("/jsonrpc", get(ws_handler).post(http_jsonrpc_handler))
+        .route(
+            "/jsonrpc",
+            get(ws_handler)
+                .post(http_jsonrpc_handler)
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_LEN)),
+        )
         .route("/stream", get(stream_ws_handler))
         .with_state(app_state);
 
@@ -105,12 +107,13 @@ async fn stream_ws_handler(
     })
 }
 
-/// HTTP POST /jsonrpc handler.
+/// HTTP POST /jsonrpc handler. Stateless: when auth is enabled every request
+/// must carry a valid `Authorization: Bearer` token.
 async fn http_jsonrpc_handler(
     State(app): State<AppState>,
     headers: axum::http::HeaderMap,
     body: String,
-) -> impl IntoResponse {
+) -> Response {
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -118,53 +121,26 @@ async fn http_jsonrpc_handler(
         return axum::Json(serde_json::json!({
             "jsonrpc": "2.0", "id": null,
             "error": {"code": -32000, "message": format!("Unauthorized: {e}")}
-        }));
+        }))
+        .into_response();
     }
 
-    let Ok(request) = serde_json::from_str::<Value>(&body) else {
-        return axum::Json(serde_json::json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32700, "message": "Parse error"}
-        }));
-    };
-
-    match jsonrpc::handle_request(&request, &app.auth_config, &app.cmd_tx).await {
-        RpcResult::Response {
-            response,
-            notification,
-        } => {
-            if let Some(n) = notification {
-                let _ = app.notify_tx.send(n);
-            }
-            axum::Json(response)
-        }
-        RpcResult::Unknown => {
-            let _ = app
-                .event_tx
-                .send(crate::ControlEvent::JsonRpc {
-                    response_tx: None,
-                    client_id: "http".into(),
-                    request,
-                })
-                .await;
-            axum::Json(serde_json::json!({
-                "jsonrpc": "2.0", "id": null,
-                "error": {"code": -32601, "message": "Method not found"}
-            }))
-        }
+    match jsonrpc::handle_message(&body, &mut true, &app.auth_config, &app.cmd_tx).await {
+        Some(reply) => axum::Json(reply).into_response(),
+        // Only notifications: nothing to answer.
+        None => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
 /// WebSocket upgrade handler at GET /jsonrpc.
 async fn ws_handler(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, app))
+    ws.max_message_size(MAX_REQUEST_LEN)
+        .on_upgrade(move |socket| handle_ws(socket, app))
 }
 
 async fn handle_ws(mut socket: WebSocket, app: AppState) {
     let mut notify_rx = app.notify_tx.subscribe();
-    // Per-connection auth state, mirroring the TCP control path. Without this
-    // the WebSocket endpoint dispatched every request unauthenticated even when
-    // auth was enabled (HTTP POST and TCP both gated — WS was a full bypass).
+    // Per-connection auth state, same policy as the TCP control server.
     let mut authenticated = !app.auth_config.enabled;
 
     loop {
@@ -172,55 +148,22 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
             msg = socket.recv() => {
                 let Some(Ok(msg)) = msg else { break };
                 let Message::Text(text) = msg else { continue };
-
-                let Ok(request) = serde_json::from_str::<Value>(&text) else {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0", "id": null,
-                        "error": {"code": -32700, "message": "Parse error"}
-                    });
-                    if socket.send(Message::Text(err.to_string().into())).await.is_err() { break }
-                    continue;
-                };
-
-                // Auth gate: until authenticated, only Server.GetToken and
-                // Server.Authenticate are permitted (same policy as TCP control).
-                let method = request["method"].as_str().unwrap_or("");
-                if !authenticated
-                    && method != "Server.GetToken"
-                    && method != "Server.Authenticate"
+                if let Some(reply) =
+                    jsonrpc::handle_message(&text, &mut authenticated, &app.auth_config, &app.cmd_tx).await
+                    && socket.send(Message::Text(reply.to_string().into())).await.is_err()
                 {
-                    let err = serde_json::json!({
-                        "jsonrpc": "2.0", "id": request["id"],
-                        "error": {"code": -32000, "message": "Unauthorized — call Server.Authenticate first"}
-                    });
-                    if socket.send(Message::Text(err.to_string().into())).await.is_err() { break }
-                    continue;
-                }
-
-                match jsonrpc::handle_request(&request, &app.auth_config, &app.cmd_tx).await {
-                    RpcResult::Response { response, notification } => {
-                        if method == "Server.Authenticate" && response["result"]["ok"] == true {
-                            authenticated = true;
-                        }
-                        if socket.send(Message::Text(response.to_string().into())).await.is_err() { break }
-                        if let Some(n) = notification {
-                            let _ = app.notify_tx.send(n);
-                        }
-                    }
-                    RpcResult::Unknown => {
-                        let _ = app.event_tx.send(crate::ControlEvent::JsonRpc {
-                            response_tx: None,
-                            client_id: "websocket".into(),
-                            request,
-                        }).await;
-                    }
+                    break;
                 }
             }
             notification = notify_rx.recv() => {
-                if let Ok(n) = notification
-                    && socket.send(Message::Text(n.to_string().into())).await.is_err()
-                {
-                    break;
+                match notification {
+                    Ok(n) => {
+                        if socket.send(Message::Text(n.to_string().into())).await.is_err() { break }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "WebSocket control client missed notifications");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
@@ -230,35 +173,15 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use snapcast_server::ServerCommand;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // --- Test scaffolding -------------------------------------------------
-    //
-    // http.rs is dominated by socket I/O (TcpListener::bind, axum::serve,
-    // WebSocket recv/send, ServeDir). Those paths are NOT unit-tested here and
-    // are listed in io_excluded. What follows exercises the *pure* logic the
-    // handlers are built out of: AppState construction/wiring, the bearer-auth
-    // check `http_jsonrpc_handler` runs, the WS per-connection auth-gate
-    // predicate, the `Server.Authenticate` success transition, and the exact
-    // error-response JSON envelopes the handlers emit inline.
-
-    /// Build an `AppState` with real (but unread) channels, matching exactly how
-    /// `run_http` wires one. Returns the state plus the receivers/subscriber so a
-    /// test can observe what the handler-equivalent logic sends.
-    fn make_state(
-        auth_config: AuthConfig,
-    ) -> (
-        AppState,
-        mpsc::Receiver<crate::ControlEvent>,
-        mpsc::Receiver<ServerCommand>,
-        broadcast::Receiver<Value>,
-    ) {
-        let (event_tx, event_rx) = mpsc::channel::<crate::ControlEvent>(16);
-        let (notify_tx, notify_rx) = broadcast::channel::<Value>(16);
+    /// Build an `AppState` with real (but unread) channels, matching how
+    /// `run_http` wires one.
+    fn make_state(auth_config: AuthConfig) -> (AppState, mpsc::Receiver<ServerCommand>) {
+        let (notify_tx, _) = broadcast::channel::<Value>(16);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ServerCommand>(16);
         let state = AppState {
-            event_tx,
             notify_tx,
             auth_config: Arc::new(auth_config),
             cmd_tx,
@@ -266,7 +189,7 @@ mod tests {
                 .0
                 .client_acceptor(),
         };
-        (state, event_rx, cmd_rx, notify_rx)
+        (state, cmd_rx)
     }
 
     /// A config with auth enabled and a usable signing secret.
@@ -277,54 +200,55 @@ mod tests {
         }
     }
 
-    /// Mirror of the WS auth-gate predicate in `handle_ws` (lines 153-156):
-    /// until authenticated, only `Server.GetToken` / `Server.Authenticate` pass.
-    /// `true` == request must be rejected as unauthorized.
-    fn ws_gate_rejects(authenticated: bool, method: &str) -> bool {
-        !authenticated && method != "Server.GetToken" && method != "Server.Authenticate"
+    /// Serve `state` on an ephemeral port and return the port.
+    async fn serve(state: AppState) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router(state, None).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        port
     }
 
-    // --- AppState wiring --------------------------------------------------
+    /// POST `body` to /jsonrpc and return (status code, response body).
+    async fn post(port: u16, body: &str, auth: Option<&str>) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+        let request = format!(
+            "POST /jsonrpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
+             {auth}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let status = response[9..12].parse().unwrap();
+        let body = response
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, b)| b)
+            .to_string();
+        (status, body)
+    }
 
     #[test]
     fn app_state_is_clone_and_shares_auth_arc() {
         // `run_http` relies on AppState: Clone (Router::with_state clones per
         // request) and on the auth_config Arc being shared, not deep-copied.
-        let (state, _e, _c, _n) = make_state(enabled_auth());
+        let (state, _c) = make_state(enabled_auth());
         let clone = state.clone();
         assert!(Arc::ptr_eq(&state.auth_config, &clone.auth_config));
-        assert!(state.auth_config.enabled);
-    }
-
-    #[tokio::test]
-    async fn app_state_channels_are_live() {
-        // Sanity: the wired channels actually deliver, so the handler paths that
-        // do `event_tx.send` / `notify_tx.send` are talking to live endpoints.
-        let (state, mut event_rx, _cmd_rx, mut notify_rx) = make_state(AuthConfig::default());
-
-        state
-            .event_tx
-            .send(crate::ControlEvent::JsonRpc {
-                response_tx: None,
-                client_id: "http".into(),
-                request: json!({"method": "X"}),
-            })
-            .await
-            .unwrap();
-        match event_rx.recv().await.unwrap() {
-            crate::ControlEvent::JsonRpc { client_id, .. } => assert_eq!(client_id, "http"),
-        }
-
-        state.notify_tx.send(json!({"n": 1})).unwrap();
-        assert_eq!(notify_rx.recv().await.unwrap(), json!({"n": 1}));
     }
 
     // --- Bearer auth check run by `http_jsonrpc_handler` ------------------
 
     #[test]
     fn bearer_check_allows_all_when_auth_disabled() {
-        // With auth disabled the handler treats every request as "anonymous"
-        // regardless of the Authorization header (or its absence).
         let cfg = AuthConfig::default();
         assert!(crate::auth::validate_bearer(&cfg, None).is_ok());
         assert!(crate::auth::validate_bearer(&cfg, Some("garbage")).is_ok());
@@ -333,11 +257,8 @@ mod tests {
     #[test]
     fn bearer_check_rejects_missing_and_malformed_header_when_enabled() {
         let cfg = enabled_auth();
-        // No header -> Unauthorized branch (-32000) in http_jsonrpc_handler.
         assert!(crate::auth::validate_bearer(&cfg, None).is_err());
-        // Present but not a Bearer token.
         assert!(crate::auth::validate_bearer(&cfg, Some("Basic abc")).is_err());
-        // Bearer prefix but a bogus token.
         assert!(crate::auth::validate_bearer(&cfg, Some("Bearer not-a-jwt")).is_err());
     }
 
@@ -349,164 +270,53 @@ mod tests {
         assert_eq!(subject, "alice");
     }
 
-    // --- WS per-connection auth state -------------------------------------
+    // --- POST /jsonrpc (end-to-end) ---------------------------------------
 
-    #[test]
-    fn ws_initial_authenticated_mirrors_auth_disabled() {
-        // handle_ws line 133: `authenticated = !auth_config.enabled`.
-        assert!(!AuthConfig::default().enabled, "disabled => starts authed");
-        assert!(enabled_auth().enabled, "enabled => starts unauthed");
-    }
-
-    #[test]
-    fn ws_gate_blocks_normal_methods_until_authenticated() {
-        // Unauthenticated: only the two auth bootstrap methods pass.
-        assert!(ws_gate_rejects(false, "Client.SetVolume"));
-        assert!(ws_gate_rejects(false, "Server.GetStatus"));
-        assert!(ws_gate_rejects(false, ""));
-        assert!(!ws_gate_rejects(false, "Server.GetToken"));
-        assert!(!ws_gate_rejects(false, "Server.Authenticate"));
-    }
-
-    #[test]
-    fn ws_gate_allows_everything_once_authenticated() {
-        for m in [
-            "Client.SetVolume",
-            "Server.GetStatus",
-            "Server.GetToken",
-            "",
-        ] {
-            assert!(!ws_gate_rejects(true, m), "authed must allow {m}");
-        }
-    }
-
-    // --- Error-response envelopes emitted inline by the handlers ----------
-
-    #[test]
-    fn parse_error_envelope_shape() {
-        // Both handlers emit this exact object on a JSON parse failure.
-        let err = json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32700, "message": "Parse error"}
-        });
-        assert_eq!(err["jsonrpc"], "2.0");
-        assert!(err["id"].is_null());
-        assert_eq!(err["error"]["code"], -32700);
-    }
-
-    #[test]
-    fn method_not_found_envelope_shape() {
-        // http_jsonrpc_handler emits this for RpcResult::Unknown.
-        let err = json!({
-            "jsonrpc": "2.0", "id": null,
-            "error": {"code": -32601, "message": "Method not found"}
-        });
-        assert_eq!(err["error"]["code"], -32601);
-    }
-
-    #[test]
-    fn ws_unauthorized_envelope_preserves_request_id() {
-        // handle_ws builds the unauthorized error with the *request's* id, not
-        // null (unlike the HTTP-path -32000 which is id:null). Pin that.
-        let request = json!({"jsonrpc": "2.0", "id": 42, "method": "Client.SetVolume"});
-        let err = json!({
-            "jsonrpc": "2.0", "id": request["id"],
-            "error": {"code": -32000, "message": "Unauthorized — call Server.Authenticate first"}
-        });
-        assert_eq!(err["id"], 42);
-        assert_eq!(err["error"]["code"], -32000);
-    }
-
-    // --- Dispatch path the handlers call: jsonrpc::handle_request ---------
-
+    /// Regression: an unknown method was answered with `"id": null`.
     #[tokio::test]
-    async fn handler_dispatch_authenticate_success_flips_auth_state() {
-        // Reproduces the two-step WS bootstrap: GetToken then Authenticate, and
-        // the exact success predicate handle_ws uses:
-        // `response["result"]["ok"] == true` -> authenticated = true.
-        let (state, _e, _c, _n) = make_state(enabled_auth());
-
-        // Step 1: mint a token (allowed even while unauthenticated).
-        let get_token = json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetToken", "params": {"username": "bob"}});
-        let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&get_token, &state.auth_config, &state.cmd_tx).await
-        else {
-            panic!("expected response");
-        };
-        let token = response["result"]["token"].as_str().unwrap().to_string();
-
-        // Step 2: authenticate with it.
-        let auth_req = json!({"jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate", "params": {"token": token}});
-        let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&auth_req, &state.auth_config, &state.cmd_tx).await
-        else {
-            panic!("expected response");
-        };
-
-        let mut authenticated = !state.auth_config.enabled; // starts false
-        assert!(!authenticated);
-        if auth_req["method"] == "Server.Authenticate" && response["result"]["ok"] == true {
-            authenticated = true;
-        }
-        assert!(authenticated, "valid Authenticate must flip the gate open");
-        assert_eq!(response["result"]["subject"], "bob");
+    async fn post_unknown_method_echoes_request_id() {
+        let (state, _c) = make_state(AuthConfig::default());
+        let port = serve(state).await;
+        let (status, body) = post(
+            port,
+            r#"{"jsonrpc":"2.0","id":5,"method":"Custom.DoThing"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["id"], 5);
+        assert_eq!(reply["error"]["code"], -32601);
     }
 
     #[tokio::test]
-    async fn handler_dispatch_authenticate_bad_token_keeps_gate_closed() {
-        let (state, _e, _c, _n) = make_state(enabled_auth());
-        let auth_req = json!({
-            "jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate",
-            "params": {"token": "not-a-valid-jwt"}
-        });
-        let RpcResult::Response { response, .. } =
-            jsonrpc::handle_request(&auth_req, &state.auth_config, &state.cmd_tx).await
-        else {
-            panic!("expected response");
-        };
-        // Invalid token -> error envelope, no `result.ok`.
-        assert_ne!(response["result"]["ok"], true);
-        assert_eq!(response["error"]["code"], -32602);
-
-        let mut authenticated = !state.auth_config.enabled;
-        if auth_req["method"] == "Server.Authenticate" && response["result"]["ok"] == true {
-            authenticated = true;
-        }
-        assert!(!authenticated, "bad token must NOT open the gate");
+    async fn post_notification_gets_no_content() {
+        let (state, _c) = make_state(AuthConfig::default());
+        let port = serve(state).await;
+        let (status, body) = post(
+            port,
+            r#"{"jsonrpc":"2.0","method":"Server.GetRPCVersion"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
-    async fn handler_dispatch_unknown_method_yields_unknown_variant() {
-        // The RpcResult::Unknown branch is what makes the handlers forward to
-        // event_tx; verify an unrecognized method produces it.
-        let (state, _e, _c, _n) = make_state(AuthConfig::default());
-        let req = json!({"jsonrpc": "2.0", "id": 7, "method": "Custom.DoThing", "params": {}});
-        assert!(matches!(
-            jsonrpc::handle_request(&req, &state.auth_config, &state.cmd_tx).await,
-            RpcResult::Unknown
-        ));
-    }
+    async fn post_requires_bearer_token_when_auth_enabled() {
+        let (state, _c) = make_state(enabled_auth());
+        let token = crate::auth::generate_token(&state.auth_config, "bob").unwrap();
+        let port = serve(state).await;
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"Server.GetRPCVersion"}"#;
 
-    #[tokio::test]
-    async fn handler_dispatch_notification_is_broadcastable() {
-        // When handle_request returns a notification, the handler does
-        // `notify_tx.send(n)`; confirm a real method produces one and that the
-        // wired broadcast channel delivers it to a subscriber.
-        let (state, _e, _c, _n) = make_state(AuthConfig::default());
-        let mut sub = state.notify_tx.subscribe();
-        let req = json!({
-            "jsonrpc": "2.0", "id": 8, "method": "Group.SetStream",
-            "params": {"id": "g1", "stream_id": "music"}
-        });
-        let RpcResult::Response { notification, .. } =
-            jsonrpc::handle_request(&req, &state.auth_config, &state.cmd_tx).await
-        else {
-            panic!("expected response");
-        };
-        let n = notification.expect("Group.SetStream emits a notification");
-        state.notify_tx.send(n.clone()).unwrap();
-        assert_eq!(sub.recv().await.unwrap(), n);
-        assert_eq!(n["params"]["stream_id"], "music");
+        let (_, body) = post(port, request, None).await;
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["error"]["code"], -32000);
+
+        let (_, body) = post(port, request, Some(&format!("Bearer {token}"))).await;
+        let reply: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(reply["result"]["major"], 2);
     }
 
     // --- WebSocket streaming endpoint (end-to-end) ---------------------------
@@ -525,17 +335,9 @@ mod tests {
         let audio_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         tokio::spawn(async move { server.serve(audio_listener).await });
 
-        let (mut state, _e, _c, _n) = make_state(AuthConfig::default());
+        let (mut state, _c) = make_state(AuthConfig::default());
         state.client_acceptor = acceptor;
-        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let http_port = http_listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            axum::serve(
-                http_listener,
-                router(state, None).into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-        });
+        let http_port = serve(state).await;
 
         let (mut client, mut events, mut client_audio) = SnapClient::new(ClientConfig {
             scheme: snapcast_proto::SCHEME_WS.into(),

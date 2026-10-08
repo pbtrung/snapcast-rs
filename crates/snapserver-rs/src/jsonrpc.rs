@@ -1,11 +1,28 @@
 //! JSON-RPC control API — method handlers for Snapcast control protocol.
+//!
+//! Change notifications (`Client.OnVolumeChanged`, `Server.OnUpdate`, ...)
+//! are not built here: every mutating command makes the library emit a
+//! `ServerEvent`, which `main.rs` turns into the notification for all control
+//! clients. Building them here as well delivered each notification twice.
 
 use serde_json::{Value, json};
+use snapcast_server::ServerCommand;
+use tokio::sync::mpsc;
 
 use crate::auth::{self, AuthConfig};
 
+/// Largest accepted JSON-RPC message (TCP line, WebSocket message or HTTP
+/// body), so a peer cannot make the server buffer unbounded input.
+pub(crate) const MAX_REQUEST_LEN: usize = 1024 * 1024;
+
 /// JSON-RPC error codes.
+const PARSE_ERROR: i64 = -32700;
+const INVALID_REQUEST: i64 = -32600;
+const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
+/// Server-defined: the connection has not authenticated yet.
+const UNAUTHORIZED: i64 = -32000;
 
 /// Bind a required string parameter, or return an `INVALID_PARAMS` error naming
 /// the missing field. Replaces the `let Some(x) = params["k"].as_str() else {
@@ -19,38 +36,101 @@ macro_rules! require_str {
     };
 }
 
-/// Result of handling a JSON-RPC request.
-pub(crate) enum RpcResult {
-    /// Handled: response JSON + optional notification to broadcast.
-    Response {
-        /// JSON-RPC response.
-        response: Value,
-        /// Optional notification to broadcast to all control clients.
-        notification: Option<Value>,
-    },
-    /// Method not recognized — forward to extension handler.
-    Unknown,
+/// Handle one raw JSON-RPC message from a control connection (a TCP line, a
+/// WebSocket text message or an HTTP body) and return the reply, if any.
+///
+/// `authenticated` is the connection's auth state: until it is set, only
+/// `Server.GetToken` and `Server.Authenticate` are dispatched, and a
+/// successful `Server.Authenticate` sets it. Batches are answered with an
+/// array. Notifications (requests without an `id`) are ignored without a
+/// reply, as in C++ snapserver.
+pub(crate) async fn handle_message(
+    text: &str,
+    authenticated: &mut bool,
+    auth_config: &AuthConfig,
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Option<Value> {
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return Some(err(&Value::Null, PARSE_ERROR, "Parse error"));
+    };
+    match message {
+        Value::Array(batch) if batch.is_empty() => {
+            Some(err(&Value::Null, INVALID_REQUEST, "Invalid Request"))
+        }
+        Value::Array(batch) => {
+            let mut responses = Vec::new();
+            for entry in &batch {
+                if let Some(response) =
+                    handle_entry(entry, authenticated, auth_config, cmd_tx).await
+                {
+                    responses.push(response);
+                }
+            }
+            (!responses.is_empty()).then_some(Value::Array(responses))
+        }
+        single => handle_entry(&single, authenticated, auth_config, cmd_tx).await,
+    }
+}
+
+/// Handle one request object of a message or batch.
+async fn handle_entry(
+    request: &Value,
+    authenticated: &mut bool,
+    auth_config: &AuthConfig,
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Option<Value> {
+    let Some(object) = request.as_object() else {
+        return Some(err(&Value::Null, INVALID_REQUEST, "Invalid Request"));
+    };
+    let Some(id) = object.get("id") else {
+        tracing::debug!(?request, "Ignoring JSON-RPC notification");
+        return None;
+    };
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Some(err(id, INVALID_REQUEST, "Invalid Request"));
+    };
+    if !*authenticated && method != "Server.GetToken" && method != "Server.Authenticate" {
+        return Some(err(
+            id,
+            UNAUTHORIZED,
+            "Unauthorized — call Server.Authenticate first",
+        ));
+    }
+    let response = handle_request(request, auth_config, cmd_tx).await;
+    if method == "Server.Authenticate" && response["result"]["ok"] == true {
+        *authenticated = true;
+    }
+    Some(response)
 }
 
 /// Fetch server status via GetStatus command, serialized to JSON.
-async fn get_status(
-    cmd_tx: &tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-) -> Option<Value> {
+async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     cmd_tx
-        .send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+        .send(ServerCommand::GetStatus { response_tx: tx })
         .await
         .ok()?;
     let status = rx.await.ok()?;
     serde_json::to_value(status).ok()
 }
 
-/// Handle a JSON-RPC request. All state access goes through ServerCommand.
+/// Find a client in a serialized server status by ID.
+pub(crate) fn find_client<'a>(status: &'a Value, client_id: &str) -> Option<&'a Value> {
+    status["server"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| g["clients"].as_array().into_iter().flatten())
+        .find(|c| c["id"].as_str() == Some(client_id))
+}
+
+/// Handle a JSON-RPC request object and return its response. All state
+/// access goes through ServerCommand.
 pub(crate) async fn handle_request(
     request: &Value,
     auth_config: &AuthConfig,
-    cmd_tx: &tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-) -> RpcResult {
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Value {
     let id = &request["id"];
     let method = request["method"].as_str().unwrap_or("");
     let params = &request["params"];
@@ -60,89 +140,91 @@ pub(crate) async fn handle_request(
         "Server.GetRPCVersion" => ok(id, json!({"major": 2, "minor": 0, "patch": 0})),
         "Server.GetStatus" => match get_status(cmd_tx).await {
             Some(status) => ok(id, status),
-            None => err(id, INVALID_PARAMS, "status unavailable"),
+            None => err(id, INTERNAL_ERROR, "status unavailable"),
         },
         "Server.DeleteClient" => {
             let client_id = require_str!(params, "id", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::DeleteClient {
+                .send(ServerCommand::DeleteClient {
                     client_id: client_id.to_string(),
                 })
                 .await;
-            ok(id, json!({"id": client_id}))
+            // Like C++ snapserver, the result is the updated server status.
+            match get_status(cmd_tx).await {
+                Some(status) => ok(id, status),
+                None => err(id, INTERNAL_ERROR, "status unavailable"),
+            }
         }
 
         // --- Client ---
         "Client.GetStatus" => {
             let client_id = require_str!(params, "id", id);
             let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INVALID_PARAMS, "status unavailable");
+                return err(id, INTERNAL_ERROR, "status unavailable");
             };
-            let client = status["server"]["groups"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|g| g["clients"].as_array().into_iter().flatten())
-                .find(|c| c["id"].as_str() == Some(client_id));
-            match client {
+            match find_client(&status, client_id) {
                 Some(c) => ok(id, json!({"client": c})),
-                None => err(id, INVALID_PARAMS, "client not found"),
+                None => err(id, INTERNAL_ERROR, "client not found"),
             }
         }
         "Client.SetVolume" => {
             let client_id = require_str!(params, "id", id);
-            let volume = params["volume"]["percent"].as_u64().unwrap_or(100).min(100) as u16;
-            let muted = params["volume"]["muted"].as_bool().unwrap_or(false);
+            let requested = &params["volume"];
+            let mut percent = requested["percent"].as_u64().map(|p| p.min(100) as u16);
+            let mut muted = requested["muted"].as_bool();
+            // Like C++ snapserver, a field left out keeps its current value,
+            // so `{"muted": true}` mutes without touching the level.
+            if (percent.is_none() || muted.is_none())
+                && let Some(status) = get_status(cmd_tx).await
+                && let Some(client) = find_client(&status, client_id)
+            {
+                let current = &client["config"]["volume"];
+                percent = percent.or(current["percent"].as_u64().map(|p| p as u16));
+                muted = muted.or(current["muted"].as_bool());
+            }
+            let (volume, muted) = (percent.unwrap_or(100), muted.unwrap_or(false));
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientVolume {
+                .send(ServerCommand::SetClientVolume {
                     client_id: client_id.to_string(),
                     volume,
                     muted,
                 })
                 .await;
-            let vol = json!({"percent": volume, "muted": muted});
-            ok_with_notification(
-                id,
-                json!({"volume": vol}),
-                crate::notify::client_on_volume_changed(client_id, volume, muted),
-            )
+            ok(id, json!({"volume": {"percent": volume, "muted": muted}}))
         }
         "Client.SetLatency" => {
             let client_id = require_str!(params, "id", id);
-            let latency = params["latency"].as_i64().unwrap_or(0) as i32;
+            let Some(latency) = params["latency"]
+                .as_i64()
+                .and_then(|l| i32::try_from(l).ok())
+            else {
+                return err(id, INVALID_PARAMS, "missing or invalid 'latency'");
+            };
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientLatency {
+                .send(ServerCommand::SetClientLatency {
                     client_id: client_id.to_string(),
                     latency,
                 })
                 .await;
-            ok_with_notification(
-                id,
-                json!({"latency": latency}),
-                crate::notify::client_on_latency_changed(client_id, latency),
-            )
+            ok(id, json!({"latency": latency}))
         }
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
-            let name = params["name"].as_str().unwrap_or("").to_string();
+            let name = require_str!(params, "name", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetClientName {
+                .send(ServerCommand::SetClientName {
                     client_id: client_id.to_string(),
-                    name: name.clone(),
+                    name: name.to_string(),
                 })
                 .await;
-            ok_with_notification(
-                id,
-                json!({"name": &name}),
-                crate::notify::client_on_name_changed(client_id, &name),
-            )
+            ok(id, json!({"name": name}))
         }
 
         // --- Group ---
         "Group.GetStatus" => {
             let group_id = require_str!(params, "id", id);
             let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INVALID_PARAMS, "status unavailable");
+                return err(id, INTERNAL_ERROR, "status unavailable");
             };
             let group = status["server"]["groups"]
                 .as_array()
@@ -151,38 +233,32 @@ pub(crate) async fn handle_request(
                 .find(|g| g["id"].as_str() == Some(group_id));
             match group {
                 Some(g) => ok(id, json!({"group": g})),
-                None => err(id, INVALID_PARAMS, "group not found"),
+                None => err(id, INTERNAL_ERROR, "group not found"),
             }
         }
         "Group.SetMute" => {
             let group_id = require_str!(params, "id", id);
-            let muted = params["mute"].as_bool().unwrap_or(false);
+            let Some(muted) = params["mute"].as_bool() else {
+                return err(id, INVALID_PARAMS, "missing 'mute'");
+            };
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupMute {
+                .send(ServerCommand::SetGroupMute {
                     group_id: group_id.to_string(),
                     muted,
                 })
                 .await;
-            ok_with_notification(
-                id,
-                json!({"mute": muted}),
-                crate::notify::group_on_mute(group_id, muted),
-            )
+            ok(id, json!({"mute": muted}))
         }
         "Group.SetStream" => {
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupStream {
+                .send(ServerCommand::SetGroupStream {
                     group_id: group_id.to_string(),
                     stream_id: stream_id.to_string(),
                 })
                 .await;
-            ok_with_notification(
-                id,
-                json!({"stream_id": stream_id}),
-                crate::notify::group_on_stream_changed(group_id, stream_id),
-            )
+            ok(id, json!({"stream_id": stream_id}))
         }
         "Group.SetClients" => {
             let group_id = require_str!(params, "id", id);
@@ -194,28 +270,26 @@ pub(crate) async fn handle_request(
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupClients {
+                .send(ServerCommand::SetGroupClients {
                     group_id: group_id.to_string(),
                     clients: client_ids,
                 })
                 .await;
-            let status = get_status(cmd_tx).await.unwrap_or_default();
-            ok_with_notify(id, status.clone(), "Server.OnUpdate", status)
+            match get_status(cmd_tx).await {
+                Some(status) => ok(id, status),
+                None => err(id, INTERNAL_ERROR, "status unavailable"),
+            }
         }
         "Group.SetName" => {
             let group_id = require_str!(params, "id", id);
-            let name = params["name"].as_str().unwrap_or("").to_string();
+            let name = require_str!(params, "name", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetGroupName {
+                .send(ServerCommand::SetGroupName {
                     group_id: group_id.to_string(),
-                    name: name.clone(),
+                    name: name.to_string(),
                 })
                 .await;
-            ok_with_notification(
-                id,
-                json!({"name": &name}),
-                crate::notify::group_on_name_changed(group_id, &name),
-            )
+            ok(id, json!({"name": name}))
         }
 
         // --- Stream ---
@@ -226,24 +300,21 @@ pub(crate) async fn handle_request(
                 .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                 .unwrap_or_default();
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::SetStreamMeta {
+                .send(ServerCommand::SetStreamMeta {
                     stream_id: stream_id.to_string(),
                     metadata,
                 })
                 .await;
-            let props = params["properties"].clone();
-            ok_with_notify(
+            ok(
                 id,
-                json!({"id": stream_id, "properties": &props}),
-                "Stream.OnUpdate",
-                json!({"id": stream_id, "properties": props}),
+                json!({"id": stream_id, "properties": &params["properties"]}),
             )
         }
         "Stream.Control" => {
             let stream_id = require_str!(params, "id", id);
             let command = require_str!(params, "command", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::StreamControl {
+                .send(ServerCommand::StreamControl {
                     stream_id: stream_id.to_string(),
                     command: command.to_string(),
                     params: params["params"].clone(),
@@ -255,29 +326,25 @@ pub(crate) async fn handle_request(
             let stream_uri = require_str!(params, "streamUri", id);
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::AddStream {
+                .send(ServerCommand::AddStream {
                     uri: stream_uri.to_string(),
                     response_tx: tx,
                 })
                 .await;
             match rx.await {
-                Ok(Ok(stream_id)) => {
-                    let status = get_status(cmd_tx).await.unwrap_or_default();
-                    ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
-                }
+                Ok(Ok(stream_id)) => ok(id, json!({"stream_id": stream_id})),
                 Ok(Err(e)) => err(id, INVALID_PARAMS, &e),
-                Err(_) => err(id, INVALID_PARAMS, "command failed"),
+                Err(_) => err(id, INTERNAL_ERROR, "command failed"),
             }
         }
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
             let _ = cmd_tx
-                .send(snapcast_server::ServerCommand::RemoveStream {
+                .send(ServerCommand::RemoveStream {
                     stream_id: stream_id.to_string(),
                 })
                 .await;
-            let status = get_status(cmd_tx).await.unwrap_or_default();
-            ok_with_notify(id, json!({"id": stream_id}), "Server.OnUpdate", status)
+            ok(id, json!({"stream_id": stream_id}))
         }
 
         // --- Auth ---
@@ -302,38 +369,16 @@ pub(crate) async fn handle_request(
             }
         }
 
-        _ => RpcResult::Unknown,
+        _ => err(id, METHOD_NOT_FOUND, "Method not found"),
     }
 }
 
-fn ok(id: &Value, result: Value) -> RpcResult {
-    RpcResult::Response {
-        response: json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        notification: None,
-    }
+fn ok(id: &Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn ok_with_notify(id: &Value, result: Value, method: &str, params: Value) -> RpcResult {
-    RpcResult::Response {
-        response: json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        notification: Some(json!({"jsonrpc": "2.0", "method": method, "params": params})),
-    }
-}
-
-/// Like [`ok_with_notify`] but takes a pre-built notification object (from the
-/// [`crate::notify`] builders) so the notification shape has a single source.
-fn ok_with_notification(id: &Value, result: Value, notification: Value) -> RpcResult {
-    RpcResult::Response {
-        response: json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        notification: Some(notification),
-    }
-}
-
-fn err(id: &Value, code: i64, msg: &str) -> RpcResult {
-    RpcResult::Response {
-        response: json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
-        notification: None,
-    }
+fn err(id: &Value, code: i64, msg: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
 }
 
 #[cfg(test)]
@@ -402,11 +447,7 @@ mod tests {
     async fn server_get_status() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 1, "method": "Server.GetStatus", "params": {}});
-        let RpcResult::Response { response, .. } =
-            handle_request(&req, &auth_config, &cmd_tx).await
-        else {
-            panic!("expected response");
-        };
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert!(response["result"]["server"]["groups"].is_array());
     }
 
@@ -418,16 +459,8 @@ mod tests {
             "method": "Client.SetVolume",
             "params": {"id": "c1", "volume": {"percent": 50, "muted": true}}
         });
-        let RpcResult::Response {
-            response,
-            notification,
-        } = handle_request(&req, &auth_config, &cmd_tx).await
-        else {
-            panic!("expected response");
-        };
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["volume"]["percent"], 50);
-        assert!(notification.is_some());
-        assert_eq!(notification.unwrap()["method"], "Client.OnVolumeChanged");
 
         // Verify state updated via GetStatus
         tokio::task::yield_now().await;
@@ -439,13 +472,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_method_returns_unknown() {
+    async fn unknown_method_is_method_not_found() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 3, "method": "Client.SetEq", "params": {}});
-        assert!(matches!(
-            handle_request(&req, &auth_config, &cmd_tx).await,
-            RpcResult::Unknown
-        ));
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
+        assert_eq!(response["id"], 3);
     }
 
     #[tokio::test]
@@ -456,12 +488,8 @@ mod tests {
             "method": "Group.SetStream",
             "params": {"id": "g1", "stream_id": "music"}
         });
-        let RpcResult::Response { notification, .. } =
-            handle_request(&req, &auth_config, &cmd_tx).await
-        else {
-            panic!("expected response");
-        };
-        assert_eq!(notification.unwrap()["params"]["stream_id"], "music");
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["result"]["stream_id"], "music");
     }
 
     // === Wave-4 additions ===================================================
@@ -474,19 +502,8 @@ mod tests {
     // handlers exercise here via the shared `mock_server()`; handlers that await
     // a reply (`Stream.AddStream`) use the dedicated helper below.
 
-    /// Unwrap a `RpcResult::Response`, panicking on `Unknown`.
-    fn resp(result: RpcResult) -> (Value, Option<Value>) {
-        match result {
-            RpcResult::Response {
-                response,
-                notification,
-            } => (response, notification),
-            RpcResult::Unknown => panic!("expected Response, got Unknown"),
-        }
-    }
-
     /// A command sink that answers `AddStream` with the supplied result and
-    /// still serves `GetStatus` (needed for the post-add `Server.OnUpdate`).
+    /// still serves `GetStatus`.
     fn mock_server_addstream(
         result: Result<String, String>,
     ) -> (AuthConfig, tokio::sync::mpsc::Sender<ServerCommand>) {
@@ -524,38 +541,21 @@ mod tests {
 
     #[test]
     fn ok_envelope_shape() {
-        let (response, notification) = resp(ok(&json!(7), json!({"a": 1})));
+        let response = ok(&json!(7), json!({"a": 1}));
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], 7);
         assert_eq!(response["result"]["a"], 1);
         assert!(response.get("error").is_none());
-        assert!(notification.is_none());
     }
 
     #[test]
     fn err_envelope_shape() {
-        let (response, notification) = resp(err(&json!("abc"), INVALID_PARAMS, "boom"));
+        let response = err(&json!("abc"), INVALID_PARAMS, "boom");
         assert_eq!(response["jsonrpc"], "2.0");
         assert_eq!(response["id"], "abc");
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "boom");
         assert!(response.get("result").is_none());
-        assert!(notification.is_none());
-    }
-
-    #[test]
-    fn ok_with_notify_pairs_response_and_notification() {
-        let (response, notification) = resp(ok_with_notify(
-            &json!(1),
-            json!({"r": true}),
-            "Server.OnUpdate",
-            json!({"p": 2}),
-        ));
-        assert_eq!(response["result"]["r"], true);
-        let n = notification.expect("notification present");
-        assert_eq!(n["jsonrpc"], "2.0");
-        assert_eq!(n["method"], "Server.OnUpdate");
-        assert_eq!(n["params"]["p"], 2);
     }
 
     // --- Server.* --------------------------------------------------------
@@ -564,23 +564,23 @@ mod tests {
     async fn server_get_rpc_version() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 10, "method": "Server.GetRPCVersion"});
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(
             response["result"],
             json!({"major": 2, "minor": 0, "patch": 0})
         );
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
-    async fn server_delete_client_echoes_id() {
+    async fn server_delete_client_returns_server_status() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
             "jsonrpc": "2.0", "id": 11,
             "method": "Server.DeleteClient", "params": {"id": "c1"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["id"], "c1");
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        // C++ snapserver answers with the updated status, not the id.
+        assert!(response["result"]["server"]["groups"].is_array());
         assert_eq!(response["id"], 11);
     }
 
@@ -589,7 +589,7 @@ mod tests {
         let (auth_config, cmd_tx) = mock_server();
         let req =
             json!({"jsonrpc": "2.0", "id": 12, "method": "Server.DeleteClient", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
@@ -603,7 +603,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 20,
             "method": "Client.GetStatus", "params": {"id": "c1"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["client"]["id"], "c1");
     }
 
@@ -614,8 +614,8 @@ mod tests {
             "jsonrpc": "2.0", "id": 21,
             "method": "Client.GetStatus", "params": {"id": "nope"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["error"]["code"], INVALID_PARAMS);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
         assert_eq!(response["error"]["message"], "client not found");
     }
 
@@ -623,7 +623,7 @@ mod tests {
     async fn client_get_status_missing_id() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({"jsonrpc": "2.0", "id": 22, "method": "Client.GetStatus", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
 
@@ -635,34 +635,57 @@ mod tests {
             "method": "Client.SetVolume",
             "params": {"id": "c1", "volume": {"percent": 250, "muted": false}}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         // percent > 100 is clamped to 100.
         assert_eq!(response["result"]["volume"]["percent"], 100);
-        let n = notification.expect("notification present");
-        assert_eq!(n["params"]["volume"]["percent"], 100);
     }
 
     #[tokio::test]
-    async fn client_set_volume_defaults_when_fields_missing_or_wrong_type() {
+    async fn client_set_volume_keeps_current_value_of_missing_fields() {
         let (auth_config, cmd_tx) = mock_server();
-        // No `volume` object at all: percent defaults to 100, muted to false.
-        let req = json!({
-            "jsonrpc": "2.0", "id": 24,
-            "method": "Client.SetVolume", "params": {"id": "c1"}
-        });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["volume"]["percent"], 100);
-        assert_eq!(response["result"]["volume"]["muted"], false);
+        let set = |id: u64, volume: Value| {
+            json!({
+                "jsonrpc": "2.0", "id": id,
+                "method": "Client.SetVolume", "params": {"id": "c1", "volume": volume}
+            })
+        };
+        let response =
+            handle_request(&set(24, json!({"percent": 30})), &auth_config, &cmd_tx).await;
+        assert_eq!(
+            response["result"]["volume"],
+            json!({"percent": 30, "muted": false})
+        );
 
-        // `muted` present but wrong type (string) -> defaults to false.
+        // Muting alone must not reset the level (regression: it went to 100).
+        let response =
+            handle_request(&set(25, json!({"muted": true})), &auth_config, &cmd_tx).await;
+        assert_eq!(
+            response["result"]["volume"],
+            json!({"percent": 30, "muted": true})
+        );
+
+        // A wrong-typed field counts as missing.
+        let response = handle_request(
+            &set(26, json!({"percent": 40, "muted": "no"})),
+            &auth_config,
+            &cmd_tx,
+        )
+        .await;
+        assert_eq!(
+            response["result"]["volume"],
+            json!({"percent": 40, "muted": true})
+        );
+
+        // An unknown client falls back to 100 % unmuted.
         let req = json!({
-            "jsonrpc": "2.0", "id": 25,
-            "method": "Client.SetVolume",
-            "params": {"id": "c1", "volume": {"percent": 30, "muted": "yes"}}
+            "jsonrpc": "2.0", "id": 27,
+            "method": "Client.SetVolume", "params": {"id": "ghost"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["volume"]["percent"], 30);
-        assert_eq!(response["result"]["volume"]["muted"], false);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(
+            response["result"]["volume"],
+            json!({"percent": 100, "muted": false})
+        );
     }
 
     #[tokio::test]
@@ -672,9 +695,8 @@ mod tests {
             "jsonrpc": "2.0", "id": 26,
             "method": "Client.SetVolume", "params": {"volume": {"percent": 10}}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
@@ -684,24 +706,25 @@ mod tests {
             "jsonrpc": "2.0", "id": 27,
             "method": "Client.SetLatency", "params": {"id": "c1", "latency": 100}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["latency"], 100);
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Client.OnLatencyChanged");
-        assert_eq!(n["params"]["latency"], 100);
-        assert_eq!(n["params"]["id"], "c1");
     }
 
     #[tokio::test]
-    async fn client_set_latency_defaults_to_zero() {
+    async fn client_set_latency_requires_an_i32_latency() {
         let (auth_config, cmd_tx) = mock_server();
-        // Missing `latency` -> defaults to 0.
-        let req = json!({
-            "jsonrpc": "2.0", "id": 28,
-            "method": "Client.SetLatency", "params": {"id": "c1"}
-        });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["latency"], 0);
+        for params in [
+            json!({"id": "c1"}),
+            json!({"id": "c1", "latency": "10"}),
+            json!({"id": "c1", "latency": 1_i64 << 40}),
+        ] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 28,
+                "method": "Client.SetLatency", "params": params
+            });
+            let response = handle_request(&req, &auth_config, &cmd_tx).await;
+            assert_eq!(response["error"]["code"], INVALID_PARAMS, "{params}");
+        }
     }
 
     #[tokio::test]
@@ -711,21 +734,26 @@ mod tests {
             "jsonrpc": "2.0", "id": 29,
             "method": "Client.SetName", "params": {"id": "c1", "name": "Kitchen"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["name"], "Kitchen");
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Client.OnNameChanged");
-        assert_eq!(n["params"]["name"], "Kitchen");
     }
 
     #[tokio::test]
-    async fn client_set_name_defaults_to_empty() {
+    async fn client_set_name_requires_name() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
             "jsonrpc": "2.0", "id": 30,
             "method": "Client.SetName", "params": {"id": "c1"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["error"]["message"], "missing 'name'");
+
+        // An empty name is still a valid name.
+        let req = json!({
+            "jsonrpc": "2.0", "id": 31,
+            "method": "Client.SetName", "params": {"id": "c1", "name": ""}
+        });
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["name"], "");
     }
 
@@ -738,7 +766,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 40,
             "method": "Group.GetStatus", "params": {"id": "g1"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["group"]["id"], "g1");
     }
 
@@ -749,7 +777,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 41,
             "method": "Group.GetStatus", "params": {"id": "ghost"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "group not found");
     }
 
@@ -760,24 +788,20 @@ mod tests {
             "jsonrpc": "2.0", "id": 42,
             "method": "Group.SetMute", "params": {"id": "g1", "mute": true}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        // Group uses the "mute" key (not "muted") on both result and notification.
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        // Group uses the "mute" key (not "muted").
         assert_eq!(response["result"]["mute"], true);
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Group.OnMute");
-        assert_eq!(n["params"]["mute"], true);
-        assert!(n["params"]["muted"].is_null());
     }
 
     #[tokio::test]
-    async fn group_set_mute_defaults_false() {
+    async fn group_set_mute_requires_mute() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
             "jsonrpc": "2.0", "id": 43,
             "method": "Group.SetMute", "params": {"id": "g1"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["mute"], false);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["error"]["message"], "missing 'mute'");
     }
 
     #[tokio::test]
@@ -787,24 +811,21 @@ mod tests {
             "jsonrpc": "2.0", "id": 44,
             "method": "Group.SetStream", "params": {"id": "g1"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'stream_id'");
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
-    async fn group_set_clients_happy_path_broadcasts_update() {
+    async fn group_set_clients_returns_server_status() {
         let (auth_config, cmd_tx) = mock_server();
         let req = json!({
             "jsonrpc": "2.0", "id": 45,
             "method": "Group.SetClients",
             "params": {"id": "g1", "clients": ["c1", "c2"]}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        // Result is the fresh full status; notification is a Server.OnUpdate.
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        // Result is the fresh full status.
         assert!(response["result"]["server"]["groups"].is_array());
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Server.OnUpdate");
     }
 
     #[tokio::test]
@@ -816,9 +837,8 @@ mod tests {
             "method": "Group.SetClients",
             "params": {"id": "g1", "clients": {"not": "an array"}}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'clients'");
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
@@ -828,11 +848,8 @@ mod tests {
             "jsonrpc": "2.0", "id": 47,
             "method": "Group.SetName", "params": {"id": "g1", "name": "Main Room"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["name"], "Main Room");
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Group.OnNameChanged");
-        assert_eq!(n["params"]["name"], "Main Room");
     }
 
     // --- Stream.* --------------------------------------------------------
@@ -845,12 +862,9 @@ mod tests {
             "method": "Stream.SetProperty",
             "params": {"id": "default", "properties": {"artist": "Test"}}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["id"], "default");
         assert_eq!(response["result"]["properties"]["artist"], "Test");
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Stream.OnUpdate");
-        assert_eq!(n["params"]["properties"]["artist"], "Test");
     }
 
     #[tokio::test]
@@ -860,7 +874,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 51,
             "method": "Stream.SetProperty", "params": {"properties": {}}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'id'");
     }
 
@@ -872,9 +886,8 @@ mod tests {
             "method": "Stream.Control",
             "params": {"id": "default", "command": "next", "params": {}}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["id"], "default");
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
@@ -884,7 +897,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 53,
             "method": "Stream.Control", "params": {"id": "default"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'command'");
     }
 
@@ -896,10 +909,8 @@ mod tests {
             "method": "Stream.AddStream",
             "params": {"streamUri": "pipe:///tmp/snapfifo?name=default"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["id"], "stream-42");
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Server.OnUpdate");
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["result"]["stream_id"], "stream-42");
     }
 
     #[tokio::test]
@@ -909,17 +920,16 @@ mod tests {
             "jsonrpc": "2.0", "id": 55,
             "method": "Stream.AddStream", "params": {"streamUri": "bogus://x"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "bad uri");
-        assert!(notification.is_none());
     }
 
     #[tokio::test]
     async fn stream_add_stream_missing_uri() {
         let (auth_config, cmd_tx) = mock_server_addstream(Ok("unused".into()));
         let req = json!({"jsonrpc": "2.0", "id": 56, "method": "Stream.AddStream", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'streamUri'");
     }
 
@@ -930,10 +940,8 @@ mod tests {
             "jsonrpc": "2.0", "id": 57,
             "method": "Stream.RemoveStream", "params": {"id": "default"}
         });
-        let (response, notification) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
-        assert_eq!(response["result"]["id"], "default");
-        let n = notification.expect("notification present");
-        assert_eq!(n["method"], "Server.OnUpdate");
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
+        assert_eq!(response["result"]["stream_id"], "default");
     }
 
     // --- Auth ------------------------------------------------------------
@@ -945,7 +953,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 60,
             "method": "Server.GetToken", "params": {"username": "bob"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         let token = response["result"]["token"].as_str().expect("token issued");
         assert!(!token.is_empty());
         // Round-trip: the issued token validates back to the requested subject.
@@ -956,7 +964,7 @@ mod tests {
     async fn server_get_token_defaults_to_anonymous() {
         let (auth_config, cmd_tx) = auth_enabled();
         let req = json!({"jsonrpc": "2.0", "id": 61, "method": "Server.GetToken", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         let token = response["result"]["token"].as_str().expect("token issued");
         assert_eq!(
             auth::validate_token(&auth_config, token).unwrap(),
@@ -972,7 +980,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 62,
             "method": "Server.GetToken", "params": {"username": "bob"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert!(
             response["error"]["message"]
@@ -990,7 +998,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 63,
             "method": "Server.Authenticate", "params": {"token": token}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["result"]["ok"], true);
         assert_eq!(response["result"]["subject"], "alice");
     }
@@ -1002,7 +1010,7 @@ mod tests {
             "jsonrpc": "2.0", "id": 64,
             "method": "Server.Authenticate", "params": {"token": "not.a.jwt"}
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["code"], INVALID_PARAMS);
         assert_eq!(response["error"]["message"], "invalid token");
     }
@@ -1012,32 +1020,26 @@ mod tests {
         let (auth_config, cmd_tx) = auth_enabled();
         let req =
             json!({"jsonrpc": "2.0", "id": 65, "method": "Server.Authenticate", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["error"]["message"], "missing 'token'");
     }
 
     // --- Dispatch edge cases --------------------------------------------
 
     #[tokio::test]
-    async fn empty_method_is_unknown() {
+    async fn missing_or_non_string_method_is_invalid_request() {
         let (auth_config, cmd_tx) = mock_server();
-        // No `method` field at all: `.as_str().unwrap_or("")` -> "" -> Unknown.
-        let req = json!({"jsonrpc": "2.0", "id": 70, "params": {}});
-        assert!(matches!(
-            handle_request(&req, &auth_config, &cmd_tx).await,
-            RpcResult::Unknown
-        ));
-    }
-
-    #[tokio::test]
-    async fn non_string_method_is_unknown() {
-        let (auth_config, cmd_tx) = mock_server();
-        // `method` present but wrong type (number): as_str() -> None -> "".
-        let req = json!({"jsonrpc": "2.0", "id": 71, "method": 12345, "params": {}});
-        assert!(matches!(
-            handle_request(&req, &auth_config, &cmd_tx).await,
-            RpcResult::Unknown
-        ));
+        let mut authenticated = true;
+        for text in [
+            r#"{"jsonrpc": "2.0", "id": 70, "params": {}}"#,
+            r#"{"jsonrpc": "2.0", "id": 71, "method": 12345}"#,
+        ] {
+            let reply = handle_message(text, &mut authenticated, &auth_config, &cmd_tx)
+                .await
+                .unwrap();
+            assert_eq!(reply["error"]["code"], INVALID_REQUEST, "{text}");
+            assert!(reply["id"].is_number());
+        }
     }
 
     #[tokio::test]
@@ -1047,7 +1049,7 @@ mod tests {
             "jsonrpc": "2.0", "id": "req-abc",
             "method": "Server.GetRPCVersion"
         });
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert_eq!(response["id"], "req-abc");
     }
 
@@ -1056,8 +1058,93 @@ mod tests {
         let (auth_config, cmd_tx) = mock_server();
         // Missing id -> Value::Null; an error response must still carry it.
         let req = json!({"method": "Server.DeleteClient", "params": {}});
-        let (response, _) = resp(handle_request(&req, &auth_config, &cmd_tx).await);
+        let response = handle_request(&req, &auth_config, &cmd_tx).await;
         assert!(response["id"].is_null());
         assert_eq!(response["error"]["message"], "missing 'id'");
+    }
+
+    // --- handle_message: framing shared by TCP, WebSocket and HTTP ------
+
+    #[tokio::test]
+    async fn message_parse_error_has_null_id() {
+        let (auth_config, cmd_tx) = mock_server();
+        let reply = handle_message("{not json", &mut true, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], PARSE_ERROR);
+        assert!(reply["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn message_notification_gets_no_reply() {
+        let (auth_config, cmd_tx) = mock_server();
+        let text = r#"{"jsonrpc": "2.0", "method": "Server.GetRPCVersion"}"#;
+        assert!(
+            handle_message(text, &mut true, &auth_config, &cmd_tx)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_unknown_method_echoes_id() {
+        let (auth_config, cmd_tx) = mock_server();
+        let text = r#"{"jsonrpc": "2.0", "id": 9, "method": "Custom.DoThing"}"#;
+        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], METHOD_NOT_FOUND);
+        assert_eq!(reply["id"], 9);
+    }
+
+    #[tokio::test]
+    async fn message_auth_gate_opens_on_successful_authenticate() {
+        let (auth_config, cmd_tx) = auth_enabled();
+        let mut authenticated = false;
+        let status = r#"{"jsonrpc": "2.0", "id": 1, "method": "Server.GetStatus"}"#;
+        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], UNAUTHORIZED);
+        assert_eq!(reply["id"], 1);
+
+        let bad = r#"{"jsonrpc": "2.0", "id": 2, "method": "Server.Authenticate", "params": {"token": "x"}}"#;
+        handle_message(bad, &mut authenticated, &auth_config, &cmd_tx).await;
+        assert!(!authenticated, "a bad token must not open the gate");
+
+        let token = auth::generate_token(&auth_config, "alice").unwrap();
+        let good = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "Server.Authenticate",
+            "params": {"token": token}
+        })
+        .to_string();
+        handle_message(&good, &mut authenticated, &auth_config, &cmd_tx).await;
+        assert!(authenticated);
+        let reply = handle_message(status, &mut authenticated, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert!(reply["result"]["server"].is_object());
+    }
+
+    #[tokio::test]
+    async fn message_batch_answers_requests_in_order() {
+        let (auth_config, cmd_tx) = mock_server();
+        let text = r#"[
+            {"jsonrpc": "2.0", "id": 1, "method": "Server.GetRPCVersion"},
+            {"jsonrpc": "2.0", "method": "Server.GetRPCVersion"},
+            {"jsonrpc": "2.0", "id": 2, "method": "Nope"}
+        ]"#;
+        let reply = handle_message(text, &mut true, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        let replies = reply.as_array().unwrap();
+        assert_eq!(replies.len(), 2, "the notification gets no entry");
+        assert_eq!(replies[0]["id"], 1);
+        assert_eq!(replies[1]["error"]["code"], METHOD_NOT_FOUND);
+
+        let reply = handle_message("[]", &mut true, &auth_config, &cmd_tx)
+            .await
+            .unwrap();
+        assert_eq!(reply["error"]["code"], INVALID_REQUEST);
     }
 }

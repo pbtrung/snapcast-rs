@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::auth::AuthConfig;
-use crate::jsonrpc::{self, RpcResult};
+use crate::jsonrpc::{self, MAX_REQUEST_LEN};
 
 /// Configuration for the control server.
 pub(crate) struct ControlConfig {
@@ -17,18 +17,12 @@ pub(crate) struct ControlConfig {
     pub bind_address: String,
     /// TCP port.
     pub port: u16,
-    /// Event sender for extension point.
-    pub event_tx: mpsc::Sender<crate::ControlEvent>,
     /// Notification broadcast sender.
     pub notify_tx: broadcast::Sender<Value>,
     /// Auth configuration.
     pub auth_config: Arc<AuthConfig>,
     /// Server command sender.
-    pub cmd_tx: tokio::sync::mpsc::Sender<snapcast_server::ServerCommand>,
-    /// Registered custom JSON-RPC methods.
-    pub registered_methods: Arc<std::collections::HashSet<String>>,
-    /// Registered custom JSON-RPC notifications.
-    pub registered_notifications: Arc<std::collections::HashSet<String>>,
+    pub cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
 }
 
 /// Runs the JSON-RPC control server on a TCP port.
@@ -44,105 +38,44 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
         let (stream, peer) = listener.accept().await?;
         tracing::debug!(%peer, "Control client connected");
 
-        let event_tx = cfg.event_tx.clone();
-        let notify_tx = cfg.notify_tx.clone();
         let mut notify_rx = cfg.notify_tx.subscribe();
         let auth_config = Arc::clone(&cfg.auth_config);
         let cmd_tx = cfg.cmd_tx.clone();
-        let registered_methods = Arc::clone(&cfg.registered_methods);
-        let registered_notifications = Arc::clone(&cfg.registered_notifications);
 
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            let client_id = peer.to_string();
+            let mut reader = BufReader::new(reader);
+            let mut line = Vec::new();
             let mut authenticated = !auth_config.enabled;
 
             loop {
                 tokio::select! {
-                    line = lines.next_line() => {
-                        let Ok(Some(line)) = line else { break };
-                        if line.trim().is_empty() { continue; }
-
-                        let Ok(request) = serde_json::from_str::<Value>(&line) else {
-                            let err = serde_json::json!({
-                                "jsonrpc": "2.0", "id": null,
-                                "error": {"code": -32700, "message": "Parse error"}
-                            });
-                            let _ = send_json(&mut writer, &err).await;
-                            continue;
+                    read = read_line(&mut reader, &mut line) => {
+                        let text = match read {
+                            Ok(Some(text)) => text,
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(%peer, error = %e, "Dropping control client");
+                                break;
+                            }
                         };
-
-                        // Auth gate: allow Server.GetToken and Server.Authenticate without auth
-                        let method = request["method"].as_str().unwrap_or("");
-                        if !authenticated
-                            && method != "Server.GetToken"
-                            && method != "Server.Authenticate"
+                        if text.trim().is_empty() { continue; }
+                        if let Some(reply) =
+                            jsonrpc::handle_message(&text, &mut authenticated, &auth_config, &cmd_tx).await
+                            && send_json(&mut writer, &reply).await.is_err()
                         {
-                            let err = serde_json::json!({
-                                "jsonrpc": "2.0", "id": request["id"],
-                                "error": {"code": -32000, "message": "Unauthorized — call Server.Authenticate first"}
-                            });
-                            let _ = send_json(&mut writer, &err).await;
-                            continue;
-                        }
-
-                        match jsonrpc::handle_request(&request, &auth_config, &cmd_tx).await {
-                            RpcResult::Response { response, notification } => {
-                                // Mark as authenticated if Server.Authenticate succeeded
-                                if method == "Server.Authenticate" && response["result"]["ok"] == true {
-                                    authenticated = true;
-                                }
-                                let _ = send_json(&mut writer, &response).await;
-                                if let Some(n) = notification {
-                                    let _ = notify_tx.send(n);
-                                }
-                            }
-                            RpcResult::Unknown => {
-                                let method_str = method.to_string();
-                                if registered_methods.contains(&method_str) {
-                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
-                                        client_id: client_id.clone(),
-                                        request,
-                                        response_tx: Some(resp_tx),
-                                    }).await;
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        resp_rx,
-                                    ).await {
-                                        Ok(Ok(response)) => {
-                                            let _ = send_json(&mut writer, &response).await;
-                                        }
-                                        _ => {
-                                            let err = serde_json::json!({
-                                                "jsonrpc": "2.0", "id": null,
-                                                "error": {"code": -32603, "message": "Handler timeout"}
-                                            });
-                                            let _ = send_json(&mut writer, &err).await;
-                                        }
-                                    }
-                                } else if registered_notifications.contains(&method_str) {
-                                    let _ = event_tx.send(crate::ControlEvent::JsonRpc {
-                                        client_id: client_id.clone(),
-                                        request,
-                                        response_tx: None,
-                                    }).await;
-                                } else {
-                                    let err = serde_json::json!({
-                                        "jsonrpc": "2.0", "id": request["id"],
-                                        "error": {"code": -32601, "message": "Method not found"}
-                                    });
-                                    let _ = send_json(&mut writer, &err).await;
-                                }
-                            }
+                            break;
                         }
                     }
                     notification = notify_rx.recv() => {
-                        if let Ok(n) = notification
-                            && send_json(&mut writer, &n).await.is_err()
-                        {
-                            break;
+                        match notification {
+                            Ok(n) => {
+                                if send_json(&mut writer, &n).await.is_err() { break; }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                                tracing::warn!(%peer, missed, "Control client missed notifications");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
@@ -150,6 +83,30 @@ pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
             tracing::debug!(%peer, "Control client disconnected");
         });
     }
+}
+
+/// Read the next `\n`-terminated line (without the line ending), or `None`
+/// at EOF. Errors on a line longer than [`MAX_REQUEST_LEN`].
+///
+/// Cancel safe, like [`AsyncBufReadExt::read_until`]: when used in
+/// `select!`, a partial line stays in `buf` and the next call continues it.
+async fn read_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    let limit = (MAX_REQUEST_LEN + 1).saturating_sub(buf.len()) as u64;
+    (&mut *reader).take(limit).read_until(b'\n', buf).await?;
+    if buf.last() != Some(&b'\n') && buf.len() > MAX_REQUEST_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request line too long",
+        ));
+    }
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    let line = String::from_utf8_lossy(&std::mem::take(buf)).into_owned();
+    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 async fn send_json<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> Result<()> {
@@ -160,17 +117,9 @@ async fn send_json<W: AsyncWriteExt + Unpin>(writer: &mut W, value: &Value) -> R
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the control-server wire framing.
-    //!
-    //! The bulk of this module is the TCP accept loop in [`run_tcp`] (bind /
-    //! accept / `tokio::select!` over a `BufReader` line stream and a broadcast
-    //! receiver). That is genuine socket I/O and the request-routing / auth-gate
-    //! logic is written inline inside the accept loop rather than as callable
-    //! functions, so it is only reachable through a live TCP connection and is
-    //! covered by integration tests, not here. The one pure, cheaply-testable
-    //! seam is [`send_json`], which serialises a JSON value and frames it with a
-    //! trailing newline onto any `AsyncWrite`. We exercise it against an
-    //! in-memory `Vec<u8>` buffer — no real sockets, fully deterministic.
+    //! Unit tests for the control-server wire framing: [`read_line`] and
+    //! [`send_json`], against in-memory buffers. Request handling itself lives
+    //! in [`jsonrpc::handle_message`] and is tested there.
 
     use super::*;
 
@@ -277,5 +226,33 @@ mod tests {
         let line = out.strip_suffix('\n').unwrap();
         let reparsed: Value = serde_json::from_str(line).expect("reparse");
         assert_eq!(reparsed, value);
+    }
+
+    #[tokio::test]
+    async fn read_line_splits_lines_and_strips_line_endings() {
+        let mut reader: &[u8] = b"{\"a\":1}\r\n\n{\"b\":2}";
+        let mut buf = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(line) = read_line(&mut reader, &mut buf).await.unwrap() {
+            lines.push(line);
+        }
+        assert_eq!(lines, [r#"{"a":1}"#, "", r#"{"b":2}"#]);
+    }
+
+    /// Regression: a peer streaming bytes without a newline used to grow the
+    /// line buffer without bound.
+    #[tokio::test]
+    async fn read_line_rejects_overlong_lines() {
+        let at_limit = format!("{}\n", "x".repeat(MAX_REQUEST_LEN));
+        let mut reader = at_limit.as_bytes();
+        let mut buf = Vec::new();
+        let line = read_line(&mut reader, &mut buf).await.unwrap().unwrap();
+        assert_eq!(line.len(), MAX_REQUEST_LEN);
+
+        let too_long = vec![b'x'; MAX_REQUEST_LEN * 2];
+        let mut reader = too_long.as_slice();
+        let err = read_line(&mut reader, &mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buf.len() <= MAX_REQUEST_LEN + 1, "buffer stayed bounded");
     }
 }

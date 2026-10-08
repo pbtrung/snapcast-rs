@@ -51,18 +51,19 @@ pub fn start(
                      without bound. Remove it and start snapserver first so it creates the FIFO"
                 );
             }
-            match tokio::fs::OpenOptions::new().read(true).open(&path).await {
-                Ok(file) => {
+            // A regular file is followed, so EOF never replays it from the
+            // start. A FIFO that hits EOF (writer gone, non-Linux) is reopened.
+            let opened: std::io::Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = if is_fifo {
+                open_fifo(&path).map(|rx| Box::new(rx) as _)
+            } else {
+                tokio::fs::File::open(&path)
+                    .await
+                    .map(|file| Box::new(Follow::new(file, chunk_duration)) as _)
+            };
+            match opened {
+                Ok(mut reader) => {
                     tracing::info!(path, "Pipe stream opened");
                     let mut ts = ChunkTimestamper::new(format.rate());
-                    // A FIFO hits EOF when its writer goes away: reopen and
-                    // wait for the next one. A regular file is followed
-                    // instead, so EOF never replays it from the start.
-                    let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if is_fifo {
-                        Box::new(file)
-                    } else {
-                        Box::new(Follow::new(file, chunk_duration))
-                    };
                     match pump_pcm(
                         &mut reader,
                         &mut ts,
@@ -86,6 +87,20 @@ pub fn start(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }))
+}
+
+/// Open a FIFO for reading without tying up a thread: the read end is
+/// nonblocking and driven by the reactor. A blocking `open`/`read` on the
+/// blocking pool would wait for a writer indefinitely, and the runtime waits
+/// for blocking tasks on shutdown, so an idle pipe source stalled every exit.
+///
+/// On Linux the FIFO is opened read-write, so it never reports EOF when a
+/// writer goes away; reads simply wait for the next writer.
+fn open_fifo(path: &str) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+    let mut options = tokio::net::unix::pipe::OpenOptions::new();
+    #[cfg(target_os = "linux")]
+    options.read_write(true);
+    options.open_receiver(path)
 }
 
 /// Reader that treats EOF as "no data yet" and retries after `poll_every`,
@@ -240,6 +255,33 @@ mod tests {
         }
         // 500 ms of 20 ms chunks is 25; unpaced it would be all 500 at once.
         assert!((15..=40).contains(&chunks), "{chunks} chunks in 500 ms");
+    }
+
+    /// Regression: the FIFO was opened with a blocking `open` on the blocking
+    /// pool, which never returns without a writer and kept the runtime from
+    /// shutting down. Now the reader waits on the reactor, and data from a
+    /// writer that connects later still arrives.
+    #[test]
+    fn idle_fifo_does_not_block_runtime_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapfifo");
+        let uri = StreamUri::parse(&format!("pipe://{}?name=t", path.display())).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        rt.block_on(async {
+            start(uri, SampleFormat::new(48000, 16, 2), 960, tx).unwrap();
+            // Let the reader create and open the FIFO with no writer.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            std::io::Write::write_all(&mut writer, &[0u8; 960 * 4]).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("chunk from a writer that connected later")
+                .unwrap();
+        });
+        let started = std::time::Instant::now();
+        drop(rt);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

@@ -1,11 +1,7 @@
-//! JSON-RPC notification builders — single source of truth for the
-//! `(method, params)` shape of each control notification.
-//!
-//! Each notification is emitted from two independent places: as the echo of a
-//! successful `Set*` command (see `jsonrpc.rs`) and as the fan-out of an
-//! internal `ServerEvent` (see `main.rs`). Authoring the shape once here keeps
-//! those two paths byte-compatible — they were previously hand-duplicated,
-//! which is exactly how a field-name slip (e.g. `mute` vs `muted`) stays live.
+//! JSON-RPC notification builders — the `(method, params)` shape of each
+//! control notification, used by `main.rs` when it fans an internal
+//! `ServerEvent` out to the control clients. Note the field-name trap these
+//! pin down: `Client.OnVolumeChanged` uses `muted`, `Group.OnMute` uses `mute`.
 
 use serde_json::{Value, json};
 
@@ -69,8 +65,7 @@ mod tests {
 
     #[test]
     fn group_mute_uses_mute_key() {
-        // Group.OnMute deliberately uses "mute" (not "muted") — the trap this
-        // module exists to prevent from drifting between the two emit paths.
+        // Group.OnMute deliberately uses "mute" (not "muted").
         let n = group_on_mute("g1", true);
         assert_eq!(n["params"]["mute"], true);
         assert!(n["params"]["muted"].is_null());
@@ -81,8 +76,6 @@ mod tests {
     /// Every builder must produce a JSON-RPC 2.0 *notification* envelope:
     /// top-level `jsonrpc: "2.0"`, top-level `method`, top-level `params`, and
     /// crucially NO `id` (notifications are fire-and-forget, unlike responses).
-    /// This is the exact shape `main.rs` hand-writes for `Client.OnDisconnect`,
-    /// so the whole module exists to keep the two byte-compatible.
     fn assert_notification_envelope(n: &Value, expected_method: &str) {
         assert_eq!(n["jsonrpc"], "2.0", "jsonrpc version must be 2.0");
         assert_eq!(n["method"], expected_method, "method must match");
@@ -273,8 +266,7 @@ mod tests {
 
     #[test]
     fn group_and_client_name_changed_have_distinct_methods() {
-        // Same params shape ({id, name}) but the method strings must differ so
-        // the two paths cannot be confused downstream.
+        // Same params shape ({id, name}) but the method strings must differ.
         let g = group_on_name_changed("x", "n");
         let c = client_on_name_changed("x", "n");
         assert_eq!(g["method"], "Group.OnNameChanged");

@@ -65,10 +65,16 @@ fn default_sources() -> Vec<String> {
 pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     let mut config = BinaryConfig::default();
 
-    let ini = match Ini::load_from_file(path) {
+    // No backslash escapes: like C++ snapserver, a value is taken verbatim,
+    // so e.g. `C:\music` or a `\` in process params survives.
+    let ini = match Ini::load_from_file_noescape(path) {
         Ok(ini) => ini,
+        Err(ini::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(path, "Config file not found, using defaults");
+            return config;
+        }
         Err(e) => {
-            tracing::debug!(path, error = %e, "Config file not found, using defaults");
+            tracing::warn!(path, error = %e, "Could not read config file, using defaults");
             return config;
         }
     };
@@ -76,13 +82,13 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     tracing::info!(path, "Loaded config file");
 
     if let Some(s) = ini.section(Some("http")) {
-        get_u16(s, "port", |v| config.http_port = v);
+        get_parsed(s, "port", |v| config.http_port = v);
         get_bind_address(s, |v| config.http_bind_address = v.to_string());
         get_str(s, "doc_root", |v| config.doc_root = Some(v.to_string()));
     }
 
     if let Some(s) = ini.section(Some("tcp-control")) {
-        get_u16(s, "port", |v| config.control_port = v);
+        get_parsed(s, "port", |v| config.control_port = v);
         get_bind_address(s, |v| config.control_bind_address = v.to_string());
     }
 
@@ -92,7 +98,7 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     }
 
     if let Some(s) = ini.section(Some("tcp-streaming")) {
-        get_u16(s, "port", |v| config.stream_port = v);
+        get_parsed(s, "port", |v| config.stream_port = v);
         get_bind_address(s, |v| config.stream_bind_address = v.to_string());
     }
 
@@ -105,7 +111,7 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
         get_str(s, "sampleformat", |v| {
             config.server.sample_format = v.to_string();
         });
-        get_u32(s, "buffer", |v| config.server.buffer_ms = v);
+        get_parsed(s, "buffer", |v| config.server.buffer_ms = v);
     }
 
     if let Some(s) = ini.section(Some("streaming_client")) {
@@ -152,15 +158,12 @@ fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
     }
 }
 
-fn get_u16<F: FnOnce(u16)>(section: &ini::Properties, key: &str, f: F) {
-    if let Some(v) = section.get(key).and_then(|v| v.parse().ok()) {
-        f(v);
-    }
-}
-
-fn get_u32<F: FnOnce(u32)>(section: &ini::Properties, key: &str, f: F) {
-    if let Some(v) = section.get(key).and_then(|v| v.parse().ok()) {
-        f(v);
+fn get_parsed<T: std::str::FromStr, F: FnOnce(T)>(section: &ini::Properties, key: &str, f: F) {
+    if let Some(v) = section.get(key) {
+        match v.trim().parse() {
+            Ok(parsed) => f(parsed),
+            Err(_) => tracing::warn!(key, value = v, "Ignoring invalid config value"),
+        }
     }
 }
 
@@ -169,7 +172,7 @@ fn get_bool<F: FnOnce(bool)>(section: &ini::Properties, key: &str, f: F) {
         match v.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => f(true),
             "false" | "no" | "off" | "0" => f(false),
-            _ => {}
+            _ => tracing::warn!(key, value = v, "Ignoring invalid boolean"),
         }
     }
 }
@@ -491,7 +494,7 @@ mod tests {
 
     #[test]
     fn invalid_buffer_value_leaves_default() {
-        // Non-numeric buffer must be ignored (parse fails silently).
+        // Non-numeric buffer is ignored (with a warning).
         let config = config_from("[stream]\nbuffer = notanumber\n");
         assert_eq!(config.server.buffer_ms, 1000);
     }
@@ -734,6 +737,19 @@ mod tests {
         assert_eq!(config.http_port, 4242);
         // Everything else stays at defaults.
         assert_eq!(config.control_port, 1705);
+    }
+
+    /// Regression: values went through backslash-escape processing, which
+    /// C++ snapserver does not do, so `\m` turned into `m`.
+    #[test]
+    fn backslashes_in_values_are_kept_verbatim() {
+        let config = config_from(
+            "[stream]\nsource = process:///usr/bin/tool?name=x&params=C:\\music\\new\n",
+        );
+        assert_eq!(
+            config.sources,
+            vec![r"process:///usr/bin/tool?name=x&params=C:\music\new"]
+        );
     }
 
     #[test]

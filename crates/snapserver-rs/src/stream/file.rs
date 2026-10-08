@@ -29,17 +29,23 @@ pub fn start(
             match tokio::fs::File::open(&path).await {
                 Ok(mut file) => {
                     tracing::info!(path, "File stream opened");
-                    // Skip WAV header if present
+                    // Skip a canonical 44-byte WAV header if present. Raw PCM
+                    // keeps its first bytes, or every frame after would be
+                    // misaligned.
                     let mut header = [0u8; 4];
-                    if file.read_exact(&mut header).await.is_ok() && &header == b"RIFF" {
-                        // Skip remaining 40 bytes of WAV header
-                        let mut skip = [0u8; 40];
-                        let _ = file.read_exact(&mut skip).await;
+                    let mut prefix: &[u8] = &[];
+                    if file.read_exact(&mut header).await.is_ok() {
+                        if &header == b"RIFF" {
+                            let mut skip = [0u8; 40];
+                            let _ = file.read_exact(&mut skip).await;
+                        } else {
+                            prefix = &header;
+                        }
                     }
 
                     // Paced reads so a finite file plays back in real time.
                     match pump_pcm(
-                        &mut file,
+                        &mut prefix.chain(&mut file),
                         &mut ts,
                         chunk_frames,
                         chunk_bytes,
@@ -53,11 +59,39 @@ pub fn start(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(path, error = %e, "File not found, retrying");
+                    tracing::warn!(path, error = %e, "Cannot open file, retrying");
                 }
             }
             ts.reset();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the first 4 bytes of a raw (non-WAV) file were read to
+    /// sniff for `RIFF` and then dropped, shifting all audio after them.
+    #[tokio::test]
+    async fn raw_pcm_keeps_its_first_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.pcm");
+        // 48 kHz 16-bit mono: 2-byte frames, 2-frame chunks.
+        std::fs::write(&path, [1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let uri = StreamUri::parse(&format!("file://{}?name=f", path.display())).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = start(uri, SampleFormat::new(48000, 16, 1), 2, tx).unwrap();
+        let mut chunks = Vec::new();
+        for _ in 0..2 {
+            let frame = rx.recv().await.unwrap();
+            let snapcast_server::AudioData::Pcm(data) = frame.data else {
+                panic!("expected PCM");
+            };
+            chunks.push(data);
+        }
+        handle.abort();
+        assert_eq!(chunks, [vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+    }
 }
