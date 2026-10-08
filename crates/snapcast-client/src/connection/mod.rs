@@ -19,25 +19,48 @@ use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Received bytes not yet assembled into frames.
+#[derive(Debug, Default)]
+struct RecvBuf {
+    bytes: Vec<u8>,
+    /// When the last read returned: the arrival time of every frame it
+    /// completed, however long the frame then waits to be taken.
+    read_at: Timeval,
+}
+
+impl RecvBuf {
+    fn clear(&mut self) {
+        self.bytes.clear();
+    }
+}
+
 /// Read a complete frame (header + payload) from an async reader.
 ///
 /// Bytes are accumulated in `buf` across calls and only consumed once a whole
 /// frame has arrived, so this is cancel-safe inside `tokio::select!`. Bytes
 /// past the returned frame stay in `buf` for the next call.
+///
+/// A frame's `received` time is when the read that completed it returned
+/// (steady clock, matching C++ steadytimeofday), not when it is taken here:
+/// a time reply read together with audio must not count the time spent on
+/// the audio as network latency.
 async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
-    buf: &mut Vec<u8>,
+    buf: &mut RecvBuf,
 ) -> Result<TypedMessage> {
     loop {
-        if let Some(mut msg) =
-            factory::take_frame(buf).map_err(|e| anyhow::anyhow!("parsing frame: {e}"))?
+        if let Some(mut msg) = factory::take_frame(&mut buf.bytes)
+            .map_err(|e| anyhow::anyhow!("parsing frame: {e}"))?
         {
-            // Stamp received time using steady clock (matching C++ steadytimeofday)
-            msg.base.received = steady_time_of_day();
+            msg.base.received = buf.read_at;
             return Ok(msg);
         }
-        buf.reserve(8192);
-        let n = reader.read_buf(buf).await.context("reading frame")?;
+        buf.bytes.reserve(8192);
+        let n = reader
+            .read_buf(&mut buf.bytes)
+            .await
+            .context("reading frame")?;
+        buf.read_at = steady_time_of_day();
         anyhow::ensure!(n > 0, "connection closed by server");
     }
 }
@@ -58,7 +81,7 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub struct TcpConnection {
     stream: Option<TcpStream>,
     /// Received bytes not yet assembled into a complete frame.
-    read_buf: Vec<u8>,
+    read_buf: RecvBuf,
     host: String,
     port: u16,
     /// Messages read by [`TcpConnection::send_request`] while waiting for its
@@ -133,7 +156,7 @@ impl TcpConnection {
     pub fn new(host: &str, port: u16) -> Self {
         Self {
             stream: None,
-            read_buf: Vec::new(),
+            read_buf: RecvBuf::default(),
             host: host.to_string(),
             port,
             queued: VecDeque::new(),
@@ -286,7 +309,7 @@ mod tests {
 
         // Read back
         let mut cursor = std::io::Cursor::new(&buf);
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         let msg = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg.base.msg_type, MessageType::Time);
         assert_eq!(msg.base.id, 42);
@@ -319,7 +342,7 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(&buf);
 
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         let msg = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg.base.refers_to, 7);
         match msg.payload {
@@ -359,11 +382,38 @@ mod tests {
 
         // Read both back
         let mut cursor = std::io::Cursor::new(&buf);
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         let msg1 = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg1.base.msg_type, MessageType::Time);
         let msg2 = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(msg2.base.msg_type, MessageType::ClientInfo);
+    }
+
+    #[tokio::test]
+    async fn frames_are_stamped_with_the_read_that_completed_them() {
+        let mut buf = Vec::new();
+        for id in [1, 2] {
+            let mut base = BaseMessage {
+                msg_type: MessageType::Time,
+                id,
+                refers_to: 0,
+                sent: Timeval::default(),
+                received: Timeval::default(),
+                size: 0,
+            };
+            write_frame(&mut buf, &mut base, &MessagePayload::Time(Time::default()))
+                .await
+                .unwrap();
+        }
+        // One read returns both frames; the second is taken later.
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut rbuf = RecvBuf::default();
+        let first = read_frame(&mut cursor, &mut rbuf).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = read_frame(&mut cursor, &mut rbuf).await.unwrap();
+        assert_eq!(second.base.id, 2);
+        assert_eq!(first.base.received, second.base.received);
+        assert!(first.base.received.to_usec() > 0);
     }
 
     #[test]
@@ -403,7 +453,7 @@ mod tests {
     async fn read_frame_empty_reader_errors() {
         // Header read_exact fails immediately on an empty reader.
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
@@ -411,7 +461,7 @@ mod tests {
     async fn read_frame_truncated_header_errors() {
         // Fewer than HEADER_SIZE bytes → header read_exact fails.
         let mut cursor = std::io::Cursor::new(vec![0u8; BaseMessage::HEADER_SIZE - 1]);
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
@@ -434,7 +484,7 @@ mod tests {
         write_frame(&mut buf, &mut base, &payload).await.unwrap();
         buf.truncate(buf.len() - 1);
         let mut cursor = std::io::Cursor::new(buf);
-        let mut rbuf = Vec::new();
+        let mut rbuf = RecvBuf::default();
         assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
     }
 
@@ -488,7 +538,7 @@ mod tests {
     /// then the response to it.
     async fn answer_one_request(listener: tokio::net::TcpListener) {
         let (mut sock, _) = listener.accept().await.unwrap();
-        let mut buf = Vec::new();
+        let mut buf = RecvBuf::default();
         let req = read_frame(&mut sock, &mut buf).await.unwrap();
         let mut unrelated = BaseMessage {
             msg_type: MessageType::Time,

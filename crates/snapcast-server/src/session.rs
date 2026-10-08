@@ -29,6 +29,22 @@ use crate::time::now_usec;
 /// descriptors) do not spin.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Unsent bytes the kernel may hold for a streaming client
+/// (`TCP_NOTSENT_LOWAT`). A time reply queues behind whatever audio is
+/// already in the socket, and every 4 KiB there delay it by 16 ms on a
+/// 2 Mbit/s link. Audio is written in realtime chunks of at most a few KiB
+/// (20 ms of 48 kHz stereo PCM is 3.75 KiB), so a backlog beyond one chunk
+/// buys no throughput; with this limit it waits in the session instead,
+/// where time replies overtake it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NOTSENT_LOWAT: u32 = 4096;
+
+/// Received messages buffered between a session's reader and its writer.
+const INCOMING_QUEUE: usize = 16;
+
+/// Byte range of `sent` in a serialized base header.
+const SENT_RANGE: std::ops::Range<usize> = 6..14;
+
 // ── Routing ───────────────────────────────────────────────────
 
 /// Per-session routing state — updated when groups/streams/mute change.
@@ -376,6 +392,8 @@ impl SessionServer {
                         let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10));
                         let sock = socket2::SockRef::from(&stream);
                         sock.set_tcp_keepalive(&ka).ok();
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        sock.set_tcp_notsent_lowat(NOTSENT_LOWAT).ok();
                         self.spawn_client(&mut clients, stream, peer, "tcp", &chunk_rx, &event_tx);
                     }
                     // Failures such as an aborted handshake or running out of
@@ -678,84 +696,106 @@ where
     } = args;
     let mut routing = routing_rx.borrow().clone();
 
-    loop {
-        tokio::select! {
-            _ = &mut cancelled => {
-                tracing::debug!(id = %client_id, "Session replaced by a newer connection");
-                return Ok(());
-            }
-            chunk = chunk_rx.recv() => {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "Broadcast lagged");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!("Broadcast closed");
-                        anyhow::bail!("broadcast closed");
-                    }
-                };
-                if !should_send_chunk(&chunk, &routing, ctx.send_audio_to_muted) {
-                    continue;
-                }
-                write_chunk(&mut writer, chunk).await?;
-            }
-            Ok(()) = routing_rx.changed() => {
-                let new = routing_rx.borrow().clone();
-                if new.stream_id != routing.stream_id {
-                    tracing::debug!(old = %routing.stream_id, new = %new.stream_id, "Stream switch");
-                    if let Some(info) = ctx.codec_header_for(&new.stream_id).await {
-                        let frame = serialize_msg(
-                            MessageType::CodecHeader,
-                            &MessagePayload::CodecHeader(CodecHeader {
-                                codec: info.codec,
-                                payload: info.header,
-                            }),
-                            0,
-                        )?;
-                        write_frame(&mut writer, &frame).await.context("write codec header")?;
-                    }
-                }
-                routing = new;
-            }
-            msg = frames.next() => {
-                let msg = msg?;
-                activity.touch();
-                match msg.payload {
-                    MessagePayload::Time(_t) => {
-                        if let Some(c) = ctx.shared_state.lock().await.clients.get_mut(&client_id) {
-                            c.touch();
-                        }
-                        // latency = server_received - client_sent (c2s one-way estimate)
-                        let latency = msg.base.received - msg.base.sent;
-                        let frame = serialize_time_reply(latency, msg.base.id, msg.base.received)?;
-                        write_frame(&mut writer, &frame).await.context("write time")?;
-                    }
-                    MessagePayload::ClientInfo(info) => {
-                        {
-                            let mut s = ctx.shared_state.lock().await;
-                            if let Some(c) = s.clients.get_mut(&client_id) {
-                                c.config.volume.percent = info.volume;
-                                c.config.volume.muted = info.muted;
-                            }
-                        }
-                        // The mute flag gates audio for this session.
-                        ctx.push_routing(&client_id).await;
-                        let _ = event_tx.send(ServerEvent::ClientVolumeChanged {
-                            client_id: client_id.clone(),
-                            volume: info.volume,
-                            muted: info.muted,
-                        }).await;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(()) = settings_rx.changed() => {
-                let update = settings_rx.borrow_and_update().clone();
-                write_settings(&mut writer, &update).await?;
+    // Reading runs beside writing, so a request is read (and stamped) when
+    // it arrives even while a write to a slow client is pending.
+    let (msg_tx, mut msg_rx) = mpsc::channel(INCOMING_QUEUE);
+    let reader = async move {
+        loop {
+            let msg = frames.next().await?;
+            activity.touch();
+            if msg_tx.send(msg).await.is_err() {
+                return Ok::<(), anyhow::Error>(());
             }
         }
+    };
+
+    // Biased: requests (time sync) and control go ahead of queued audio.
+    let writer_loop = async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut cancelled => {
+                    tracing::debug!(id = %client_id, "Session replaced by a newer connection");
+                    return Ok(());
+                }
+                Some(msg) = msg_rx.recv() => {
+                    match msg.payload {
+                        MessagePayload::Time(_t) => {
+                            // Reply first: anything done before the write
+                            // counts as network latency for the client.
+                            // latency = server_received - client_sent (c2s one-way estimate)
+                            let latency = msg.base.received - msg.base.sent;
+                            let mut frame = serialize_time_reply(latency, msg.base.id, msg.base.received)?;
+                            write_time_reply(&mut writer, &mut frame).await.context("write time")?;
+                            if let Some(c) = ctx.shared_state.lock().await.clients.get_mut(&client_id) {
+                                c.touch();
+                            }
+                        }
+                        MessagePayload::ClientInfo(info) => {
+                            {
+                                let mut s = ctx.shared_state.lock().await;
+                                if let Some(c) = s.clients.get_mut(&client_id) {
+                                    c.config.volume.percent = info.volume;
+                                    c.config.volume.muted = info.muted;
+                                }
+                            }
+                            // The mute flag gates audio for this session.
+                            ctx.push_routing(&client_id).await;
+                            let _ = event_tx.send(ServerEvent::ClientVolumeChanged {
+                                client_id: client_id.clone(),
+                                volume: info.volume,
+                                muted: info.muted,
+                            }).await;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(()) = settings_rx.changed() => {
+                    let update = settings_rx.borrow_and_update().clone();
+                    write_settings(&mut writer, &update).await?;
+                }
+                Ok(()) = routing_rx.changed() => {
+                    let new = routing_rx.borrow().clone();
+                    if new.stream_id != routing.stream_id {
+                        tracing::debug!(old = %routing.stream_id, new = %new.stream_id, "Stream switch");
+                        if let Some(info) = ctx.codec_header_for(&new.stream_id).await {
+                            let frame = serialize_msg(
+                                MessageType::CodecHeader,
+                                &MessagePayload::CodecHeader(CodecHeader {
+                                    codec: info.codec,
+                                    payload: info.header,
+                                }),
+                                0,
+                            )?;
+                            write_frame(&mut writer, &frame).await.context("write codec header")?;
+                        }
+                    }
+                    routing = new;
+                }
+                chunk = chunk_rx.recv() => {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "Broadcast lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::warn!("Broadcast closed");
+                            anyhow::bail!("broadcast closed");
+                        }
+                    };
+                    if !should_send_chunk(&chunk, &routing, ctx.send_audio_to_muted) {
+                        continue;
+                    }
+                    write_chunk(&mut writer, chunk).await?;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        result = reader => result,
+        result = writer_loop => result,
     }
 }
 
@@ -911,6 +951,23 @@ fn serialize_time_reply(latency: Timeval, refers_to: u16, received: Timeval) -> 
         .map_err(|e| anyhow::anyhow!("serialize: {e}"))
 }
 
+/// Write a serialized time reply, stamping its `sent` time right before
+/// every write attempt: a reply that waits for a congested socket must not
+/// count that wait as network latency (the client takes `sent` as the time
+/// the reply left).
+async fn write_time_reply<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &mut [u8],
+) -> std::io::Result<()> {
+    let written = std::future::poll_fn(|cx| {
+        now_timeval().write_to(&mut &mut frame[SENT_RANGE])?;
+        std::pin::Pin::new(&mut *writer).poll_write(cx, frame)
+    })
+    .await?;
+    writer.write_all(&frame[written..]).await?;
+    writer.flush().await
+}
+
 async fn send_msg<W: AsyncWrite + Unpin>(
     stream: &mut W,
     msg_type: MessageType,
@@ -937,6 +994,9 @@ async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &[u8]) -> std
 struct FrameReader<R> {
     reader: R,
     buf: Vec<u8>,
+    /// When the last read returned: the arrival time of the frames it
+    /// completed, however long they wait in `buf` to be taken.
+    read_at: Timeval,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
@@ -944,6 +1004,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         Self {
             reader,
             buf: Vec::new(),
+            read_at: Timeval::default(),
         }
     }
 
@@ -952,7 +1013,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
             if let Some(mut msg) =
                 factory::take_frame(&mut self.buf).map_err(|e| anyhow::anyhow!("parse: {e}"))?
             {
-                msg.base.received = now_timeval();
+                msg.base.received = self.read_at;
                 return Ok(msg);
             }
             self.buf.reserve(8192);
@@ -961,6 +1022,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 .read_buf(&mut self.buf)
                 .await
                 .context("read frame")?;
+            self.read_at = now_timeval();
             anyhow::ensure!(n > 0, "connection closed");
         }
     }
@@ -1048,6 +1110,57 @@ mod tests {
 
         let err = frames.next().await.unwrap_err();
         assert!(err.to_string().contains("payload too large"));
+    }
+
+    #[test]
+    fn sent_range_locates_the_sent_field() {
+        let sent = Timeval {
+            sec: 0x0102_0304,
+            usec: 0x0506_0708,
+        };
+        let frame = serialize_time_reply(Timeval::default(), 1, Timeval::default()).unwrap();
+        let mut patched = frame.clone();
+        sent.write_to(&mut &mut patched[SENT_RANGE]).unwrap();
+        let msg = factory::take_frame(&mut patched).unwrap().unwrap();
+        assert_eq!(msg.base.sent, sent);
+    }
+
+    #[tokio::test]
+    async fn time_reply_is_stamped_when_the_socket_takes_it() {
+        // A full pipe: the reply has to wait until the peer reads.
+        let (mut server, client) = tokio::io::duplex(64);
+        server.write_all(&[0u8; 64]).await.unwrap();
+        let mut frame = serialize_time_reply(Timeval::default(), 1, Timeval::default()).unwrap();
+        let writer = tokio::spawn(async move {
+            write_time_reply(&mut server, &mut frame).await.unwrap();
+            server
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let drained_at = now_usec();
+        let mut frames = FrameReader::new(client);
+        let mut filler = [0u8; 64];
+        frames.reader.read_exact(&mut filler).await.unwrap();
+        let reply = frames.next().await.unwrap();
+        assert!(
+            reply.base.sent.to_usec() >= drained_at,
+            "sent must not include the wait for the socket"
+        );
+        drop(writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_stamps_on_read() {
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            let frame = serialize_msg(MessageType::Time, &MessagePayload::Time(Time::default()), 0)
+                .unwrap();
+            bytes.extend_from_slice(&frame);
+        }
+        let mut frames = FrameReader::new(std::io::Cursor::new(bytes));
+        let first = frames.next().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = frames.next().await.unwrap();
+        assert_eq!(first.base.received, second.base.received);
     }
 
     #[test]
