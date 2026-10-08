@@ -17,6 +17,7 @@ async fn two_clients_play_in_sync_on_a_clean_link() {
         warmup: Duration::from_secs(3),
         buffer_ms: 1000,
         seed: 1,
+        probe: false,
     })
     .await;
     println!("{report}");
@@ -53,20 +54,35 @@ fn scenarios() -> Vec<(&'static str, LinkProfile)> {
                 s2c: clean.with_bandwidth(1_800_000, 8 * 1024),
             },
         ),
+        (
+            "s2c fading 4 <-> 1.2 Mbit/s every 4 s, 4 KiB queue (bursty backlog in server socket)",
+            LinkProfile {
+                c2s: clean,
+                s2c: clean
+                    .with_bandwidth(4_000_000, 4 * 1024)
+                    .with_fade(1_200_000, Duration::from_secs(4)),
+            },
+        ),
     ]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "report; ~3 minutes; run with --ignored --nocapture"]
+#[ignore = "report; ~4 minutes; run with --ignored --nocapture"]
 async fn sync_report() {
     let clean = LinkProfile::symmetric(Link::delay(500, 200));
+    // SYNC_SCENARIO=<substring> runs only the matching scenarios.
+    let filter = std::env::var("SYNC_SCENARIO").unwrap_or_default();
     for (name, link) in scenarios() {
+        if !name.contains(&filter) {
+            continue;
+        }
         let report = run_sync(SyncRun {
             links: vec![clean, link],
             duration: Duration::from_secs(45),
             warmup: Duration::from_secs(10),
             buffer_ms: 1000,
             seed: 7,
+            probe: true,
         })
         .await;
         println!("{name}\n{report}");

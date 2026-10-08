@@ -47,6 +47,9 @@ pub struct Link {
     pub jitter: Duration,
     /// Bottleneck rate in bits per second; `None` = unlimited.
     pub bandwidth_bps: Option<u64>,
+    /// Fading: for the second half of every period the bottleneck drops to
+    /// this rate (bits per second), as on a congested wireless link.
+    pub fade: Option<(u64, Duration)>,
     /// The proxy stops reading while this many bytes wait for the link, so
     /// any further backlog stays in the sender's socket.
     pub queue_limit: usize,
@@ -59,6 +62,7 @@ impl Link {
             latency: Duration::from_micros(latency_usec),
             jitter: Duration::from_micros(jitter_usec),
             bandwidth_bps: None,
+            fade: None,
             queue_limit: 1 << 20,
         }
     }
@@ -69,6 +73,26 @@ impl Link {
             bandwidth_bps: Some(bps),
             queue_limit,
             ..self
+        }
+    }
+
+    /// Drop the bandwidth to `low_bps` for half of every `period`.
+    pub fn with_fade(self, low_bps: u64, period: Duration) -> Self {
+        Self {
+            fade: Some((low_bps, period)),
+            ..self
+        }
+    }
+
+    /// Bottleneck rate at `elapsed` into the connection.
+    fn rate_at(&self, elapsed: Duration) -> Option<u64> {
+        match self.fade {
+            Some((low, period))
+                if elapsed.as_nanos() % period.as_nanos() >= period.as_nanos() / 2 =>
+            {
+                Some(low)
+            }
+            _ => self.bandwidth_bps,
         }
     }
 }
@@ -151,8 +175,9 @@ fn pump(mut src: TcpStream, mut dst: TcpStream, link: Link, seed: u64) {
 
     let mut rng = Rng(seed);
     let mut buf = vec![0u8; 64 * 1024];
-    let mut link_free = Instant::now();
-    let mut last_delivery = Instant::now();
+    let opened = Instant::now();
+    let mut link_free = opened;
+    let mut last_delivery = opened;
     loop {
         {
             let (lock, cvar) = &*pending;
@@ -170,7 +195,7 @@ fn pump(mut src: TcpStream, mut dst: TcpStream, link: Link, seed: u64) {
             // Serialized on the bottleneck, then delayed.
             let start = link_free.max(now);
             link_free = start
-                + link.bandwidth_bps.map_or(Duration::ZERO, |bps| {
+                + link.rate_at(start - opened).map_or(Duration::ZERO, |bps| {
                     Duration::from_nanos(segment.len() as u64 * 8 * 1_000_000_000 / bps)
                 });
             let jitter = link.jitter.mul_f64(rng.uniform());
@@ -278,6 +303,8 @@ pub struct SyncRun {
     pub buffer_ms: u32,
     /// Seed for the links' jitter.
     pub seed: u64,
+    /// Also probe raw time exchanges over a copy of the last client's link.
+    pub probe: bool,
 }
 
 /// Results of one client (µs).
@@ -298,6 +325,17 @@ pub struct SyncReport {
     pub clients: Vec<ClientReport>,
     /// Playout error of client `i` minus that of client 0, for `i >= 1`.
     pub alignment: Vec<Stats>,
+    /// Raw exchanges of the probe, if run.
+    pub probe: Option<ProbeReport>,
+}
+
+/// Unfiltered time exchanges (µs), as `TimeProvider` receives them.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeReport {
+    /// Per-exchange diff `(c2s - s2c) / 2`; the true diff is 0.
+    pub diff: Stats,
+    /// Per-exchange round trip `c2s + s2c`.
+    pub rtt: Stats,
 }
 
 impl std::fmt::Display for SyncReport {
@@ -308,6 +346,10 @@ impl std::fmt::Display for SyncReport {
         }
         for (i, a) in self.alignment.iter().enumerate() {
             writeln!(f, "  client {} vs 0 align: {a}", i + 1)?;
+        }
+        if let Some(p) = &self.probe {
+            writeln!(f, "  raw exchange diff  : {}", p.diff)?;
+            writeln!(f, "  raw exchange rtt   : {}", p.rtt)?;
         }
         Ok(())
     }
@@ -379,6 +421,14 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
         clients.push(handles);
     }
 
+    let probe = match (run.probe, run.links.last()) {
+        (true, Some(link)) => {
+            let proxy_port = spawn_proxy(port, *link, run.seed.wrapping_add(999));
+            Some(tokio::spawn(probe(proxy_port, run.duration, run.warmup)))
+        }
+        _ => None,
+    };
+
     let dac_clients: Vec<_> = clients
         .iter()
         .map(|(tp, stream, _)| (Arc::clone(tp), Arc::clone(stream)))
@@ -394,6 +444,10 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
     for (_, _, cmd) in &clients {
         cmd.send(ClientCommand::Stop).await.ok();
     }
+    let probe = match probe {
+        Some(handle) => Some(handle.await.unwrap()),
+        None => None,
+    };
     feeder.abort();
 
     let mut alignment = Vec::new();
@@ -414,7 +468,96 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
             ticks: s.diff.len(),
         })
         .collect();
-    SyncReport { clients, alignment }
+    SyncReport {
+        clients,
+        alignment,
+        probe,
+    }
+}
+
+/// A bare client sending a Time request every 100 ms and recording the raw
+/// exchanges. Reads run in their own task and stamp arrival when the read
+/// returns, as the client does.
+async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
+    use snapcast_proto::message::factory::{self, MessagePayload};
+    use snapcast_proto::message::hello::Hello;
+    use snapcast_proto::message::time::Time;
+    use snapcast_proto::{BaseMessage, MessageType, Timeval};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream.set_nodelay(true).unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+    let frame = |msg_type, payload: &MessagePayload| {
+        let mut base = BaseMessage {
+            msg_type,
+            id: 1,
+            refers_to: 0,
+            sent: Timeval::from_usec(now_usec()),
+            received: Timeval::default(),
+            size: 0,
+        };
+        factory::serialize(&mut base, payload).unwrap()
+    };
+    let hello = Hello {
+        mac: "00:00:00:00:00:00".into(),
+        host_name: "probe".into(),
+        version: "0.0.0".into(),
+        client_name: "probe".into(),
+        os: "test".into(),
+        arch: "test".into(),
+        instance: 1,
+        id: "probe".into(),
+        snap_stream_protocol_version: snapcast_proto::PROTOCOL_VERSION,
+        auth: None,
+    };
+    wr.write_all(&frame(MessageType::Hello, &MessagePayload::Hello(hello)))
+        .await
+        .unwrap();
+
+    let begin = tokio::time::Instant::now();
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let reader = tokio::spawn({
+        let samples = Arc::clone(&samples);
+        async move {
+            let mut buf = Vec::new();
+            let mut read_at = 0;
+            loop {
+                while let Some(msg) = factory::take_frame(&mut buf).unwrap() {
+                    if let MessagePayload::Time(t) = msg.payload
+                        && begin.elapsed() > warmup
+                    {
+                        let c2s = t.latency.to_usec();
+                        let s2c = read_at - msg.base.sent.to_usec();
+                        let sample = ((c2s - s2c) as f64 / 2.0, (c2s + s2c) as f64);
+                        samples.lock().unwrap().push(sample);
+                    }
+                }
+                buf.reserve(64 * 1024);
+                match rd.read_buf(&mut buf).await {
+                    Ok(n) if n > 0 => read_at = now_usec(),
+                    _ => return,
+                }
+            }
+        }
+    });
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    while begin.elapsed() < duration {
+        tick.tick().await;
+        let req = frame(MessageType::Time, &MessagePayload::Time(Time::new()));
+        if wr.write_all(&req).await.is_err() {
+            break;
+        }
+    }
+    drop(wr);
+    reader.abort();
+    let (diffs, rtts): (Vec<f64>, Vec<f64>) = samples.lock().unwrap().iter().copied().unzip();
+    ProbeReport {
+        diff: Stats::from_errors(&diffs),
+        rtt: Stats::from_errors(&rtts),
+    }
 }
 
 /// Per-client samples, one per DAC tick after warm-up.
