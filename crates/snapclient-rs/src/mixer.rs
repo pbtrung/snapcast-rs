@@ -1,36 +1,82 @@
 //! Volume mixer — software (PCM scaling) or hardware (ALSA control).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Shared volume state for the software mixer.
+use snapcast_client::config::{MixerMode, MixerSettings};
+
+/// Shared linear gain applied by the player (software mixer).
 pub struct VolumeState {
-    pub percent: AtomicU8,
-    pub muted: AtomicBool,
+    /// `f32` gain as bits, so the audio callback can read it lock-free.
+    gain_bits: AtomicU32,
 }
 
 impl VolumeState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            percent: AtomicU8::new(100),
-            muted: AtomicBool::new(false),
+            gain_bits: AtomicU32::new(1.0f32.to_bits()),
         })
     }
 
     /// Get the linear gain factor (0.0–1.0).
     pub fn gain(&self) -> f32 {
-        if self.muted.load(Ordering::Relaxed) {
-            0.0
-        } else {
-            self.percent.load(Ordering::Relaxed) as f32 / 100.0
+        f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_gain(&self, gain: f32) {
+        self.gain_bits.store(gain.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Software volume curve, as C++ snapclient's `software[:poly|exp[:<param>]]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VolumeCurve {
+    /// `gain = v^exponent` (default exponent 3).
+    Poly(f64),
+    /// `gain = (base^v - 1) / (base - 1)` (default base 10; the default curve).
+    Exp(f64),
+}
+
+impl VolumeCurve {
+    /// Parse the software mixer parameter: `[poly|exp][:<param>]`.
+    fn parse(param: &str) -> Self {
+        let (mode, value) = param.split_once(':').unwrap_or((param, ""));
+        let value = match value.parse::<f64>() {
+            Ok(v) if v > 0.0 && v.is_finite() => Some(v),
+            _ if value.is_empty() => None,
+            _ => {
+                tracing::warn!(value, "Invalid software mixer parameter, using default");
+                None
+            }
+        };
+        match mode {
+            "poly" => Self::Poly(value.unwrap_or(3.0)),
+            "exp" | "" => Self::Exp(value.filter(|&b| b != 1.0).unwrap_or(10.0)),
+            other => {
+                tracing::warn!(mode = other, "Unknown software mixer curve, using exp");
+                Self::Exp(10.0)
+            }
         }
+    }
+
+    /// Linear gain for a volume percentage.
+    fn gain(self, percent: u8) -> f32 {
+        let v = f64::from(percent.min(100)) / 100.0;
+        let gain = match self {
+            Self::Poly(exponent) => v.powf(exponent),
+            Self::Exp(base) => (base.powf(v) - 1.0) / (base - 1.0),
+        };
+        gain as f32
     }
 }
 
 /// Mixer backend.
 pub enum Mixer {
     /// PCM amplitude scaling (default).
-    Software(Arc<VolumeState>),
+    Software {
+        volume: Arc<VolumeState>,
+        curve: VolumeCurve,
+    },
     /// ALSA hardware mixer control (Linux only).
     #[cfg(target_os = "linux")]
     Hardware { control: String },
@@ -39,15 +85,18 @@ pub enum Mixer {
 }
 
 impl Mixer {
-    /// Parse from CLI string: `software`, `hardware[:control]`, `none`.
-    pub fn from_str(raw: &str) -> (Self, Arc<VolumeState>) {
+    /// Build the mixer from CLI settings. Returns it with the gain handle the
+    /// player applies (stays at unity unless the mixer is software).
+    pub fn new(settings: &MixerSettings) -> (Self, Arc<VolumeState>) {
         let volume = VolumeState::new();
-        #[allow(unused_variables)]
-        let (mode, param) = raw.split_once(':').unwrap_or((raw, ""));
-        let mixer = match mode {
-            "software" | "" => Mixer::Software(volume.clone()),
+        let param = settings.parameter.as_str();
+        let mixer = match settings.mode {
+            MixerMode::Software => Mixer::Software {
+                volume: volume.clone(),
+                curve: VolumeCurve::parse(param),
+            },
             #[cfg(target_os = "linux")]
-            "hardware" => {
+            MixerMode::Hardware => {
                 let control = if param.is_empty() {
                     detect_alsa_control().unwrap_or_else(|| "Master".to_string())
                 } else {
@@ -65,15 +114,21 @@ impl Mixer {
                 Mixer::Hardware { control }
             }
             #[cfg(not(target_os = "linux"))]
-            "hardware" => {
+            MixerMode::Hardware => {
                 tracing::warn!("Hardware mixer not supported on this platform, using software");
-                Mixer::Software(volume.clone())
+                Mixer::Software {
+                    volume: volume.clone(),
+                    curve: VolumeCurve::parse(""),
+                }
             }
-            "none" => Mixer::None,
-            _ => {
-                tracing::warn!(mode, "Unknown mixer mode, using software");
-                Mixer::Software(volume.clone())
+            MixerMode::Script => {
+                tracing::warn!("Script mixer not implemented, using software");
+                Mixer::Software {
+                    volume: volume.clone(),
+                    curve: VolumeCurve::parse(""),
+                }
             }
+            MixerMode::None => Mixer::None,
         };
         (mixer, volume)
     }
@@ -81,9 +136,8 @@ impl Mixer {
     /// Apply a volume change from the server.
     pub fn set_volume(&self, percent: u8, muted: bool) {
         match self {
-            Mixer::Software(vol) => {
-                vol.percent.store(percent, Ordering::Relaxed);
-                vol.muted.store(muted, Ordering::Relaxed);
+            Mixer::Software { volume, curve } => {
+                volume.set_gain(if muted { 0.0 } else { curve.gain(percent) });
             }
             #[cfg(target_os = "linux")]
             Mixer::Hardware { control } => {
@@ -113,7 +167,7 @@ fn set_alsa_volume_inner(control: &str, percent: u8) -> anyhow::Result<()> {
         .find_selem(&selem_id)
         .ok_or_else(|| anyhow::anyhow!("ALSA control '{control}' not found"))?;
     let (min, max) = selem.get_playback_volume_range();
-    // Perceptual volume curve (quadratic) — matches how humans perceive loudness.
+    // Perceptual volume curve (cubic) — closer to perceived loudness than linear.
     let normalized = f64::from(percent) / 100.0;
     let curved = normalized * normalized * normalized;
     let vol = min + ((max - min) as f64 * curved) as i64;
@@ -170,200 +224,113 @@ fn detect_alsa_control() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn mixer(mode: MixerMode, parameter: &str) -> (Mixer, Arc<VolumeState>) {
+        Mixer::new(&MixerSettings {
+            mode,
+            parameter: parameter.into(),
+        })
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
     // ---- VolumeState ----
 
     #[test]
-    fn volume_state_new_defaults() {
-        let vol = VolumeState::new();
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
-        assert!(!vol.muted.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn gain_default_is_unity() {
-        let vol = VolumeState::new();
-        assert_eq!(vol.gain(), 1.0);
+        assert_eq!(VolumeState::new().gain(), 1.0);
+    }
+
+    // ---- VolumeCurve ----
+
+    #[test]
+    fn default_curve_is_exp_base_10() {
+        let curve = VolumeCurve::parse("");
+        assert_eq!(curve, VolumeCurve::Exp(10.0));
+        assert_eq!(curve.gain(0), 0.0);
+        assert!(close(curve.gain(100), 1.0));
+        // (10^0.5 - 1) / 9 ≈ 0.2403, as C++ snapclient
+        assert!(close(curve.gain(50), ((10f64.sqrt() - 1.0) / 9.0) as f32));
     }
 
     #[test]
-    fn gain_scales_linearly_with_percent() {
-        let vol = VolumeState::new();
-        vol.percent.store(50, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 0.5);
-
-        vol.percent.store(25, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 0.25);
-
-        vol.percent.store(0, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 0.0);
+    fn poly_curve_and_params() {
+        assert_eq!(VolumeCurve::parse("poly"), VolumeCurve::Poly(3.0));
+        assert_eq!(VolumeCurve::parse("poly:2"), VolumeCurve::Poly(2.0));
+        assert_eq!(VolumeCurve::parse("exp:20"), VolumeCurve::Exp(20.0));
+        assert!(close(VolumeCurve::Poly(2.0).gain(50), 0.25));
+        assert!(close(VolumeCurve::Poly(1.0).gain(30), 0.3));
     }
 
     #[test]
-    fn gain_full_scale_at_100() {
-        let vol = VolumeState::new();
-        vol.percent.store(100, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 1.0);
+    fn invalid_curve_params_fall_back_to_defaults() {
+        assert_eq!(VolumeCurve::parse("poly:-1"), VolumeCurve::Poly(3.0));
+        assert_eq!(VolumeCurve::parse("poly:abc"), VolumeCurve::Poly(3.0));
+        // base 1 would divide by zero
+        assert_eq!(VolumeCurve::parse("exp:1"), VolumeCurve::Exp(10.0));
+        assert_eq!(VolumeCurve::parse("bogus"), VolumeCurve::Exp(10.0));
     }
 
     #[test]
-    fn gain_muted_is_zero_regardless_of_percent() {
-        let vol = VolumeState::new();
-        // A non-zero percent that would otherwise produce audible gain.
-        vol.percent.store(80, Ordering::Relaxed);
-        vol.muted.store(true, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 0.0);
-
-        // Un-muting restores the underlying percent-derived gain.
-        vol.muted.store(false, Ordering::Relaxed);
-        assert_eq!(vol.gain(), 0.8);
-    }
-
-    #[test]
-    fn gain_matches_percent_over_full_range() {
-        let vol = VolumeState::new();
-        for p in 0u8..=100 {
-            vol.percent.store(p, Ordering::Relaxed);
-            let expected = p as f32 / 100.0;
-            assert!(
-                (vol.gain() - expected).abs() < f32::EPSILON,
-                "percent {p} -> gain {} != {expected}",
-                vol.gain()
-            );
+    fn curves_are_monotonic() {
+        for curve in [VolumeCurve::Exp(10.0), VolumeCurve::Poly(3.0)] {
+            for p in 0u8..100 {
+                assert!(curve.gain(p) < curve.gain(p + 1), "{curve:?} at {p}");
+            }
         }
     }
 
-    // ---- Mixer::from_str parsing ----
+    // ---- Mixer::new ----
 
     #[test]
-    fn from_str_software_selects_software_backend() {
-        let (mixer, _vol) = Mixer::from_str("software");
-        assert!(matches!(mixer, Mixer::Software(_)));
-    }
-
-    #[test]
-    fn from_str_empty_defaults_to_software() {
-        let (mixer, _vol) = Mixer::from_str("");
-        assert!(matches!(mixer, Mixer::Software(_)));
-    }
-
-    #[test]
-    fn from_str_none_selects_no_control() {
-        let (mixer, _vol) = Mixer::from_str("none");
-        assert!(matches!(mixer, Mixer::None));
-    }
-
-    #[test]
-    fn from_str_unknown_mode_falls_back_to_software() {
-        let (mixer, _vol) = Mixer::from_str("bogus");
-        assert!(matches!(mixer, Mixer::Software(_)));
-    }
-
-    #[test]
-    fn from_str_splits_on_colon_and_ignores_param_for_software() {
-        // `split_once(':')` means the mode is only the part before the colon;
-        // "software:whatever" is still the software backend.
-        let (mixer, _vol) = Mixer::from_str("software:ignored");
-        assert!(matches!(mixer, Mixer::Software(_)));
-    }
-
-    #[test]
-    fn from_str_none_with_colon_param_is_still_none() {
-        let (mixer, _vol) = Mixer::from_str("none:whatever");
-        assert!(matches!(mixer, Mixer::None));
-    }
-
-    // On non-Linux targets the ALSA backend is compiled out, so "hardware"
-    // deterministically falls back to the software mixer (no hardware probe).
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn from_str_hardware_falls_back_to_software_off_linux() {
-        let (mixer, _vol) = Mixer::from_str("hardware");
-        assert!(matches!(mixer, Mixer::Software(_)));
-
-        // A named control is likewise ignored off-Linux.
-        let (mixer2, _vol2) = Mixer::from_str("hardware:Master");
-        assert!(matches!(mixer2, Mixer::Software(_)));
-    }
-
-    // ---- from_str returned VolumeState handle ----
-
-    #[test]
-    fn from_str_returns_default_volume_handle() {
-        let (_mixer, vol) = Mixer::from_str("software");
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
-        assert!(!vol.muted.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn from_str_software_handle_is_shared_with_backend() {
-        // The returned handle must alias the Arc stored inside the Software
-        // variant, otherwise set_volume() would update invisible state.
-        let (mixer, vol) = Mixer::from_str("software");
+    fn software_handle_is_shared_with_backend() {
+        let (mixer, vol) = mixer(MixerMode::Software, "");
         match &mixer {
-            Mixer::Software(inner) => {
-                assert!(
-                    Arc::ptr_eq(inner, &vol),
-                    "returned handle must be the backend's Arc"
-                );
-            }
+            Mixer::Software { volume, .. } => assert!(Arc::ptr_eq(volume, &vol)),
             _ => panic!("expected software backend"),
         }
     }
 
-    // ---- Mixer::set_volume dispatch ----
+    #[test]
+    fn script_falls_back_to_software() {
+        let (mixer, _) = mixer(MixerMode::Script, "");
+        assert!(matches!(mixer, Mixer::Software { .. }));
+    }
 
     #[test]
-    fn set_volume_software_updates_shared_state() {
-        let (mixer, vol) = Mixer::from_str("software");
+    #[cfg(not(target_os = "linux"))]
+    fn hardware_falls_back_to_software_off_linux() {
+        let (mixer, _) = mixer(MixerMode::Hardware, "Master");
+        assert!(matches!(mixer, Mixer::Software { .. }));
+    }
+
+    // ---- Mixer::set_volume ----
+
+    #[test]
+    fn set_volume_software_applies_curve() {
+        let (mixer, vol) = mixer(MixerMode::Software, "poly:1");
         mixer.set_volume(75, false);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 75);
-        assert!(!vol.muted.load(Ordering::Relaxed));
-
-        // Observed through gain(): 75% unmuted -> 0.75.
-        assert_eq!(vol.gain(), 0.75);
-    }
-
-    #[test]
-    fn set_volume_software_applies_mute() {
-        let (mixer, vol) = Mixer::from_str("software");
-        mixer.set_volume(60, true);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 60);
-        assert!(vol.muted.load(Ordering::Relaxed));
-        // Muted overrides percent in the gain calculation.
-        assert_eq!(vol.gain(), 0.0);
-    }
-
-    #[test]
-    fn set_volume_software_boundary_values() {
-        let (mixer, vol) = Mixer::from_str("software");
-
-        mixer.set_volume(0, false);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 0);
-        assert_eq!(vol.gain(), 0.0);
-
+        assert!(close(vol.gain(), 0.75));
         mixer.set_volume(100, false);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
-        assert_eq!(vol.gain(), 1.0);
+        assert!(close(vol.gain(), 1.0));
+        mixer.set_volume(0, false);
+        assert_eq!(vol.gain(), 0.0);
     }
 
     #[test]
-    fn set_volume_software_last_write_wins() {
-        let (mixer, vol) = Mixer::from_str("software");
-        mixer.set_volume(30, true);
-        mixer.set_volume(90, false);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 90);
-        assert!(!vol.muted.load(Ordering::Relaxed));
-        assert_eq!(vol.gain(), 0.9);
+    fn set_volume_software_mute_overrides_percent() {
+        let (mixer, vol) = mixer(MixerMode::Software, "");
+        mixer.set_volume(80, true);
+        assert_eq!(vol.gain(), 0.0);
+        mixer.set_volume(80, false);
+        assert!(vol.gain() > 0.0);
     }
 
     #[test]
-    fn set_volume_none_is_a_noop_on_returned_handle() {
-        // For the `none` backend the returned handle is a fresh default state
-        // that set_volume never touches.
-        let (mixer, vol) = Mixer::from_str("none");
+    fn set_volume_none_leaves_unity_gain() {
+        let (mixer, vol) = mixer(MixerMode::None, "");
         mixer.set_volume(10, true);
-        assert_eq!(vol.percent.load(Ordering::Relaxed), 100);
-        assert!(!vol.muted.load(Ordering::Relaxed));
         assert_eq!(vol.gain(), 1.0);
     }
 }

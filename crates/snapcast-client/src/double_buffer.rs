@@ -40,11 +40,8 @@ impl DoubleBuffer {
         if mean_count <= 1 || sorted.len() < mean_count {
             sorted[sorted.len() / 2]
         } else {
-            let mid = sorted.len() / 2;
-            let half = mean_count / 2;
-            let low = mid - half;
-            let high = mid + half;
-            let sum: i64 = sorted[low..=high].iter().sum();
+            let low = sorted.len() / 2 - mean_count / 2;
+            let sum: i64 = sorted[low..low + mean_count].iter().sum();
             sum / mean_count as i64
         }
     }
@@ -57,11 +54,6 @@ impl DoubleBuffer {
     /// Remove all values.
     pub fn clear(&mut self) {
         self.buf.clear();
-    }
-
-    /// Returns true if the buffer contains no values.
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
     }
 
     /// Number of values currently stored.
@@ -136,12 +128,26 @@ mod tests {
     }
 
     #[test]
+    fn median_with_even_mean_count() {
+        let mut db = DoubleBuffer::new(10);
+        db.add(10);
+        db.add(20);
+        // Averages exactly two values (and doesn't index past the end).
+        assert_eq!(db.median(2), 15);
+        for v in [30, 40] {
+            db.add(v);
+        }
+        // sorted: [10,20,30,40], low = 2 - 1 → avg of [20,30]
+        assert_eq!(db.median(2), 25);
+    }
+
+    #[test]
     fn clear_resets() {
         let mut db = DoubleBuffer::new(10);
         db.add(1);
         db.add(2);
         db.clear();
-        assert!(db.is_empty());
+        assert_eq!(db.len(), 0);
         assert_eq!(db.median_simple(), 0);
     }
 

@@ -108,7 +108,7 @@ pub enum ClientEvent {
         /// Mute state.
         muted: bool,
     },
-    /// Volume changed (from server or local).
+    /// Volume changed by the server.
     VolumeChanged {
         /// Volume (0–100).
         volume: u16,
@@ -141,7 +141,8 @@ pub enum ClientCommand {
 pub struct ClientConfig {
     /// Connection scheme: "tcp" or "ws" (`websocket` feature).
     pub scheme: String,
-    /// Server hostname or IP (empty = mDNS discovery).
+    /// Server hostname or IP. Must be set: the library does no discovery
+    /// (an empty host fails every connection attempt).
     pub host: String,
     /// Server port. Default: 1704.
     pub port: u16,
@@ -219,7 +220,9 @@ impl SnapClient {
         self.command_tx.clone()
     }
 
-    /// Run the client. Blocks until stopped or a fatal error occurs.
+    /// Run the client, reconnecting after connection errors, until a
+    /// [`ClientCommand::Stop`] arrives. Fails early on an invalid configuration
+    /// (e.g. an unsupported scheme).
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let command_rx = self
             .command_rx

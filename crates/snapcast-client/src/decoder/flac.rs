@@ -86,8 +86,7 @@ impl Decoder for FlacDecoder {
             payload_len = header.payload.len(),
             "set_header"
         );
-        let (sf, params) = parse_streaminfo(&header.payload)?;
-        *self = Self::new_from_params(sf, &params)?;
+        *self = create(header)?;
         Ok(self.sample_format)
     }
 

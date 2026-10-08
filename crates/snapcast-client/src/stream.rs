@@ -52,9 +52,22 @@ impl PcmChunk {
         }
     }
 
-    /// Start time of this chunk in microseconds.
+    /// Server time of the next unread frame in microseconds: the chunk's
+    /// timestamp advanced by the frames already read or skipped (as C++
+    /// `PcmChunk::start()`).
     pub fn start_usec(&self) -> i64 {
-        self.timestamp.to_usec()
+        let frame_size = self.format.frame_size() as i64;
+        let rate = self.format.rate() as i64;
+        if frame_size == 0 || rate == 0 {
+            return self.timestamp.to_usec();
+        }
+        let consumed_frames = self.read_pos as i64 / frame_size;
+        self.timestamp.to_usec() + consumed_frames * 1_000_000 / rate
+    }
+
+    /// Server time just past the last frame of this chunk in microseconds.
+    fn end_usec(&self) -> i64 {
+        self.timestamp.to_usec() + self.duration_usec()
     }
 
     /// Duration of this chunk in microseconds.
@@ -86,9 +99,14 @@ impl PcmChunk {
         to_read as u32
     }
 
-    /// Returns true if all data has been read.
+    /// Returns true if no whole frame is left to read.
+    ///
+    /// A trailing partial frame (payload length not a multiple of the frame
+    /// size) counts as the end, so readers never wait on bytes that
+    /// [`read_frames`](Self::read_frames) cannot return.
     pub fn is_end(&self) -> bool {
-        self.read_pos >= self.data.len()
+        let frame_size = self.format.frame_size() as usize;
+        frame_size == 0 || self.data.len() - self.read_pos < frame_size
     }
 
     /// Skip forward by `frames` frames.
@@ -135,13 +153,14 @@ const DEFAULT_BUFFER_MS: i64 = 1000;
 ///
 /// There are two main modes of synchronization:
 ///
-/// 1. **Hard Sync**: Used when the client is far out of sync (> 50ms) or just starting.
-///    In this mode, the stream skips forward in the buffer or inserts silence to reach
-///    the desired target time exactly.
-/// 2. **Soft Sync**: Used for fine-tuning when the drift is small (typically < 10ms).
-///    Instead of jumping, the stream subtly adjusts the playback rate (e.g., by 0.05%)
-///    by adding or removing single samples at regular intervals. This is inaudible to
-///    most listeners.
+/// 1. **Hard Sync**: Used at startup and whenever the drift is too large to
+///    correct smoothly (long-term median > 2ms, short-term median > 5ms, mini
+///    median > 50ms, or a single age > 500ms). The stream skips forward in the
+///    buffer or inserts silence to reach the desired target time exactly.
+/// 2. **Soft Sync**: Used for fine-tuning when the short-term median drift
+///    exceeds 100µs. Instead of jumping, the stream adjusts the playback rate
+///    (by at most 0.05%) by adding or removing single frames at regular
+///    intervals. This is inaudible to most listeners.
 ///
 /// ### Drift Detection
 ///
@@ -235,6 +254,11 @@ impl Stream {
         self.buffer_ms = ms;
     }
 
+    #[cfg(test)]
+    pub(crate) fn buffer_ms(&self) -> i64 {
+        self.buffer_ms
+    }
+
     /// Enqueue a decoded PCM chunk.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
         self.chunks.push_back(chunk);
@@ -290,12 +314,15 @@ impl Stream {
             return false;
         }
 
+        // Server time whose sample should reach the DAC with this buffer;
+        // the age of a frame is how far past its playout time it is.
+        let playout_usec = server_now_usec - self.buffer_ms * 1000 + output_buffer_dac_time_usec;
+
         // --- Hard sync: initial alignment ---
         if self.hard_sync {
             let chunk = self.current.as_ref().unwrap();
             let req_duration_usec = (frames as i64 * 1_000_000) / self.format.rate() as i64;
-            let age_usec = server_now_usec - chunk.start_usec() - self.buffer_ms * 1000
-                + output_buffer_dac_time_usec;
+            let age_usec = playout_usec - chunk.start_usec();
 
             if age_usec < -req_duration_usec {
                 self.get_silence(output, frames);
@@ -303,16 +330,20 @@ impl Stream {
             }
 
             if age_usec > 0 {
-                self.current = None;
+                // Too old: drop frames until the playout point. The current
+                // chunk is a candidate too (it may only be partly stale).
+                if let Some(c) = self.current.take() {
+                    self.chunks.push_front(c);
+                }
                 while let Some(mut c) = self.chunks.pop_front() {
-                    let a = server_now_usec - c.start_usec() - self.buffer_ms * 1000
-                        + output_buffer_dac_time_usec;
-                    if a > 0 && a < c.duration_usec() {
-                        let skip = (self.format.rate() as f64 * a as f64 / 1_000_000.0) as u32;
-                        c.seek(skip);
+                    let a = playout_usec - c.start_usec();
+                    if a <= 0 {
                         self.current = Some(c);
                         break;
-                    } else if a <= 0 {
+                    }
+                    if a < c.end_usec() - c.start_usec() {
+                        let skip = (self.format.rate() as f64 * a as f64 / 1_000_000.0) as u32;
+                        c.seek(skip);
                         self.current = Some(c);
                         break;
                     }
@@ -323,8 +354,7 @@ impl Stream {
             }
 
             let chunk = self.current.as_ref().unwrap();
-            let age_usec = server_now_usec - chunk.start_usec() - self.buffer_ms * 1000
-                + output_buffer_dac_time_usec;
+            let age_usec = playout_usec - chunk.start_usec();
 
             if age_usec <= 0 {
                 let silent_frames =
@@ -367,8 +397,7 @@ impl Stream {
             None => return false,
         };
 
-        let age_usec =
-            server_now_usec - chunk_start - self.buffer_ms * 1000 + output_buffer_dac_time_usec;
+        let age_usec = playout_usec - chunk_start;
 
         // Reset sample rate to nominal, soft sync may override below
         self.set_real_sample_rate(self.format.rate() as f64);
@@ -473,13 +502,13 @@ impl Stream {
         result
     }
 
+    /// Read `frames` frames, continuing into queued chunks as needed. Returns
+    /// the server time of the first frame read. On underrun the unfilled tail
+    /// of `output` is zeroed so stale buffer contents are never played.
     fn read_next(&mut self, output: &mut [u8], frames: u32) -> Option<i64> {
         let chunk = self.current.as_mut()?;
-        // Adjusted timestamp: chunk start + already-consumed frames
         let frame_size = self.format.frame_size() as usize;
-        let consumed_frames = chunk.read_pos / frame_size;
-        let ts =
-            chunk.start_usec() + consumed_frames as i64 * 1_000_000 / self.format.rate() as i64;
+        let ts = chunk.start_usec();
         let mut read = 0u32;
         while read < frames {
             let offset = read as usize * frame_size;
@@ -490,7 +519,15 @@ impl Stream {
                     Some(next) => *chunk = next,
                     None => break,
                 }
+            } else if n == 0 {
+                // `output` is full (shorter than `frames`): nothing more fits.
+                break;
             }
+        }
+        let filled = (read as usize * frame_size).min(output.len());
+        let wanted = (frames as usize * frame_size).min(output.len());
+        if filled < wanted {
+            output[filled..wanted].fill(0);
         }
         Some(ts)
     }
@@ -815,6 +852,49 @@ mod tests {
             buf.iter().any(|&b| b != 0),
             "expected real audio, not silence"
         );
+    }
+
+    #[test]
+    fn hard_sync_seeks_into_partially_stale_chunk() {
+        let f = fmt();
+        let mut s = Stream::new(f);
+        s.set_buffer_ms(1000);
+        // One second of audio starting at 98.5 s: at server time 100 s with a
+        // 1 s buffer, playout is 0.5 s into the chunk, so hard sync must seek
+        // there and start playing instead of discarding the chunk.
+        s.add_chunk(make_chunk(98, 500_000, 48000, f));
+        let mut buf = vec![0u8; 480 * f.frame_size() as usize];
+        assert!(s.get_player_chunk(100_000_000, 0, &mut buf, 480));
+        assert!(!s.hard_sync, "hard sync completes after seeking");
+        let pos = s.current.as_ref().unwrap().read_pos / f.frame_size() as usize;
+        assert_eq!(pos, 24000 + 480, "seeked 0.5 s, then played one buffer");
+    }
+
+    #[test]
+    fn read_continues_past_trailing_partial_frame() {
+        // A payload that isn't a whole number of frames (malformed PCM) must
+        // not stall the reader on the leftover bytes.
+        let f = fmt();
+        let mut s = Stream::new(f);
+        let mut odd = make_chunk(100, 0, 10, f);
+        odd.data.extend_from_slice(&[0xEE, 0xEE]);
+        s.add_chunk(odd);
+        s.add_chunk(make_chunk(100, 10_000, 10, f));
+        s.current = s.chunks.pop_front();
+        let mut out = vec![0u8; 15 * f.frame_size() as usize];
+        assert!(s.read_next(&mut out, 15).is_some());
+        assert_eq!(s.current.as_ref().unwrap().read_pos, 5 * 4);
+    }
+
+    #[test]
+    fn underrun_zeroes_unfilled_output() {
+        let f = fmt();
+        let mut s = Stream::new(f);
+        s.add_chunk(make_chunk(100, 0, 10, f));
+        s.current = s.chunks.pop_front();
+        let mut out = vec![0xAAu8; 20 * f.frame_size() as usize];
+        s.read_next(&mut out, 20);
+        assert!(out[40..].iter().all(|&b| b == 0), "no stale samples");
     }
 
     #[test]

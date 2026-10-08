@@ -2,27 +2,20 @@
 
 use std::sync::{Arc, Mutex};
 
-use snapcast_client::AudioFrame;
 use snapcast_client::connection::now_usec;
 use snapcast_client::stream::{SampleEncoding, Stream};
 use snapcast_client::time_provider::TimeProvider;
-use tokio::sync::mpsc;
+use snapcast_proto::SampleFormat;
 
 use crate::mixer::VolumeState;
 
-/// Start audio output. Waits for the Stream to have audio, then starts cpal.
+/// Run audio output forever: wait for the Stream to have a format, play it
+/// through cpal, and restart whenever the format changes or output fails.
 pub async fn play_audio(
-    rx: mpsc::Receiver<AudioFrame>,
     stream: Arc<Mutex<Stream>>,
     time_provider: Arc<Mutex<TimeProvider>>,
     volume: Arc<VolumeState>,
 ) {
-    // Drain audio_rx in background
-    tokio::spawn(async move {
-        let mut rx = rx;
-        while rx.recv().await.is_some() {}
-    });
-
     loop {
         // Wait for the Stream to have a valid format
         let (format, encoding) = loop {
@@ -43,38 +36,55 @@ pub async fn play_audio(
             "Audio format detected"
         );
 
-        // Run cpal on dedicated thread.
+        // cpal blocks its thread until the format changes; run it off the executor.
         let stream_clone = Arc::clone(&stream);
         let tp_clone = Arc::clone(&time_provider);
         let vol_clone = Arc::clone(&volume);
-
-        // We use spawn_blocking to wait for the thread without blocking the executor
         let result = tokio::task::spawn_blocking(move || {
-            let handle = std::thread::spawn(move || {
-                run_cpal(stream_clone, tp_clone, format, encoding, vol_clone)
-            });
-            handle.join()
+            run_cpal(stream_clone, tp_clone, format, encoding, vol_clone)
         })
         .await;
 
         match result {
-            Ok(Ok(Ok(_))) => {
+            Ok(Ok(())) => {
                 tracing::info!("Audio format change detected, restarting player");
             }
-            Ok(Ok(Err(e))) => {
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "Audio output failed, retrying in 1s");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            Ok(Err(_)) => {
-                tracing::error!("Audio thread panicked, restarting in 1s");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
             Err(e) => {
-                tracing::error!(error = %e, "Task join failed, restarting in 1s");
+                tracing::error!(error = %e, "Audio thread failed, restarting in 1s");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
     }
+}
+
+/// Pick the device config for `format`: the exact rate and channel count if
+/// supported, else the exact rate with another channel count (channels are
+/// remapped), else the device default. Returns whether the rate differs.
+fn select_config(
+    device: &cpal::Device,
+    format: SampleFormat,
+) -> anyhow::Result<(cpal::StreamConfig, bool)> {
+    use cpal::traits::DeviceTrait;
+
+    let supported: Vec<_> = device.supported_output_configs()?.collect();
+    let has_rate = |f: &&cpal::SupportedStreamConfigRange| {
+        (f.min_sample_rate()..=f.max_sample_rate()).contains(&format.rate())
+    };
+    let matching = supported
+        .iter()
+        .filter(has_rate)
+        .find(|f| f.channels() == format.channels())
+        .or_else(|| supported.iter().find(has_rate));
+    if let Some(f) = matching {
+        return Ok((f.with_sample_rate(format.rate()).into(), false));
+    }
+    let config: cpal::StreamConfig = device.default_output_config()?.into();
+    let resample = config.sample_rate != format.rate();
+    Ok((config, resample))
 }
 
 fn run_cpal(
@@ -93,44 +103,43 @@ fn run_cpal(
 
     tracing::info!(device = %device.description().map(|d| d.name().to_string()).unwrap_or_default(), "Using audio device");
 
-    // Try to match stream format, fallback to default if unsupported
-    let supported_formats = device.supported_output_configs()?;
-    let mut target_config = None;
-    for f in supported_formats {
-        if f.channels() == format.channels()
-            && f.min_sample_rate() <= format.rate()
-            && f.max_sample_rate() >= format.rate()
-        {
-            target_config = Some(f.with_sample_rate(format.rate()));
-            break;
-        }
-    }
-
-    let (config, _use_resampler): (cpal::StreamConfig, bool) = if let Some(c) = target_config {
-        (c.into(), false)
-    } else {
-        tracing::warn!("Stream format not supported by device, using default and resampling");
-        let c = device.default_output_config()?;
-        (c.into(), true)
-    };
-
+    let (config, needs_resampling) = select_config(&device, format)?;
     let device_rate = config.sample_rate;
     let device_channels = config.channels as usize;
+    if device_channels != format.channels() as usize {
+        tracing::warn!(
+            stream = format.channels(),
+            device = device_channels,
+            "Device can't play the stream's channel count, remapping channels"
+        );
+    }
 
     #[cfg(feature = "resampler")]
-    let mut resampler = if _use_resampler {
-        let device_format =
-            snapcast_proto::SampleFormat::new(device_rate, 16, device_channels as u16);
-        // We assume 20ms chunks for resampler init (typical for Snapcast)
+    let mut resampled = if needs_resampling {
+        tracing::warn!(
+            stream = format.rate(),
+            device = device_rate,
+            "Device can't play the stream's sample rate, resampling"
+        );
+        let device_format = SampleFormat::new(device_rate, 32, format.channels());
+        // 20 ms resampler chunks (a typical Snapcast chunk size)
         snapcast_client::resampler::Resampler::new_if_needed(
             format,
             device_format,
             encoding,
             (format.rate() / 50) as usize,
         )?
+        .map(ResampledOutput::new)
     } else {
         None
     };
+    #[cfg(not(feature = "resampler"))]
+    if needs_resampling {
+        anyhow::bail!(
+            "device can't play {} Hz (it uses {device_rate} Hz); build with the `resampler` feature",
+            format.rate()
+        );
+    }
 
     let stream_cb = Arc::clone(&stream);
     let tp_cb = Arc::clone(&time_provider);
@@ -156,72 +165,32 @@ fn run_cpal(
             };
 
             let mut s = stream_cb.lock().unwrap_or_else(|e| e.into_inner());
-            let current_format = s.format();
-            let current_encoding = s.encoding();
 
-            // Format change detection
-            if current_format.rate() != format.rate()
-                || current_format.channels() != format.channels()
-                || current_encoding != encoding
-            {
-                // Return silence and hope the main loop picks up the change
-                data.fill(0.0);
-                return;
-            }
-
-            let frame_size = current_format.frame_size() as usize;
-            if frame_size == 0 {
+            // Format change: play silence until the outer loop restarts us
+            if s.format() != format || s.encoding() != encoding {
                 data.fill(0.0);
                 return;
             }
 
             #[cfg(feature = "resampler")]
-            if let Some(ref mut r) = resampler {
-                // Resampling: we need to calculate how many input frames we need to get num_frames output
-                // Rubato FftFixedIn is easier if we just process what we get.
-                // For simplicity, we read a block from Stream, resample it, and buffer the rest.
-                // But cpal callback must be fast.
-                // A better approach is to have Stream return what it has and resample that.
-
-                // For now, let's do a simple implementation that matches the requested output frames
-                let input_frames =
-                    (num_frames as f64 * format.rate() as f64 / device_rate as f64).ceil() as usize;
-                pcm_buf.resize(input_frames * frame_size, 0);
-                s.get_player_chunk_or_silence(
+            let done = if let Some(ref mut r) = resampled {
+                r.render(
+                    &mut s,
                     server_now,
                     buffer_dac_usec,
-                    &mut pcm_buf,
-                    input_frames as u32,
-                );
-                drop(s);
-
-                if let Err(e) = r.process(&mut pcm_buf) {
-                    tracing::error!(error = %e, "Resampling failed");
-                    data.fill(0.0);
-                    return;
-                }
-
-                write_samples_to_output(
+                    device_rate,
                     data,
-                    &pcm_buf,
-                    snapcast_proto::SampleFormat::new(device_rate, 32, device_channels as u16),
-                    SampleEncoding::Float32,
+                    device_channels,
                 );
+                true
             } else {
-                pcm_buf.resize(num_frames * frame_size, 0);
-                s.get_player_chunk_or_silence(
-                    server_now,
-                    buffer_dac_usec,
-                    &mut pcm_buf,
-                    num_frames as u32,
-                );
-                drop(s);
-
-                write_samples_to_output(data, &pcm_buf, current_format, current_encoding);
-            }
+                false
+            };
             #[cfg(not(feature = "resampler"))]
-            {
-                pcm_buf.resize(num_frames * frame_size, 0);
+            let done = false;
+
+            if !done {
+                pcm_buf.resize(num_frames * format.frame_size() as usize, 0);
                 s.get_player_chunk_or_silence(
                     server_now,
                     buffer_dac_usec,
@@ -229,8 +198,7 @@ fn run_cpal(
                     num_frames as u32,
                 );
                 drop(s);
-
-                write_samples_to_output(data, &pcm_buf, current_format, current_encoding);
+                write_samples_to_output(data, device_channels, &pcm_buf, format, encoding);
             }
 
             // Apply software volume
@@ -251,72 +219,191 @@ fn run_cpal(
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let s = stream.lock().unwrap_or_else(|e| e.into_inner());
-        let current_format = s.format();
-        if current_format.rate() != format.rate()
-            || current_format.channels() != format.channels()
-            || s.encoding() != encoding
-        {
+        if s.format() != format || s.encoding() != encoding {
             return Ok(());
         }
     }
 }
 
-fn write_samples_to_output(
-    output: &mut [f32],
-    samples: &[u8],
-    format: snapcast_proto::SampleFormat,
-    encoding: SampleEncoding,
-) {
-    output.fill(0.0);
-    match encoding {
-        SampleEncoding::Float32 => {
-            for (i, chunk) in samples
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .take(output.len())
-                .enumerate()
-            {
-                output[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+/// Resampled output: stream frames are resampled in whole resampler chunks,
+/// and the output not yet played is kept for the next callbacks.
+#[cfg(feature = "resampler")]
+struct ResampledOutput {
+    resampler: snapcast_client::resampler::Resampler,
+    in_buf: Vec<u8>,
+    /// Resampled interleaved samples (stream channel layout) not yet played.
+    out: std::collections::VecDeque<f32>,
+}
+
+#[cfg(feature = "resampler")]
+impl ResampledOutput {
+    fn new(resampler: snapcast_client::resampler::Resampler) -> Self {
+        Self {
+            resampler,
+            in_buf: Vec::new(),
+            out: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Fill `data` (device layout) from the stream via the resampler.
+    fn render(
+        &mut self,
+        stream: &mut Stream,
+        server_now: i64,
+        buffer_dac_usec: i64,
+        device_rate: u32,
+        data: &mut [f32],
+        device_channels: usize,
+    ) {
+        let format = stream.format();
+        let channels = format.channels() as usize;
+        let frames = data.len() / device_channels;
+        while self.out.len() < frames * channels {
+            // Output already queued, plus the resampler's latency, plays
+            // before the frames read now.
+            let ahead_frames = self.out.len() / channels + self.resampler.output_delay();
+            let dac_usec = buffer_dac_usec + ahead_frames as i64 * 1_000_000 / device_rate as i64;
+            let in_frames = self.resampler.input_frames_until_output();
+            self.in_buf
+                .resize(in_frames * format.frame_size() as usize, 0);
+            stream.get_player_chunk_or_silence(
+                server_now,
+                dac_usec,
+                &mut self.in_buf,
+                in_frames as u32,
+            );
+            if let Err(e) = self.resampler.process(&mut self.in_buf) {
+                tracing::error!(error = %e, "Resampling failed");
+                break;
+            }
+            if self.in_buf.is_empty() {
+                break;
+            }
+            self.out.extend(
+                self.in_buf
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+        }
+
+        let available = (self.out.len() / channels).min(frames);
+        data.fill(0.0);
+        for (frame, out) in data
+            .chunks_exact_mut(device_channels)
+            .take(available)
+            .enumerate()
+        {
+            for (c, sample) in out.iter_mut().enumerate() {
+                *sample = self.out[frame * channels + c % channels];
             }
         }
-        SampleEncoding::PcmInt => match format.bits() {
-            16 => {
-                for (i, chunk) in samples
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .take(output.len())
-                    .enumerate()
-                {
-                    output[i] = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
-                }
-            }
-            24 => {
-                for (i, chunk) in samples
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .take(output.len())
-                    .enumerate()
-                {
-                    output[i] = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
-                        / snapcast_proto::PCM_24BIT_MAX;
-                }
-            }
-            32 => {
-                for (i, chunk) in samples
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .take(output.len())
-                    .enumerate()
-                {
-                    output[i] = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32
-                        / i32::MAX as f32;
-                }
-            }
-            _ => output.fill(0.0),
-        },
+        self.out.drain(..available * channels);
+    }
+}
+
+/// Decode one sample of `samples` at sample index `idx` to f32.
+fn sample_at(samples: &[u8], idx: usize, format: SampleFormat, encoding: SampleEncoding) -> f32 {
+    let bytes = |n: usize| samples.get(idx * n..idx * n + n);
+    match (encoding, format.bits()) {
+        (SampleEncoding::Float32, _) => {
+            bytes(4).map_or(0.0, |b| f32::from_le_bytes(b.try_into().unwrap()))
+        }
+        (SampleEncoding::PcmInt, 16) => bytes(2).map_or(0.0, |b| {
+            i16::from_le_bytes(b.try_into().unwrap()) as f32 / i16::MAX as f32
+        }),
+        (SampleEncoding::PcmInt, 24) => bytes(4).map_or(0.0, |b| {
+            i32::from_le_bytes(b.try_into().unwrap()) as f32 / snapcast_proto::PCM_24BIT_MAX
+        }),
+        (SampleEncoding::PcmInt, 32) => bytes(4).map_or(0.0, |b| {
+            i32::from_le_bytes(b.try_into().unwrap()) as f32 / i32::MAX as f32
+        }),
+        _ => 0.0,
+    }
+}
+
+/// Convert interleaved stream samples to the device's f32 output, mapping the
+/// stream's channels onto the device's (device channel `c` plays stream
+/// channel `c % stream_channels`, so mono feeds every output).
+fn write_samples_to_output(
+    output: &mut [f32],
+    output_channels: usize,
+    samples: &[u8],
+    format: SampleFormat,
+    encoding: SampleEncoding,
+) {
+    let channels = format.channels() as usize;
+    if channels == 0 || output_channels == 0 {
+        output.fill(0.0);
+        return;
+    }
+    for (frame, out) in output.chunks_exact_mut(output_channels).enumerate() {
+        for (c, sample) in out.iter_mut().enumerate() {
+            *sample = sample_at(samples, frame * channels + c % channels, format, encoding);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn i16_bytes(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn writes_matching_layout() {
+        let f = SampleFormat::new(48000, 16, 2);
+        let mut out = [9.0f32; 4];
+        write_samples_to_output(
+            &mut out,
+            2,
+            &i16_bytes(&[i16::MAX, 0, 0, -i16::MAX]),
+            f,
+            SampleEncoding::PcmInt,
+        );
+        assert_eq!(out, [1.0, 0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn mono_stream_feeds_every_device_channel() {
+        let f = SampleFormat::new(48000, 16, 1);
+        let mut out = [9.0f32; 4];
+        write_samples_to_output(
+            &mut out,
+            2,
+            &i16_bytes(&[i16::MAX, 0]),
+            f,
+            SampleEncoding::PcmInt,
+        );
+        assert_eq!(out, [1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stereo_stream_on_mono_device_keeps_frame_alignment() {
+        let f = SampleFormat::new(48000, 32, 2);
+        let samples: Vec<u8> = [0.1f32, 0.2, 0.3, 0.4]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut out = [9.0f32; 2];
+        write_samples_to_output(&mut out, 1, &samples, f, SampleEncoding::Float32);
+        assert_eq!(out, [0.1, 0.3]);
+    }
+
+    #[test]
+    fn short_input_is_silence() {
+        let f = SampleFormat::new(48000, 16, 2);
+        let mut out = [9.0f32; 4];
+        write_samples_to_output(
+            &mut out,
+            2,
+            &i16_bytes(&[i16::MAX]),
+            f,
+            SampleEncoding::PcmInt,
+        );
+        assert_eq!(out, [1.0, 0.0, 0.0, 0.0]);
     }
 }

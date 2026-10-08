@@ -29,7 +29,8 @@ pub struct Controller {
     settings: crate::ClientConfig,
     connection: SnapConnection,
     time_provider: Arc<Mutex<TimeProvider>>,
-    stream: Option<Arc<Mutex<Stream>>>,
+    /// Shared with the binary's player; never replaced, only reinitialized.
+    stream: Arc<Mutex<Stream>>,
     decoder: Option<Box<dyn Decoder>>,
     sample_format: SampleFormat,
     sample_encoding: SampleEncoding,
@@ -37,6 +38,8 @@ pub struct Controller {
     event_tx: mpsc::Sender<ClientEvent>,
     audio_tx: mpsc::Sender<crate::AudioFrame>,
     command_rx: mpsc::Receiver<ClientCommand>,
+    /// Consecutive failed sessions; reset once a handshake succeeds.
+    failed_attempts: u32,
 }
 
 impl Controller {
@@ -55,7 +58,7 @@ impl Controller {
             connection,
             settings,
             time_provider,
-            stream: Some(stream),
+            stream,
             decoder: None,
             sample_format: SampleFormat::default(),
             sample_encoding: SampleEncoding::PcmInt,
@@ -63,12 +66,15 @@ impl Controller {
             event_tx,
             audio_tx,
             command_rx,
+            failed_attempts: 0,
         })
     }
 
     /// Run the client, reconnecting on errors until stopped.
+    ///
+    /// The reconnect delay grows by one second per consecutive failure (capped
+    /// at [`MAX_RECONNECT_DELAY_SECS`]) and resets after a successful handshake.
     pub async fn run(&mut self) -> Result<()> {
-        let mut attempts = 0u32;
         loop {
             match self.session().await {
                 Ok(()) => {
@@ -76,20 +82,24 @@ impl Controller {
                     return Ok(());
                 }
                 Err(e) => {
-                    if attempts == 0 {
+                    if self.failed_attempts == 0 {
                         tracing::warn!("Connection failed: {e}");
                     } else {
-                        tracing::debug!("Reconnect attempt {attempts} failed: {e}");
+                        tracing::debug!("Reconnect attempt {} failed: {e}", self.failed_attempts);
                     }
                     self.emit(ClientEvent::Disconnected {
                         reason: e.to_string(),
                     });
-                    attempts = attempts.saturating_add(1);
+                    self.failed_attempts = self.failed_attempts.saturating_add(1);
                 }
             }
             self.cleanup();
-            let delay = Duration::from_secs(attempts.min(MAX_RECONNECT_DELAY_SECS) as u64);
-            tokio::time::sleep(delay).await;
+            let delay =
+                Duration::from_secs(self.failed_attempts.min(MAX_RECONNECT_DELAY_SECS) as u64);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = wait_for_stop(&mut self.command_rx) => return Ok(()),
+            }
         }
     }
 
@@ -98,7 +108,11 @@ impl Controller {
             bail!("No server host configured — specify a server address");
         }
 
-        self.connection.connect().await?;
+        // Connecting can take long (e.g. an unreachable host); stay stoppable.
+        tokio::select! {
+            res = self.connection.connect() => res?,
+            _ = wait_for_stop(&mut self.command_rx) => return Ok(()),
+        }
         tracing::info!(
             scheme = %self.settings.scheme,
             host = %self.settings.host,
@@ -111,6 +125,7 @@ impl Controller {
         });
 
         self.send_hello().await?;
+        self.failed_attempts = 0;
         self.receive_loop().await
     }
 
@@ -155,6 +170,8 @@ impl Controller {
                         volume: ss.volume,
                         muted: ss.muted,
                     });
+                    // A CodecHeader may already have set up the stream.
+                    self.apply_server_settings(&ss);
                     self.server_settings = Some(ss);
                     return Ok(());
                 }
@@ -240,32 +257,30 @@ impl Controller {
                 if let Some(ref mut dec) = self.decoder {
                     let mut data = wc.payload;
                     if dec.decode(&mut data)? {
+                        // Also send to the external audio receiver, if still listening
+                        if !self.audio_tx.is_closed() {
+                            let samples =
+                                samples_to_f32(&data, self.sample_format, self.sample_encoding);
+                            if !samples.is_empty() {
+                                let _ = self.audio_tx.try_send(crate::AudioFrame {
+                                    samples,
+                                    sample_rate: self.sample_format.rate(),
+                                    channels: self.sample_format.channels(),
+                                    timestamp_usec: wc.timestamp.to_usec(),
+                                });
+                            }
+                        }
+
                         let chunk = PcmChunk::new_with_encoding(
                             wc.timestamp,
-                            data.clone(),
+                            data,
                             self.sample_format,
                             self.sample_encoding,
                         );
-                        if let Some(ref stream) = self.stream {
-                            stream
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .add_chunk(chunk);
-                        }
-
-                        // Also send to external audio_tx
-                        let samples =
-                            samples_to_f32(&data, self.sample_format, self.sample_encoding);
-
-                        if !samples.is_empty() {
-                            let _ = self.audio_tx.try_send(crate::AudioFrame {
-                                samples,
-                                sample_rate: self.sample_format.rate(),
-                                channels: self.sample_format.channels(),
-                                timestamp_usec: wc.timestamp.sec as i64 * 1_000_000
-                                    + wc.timestamp.usec as i64,
-                            });
-                        }
+                        self.stream
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add_chunk(chunk);
                     }
                 }
             }
@@ -290,7 +305,7 @@ impl Controller {
                 let s2c = msg.base.received - msg.base.sent;
                 self.time_provider
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .set_diff(&t.latency, &s2c);
             }
             MessagePayload::Error(e) => {
@@ -301,14 +316,17 @@ impl Controller {
         Ok(())
     }
 
-    fn apply_server_settings(&mut self, ss: &ServerSettings) {
-        if let Some(ref stream) = self.stream {
-            let buf_ms = (ss.buffer_ms - ss.latency - self.settings.latency).max(0);
-            stream
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_buffer_ms(buf_ms as i64);
-        }
+    /// Playout buffer for the stream: server buffer minus server- and
+    /// client-side latency (as C++ `Controller`).
+    fn buffer_ms(&self, ss: &ServerSettings) -> i64 {
+        i64::from((ss.buffer_ms - ss.latency - self.settings.latency).max(0))
+    }
+
+    fn apply_server_settings(&self, ss: &ServerSettings) {
+        self.stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_buffer_ms(self.buffer_ms(ss));
     }
 
     fn init_audio_pipeline(&mut self, header: &CodecHeader) -> Result<()> {
@@ -329,14 +347,11 @@ impl Controller {
         });
 
         // Reinitialize the shared stream (binary's player holds the same Arc)
-        if let Some(ref stream) = self.stream {
-            let mut s = stream.lock().unwrap_or_else(|e| e.into_inner());
-            *s = Stream::with_encoding(self.sample_format, self.sample_encoding);
-            if let Some(ref ss) = self.server_settings {
-                let buf_ms = (ss.buffer_ms - ss.latency - self.settings.latency).max(0);
-                s.set_buffer_ms(buf_ms as i64);
-            }
+        let mut stream = Stream::with_encoding(self.sample_format, self.sample_encoding);
+        if let Some(ref ss) = self.server_settings {
+            stream.set_buffer_ms(self.buffer_ms(ss));
         }
+        *self.stream.lock().unwrap_or_else(|e| e.into_inner()) = stream;
 
         self.decoder = Some(dec);
         Ok(())
@@ -349,13 +364,23 @@ impl Controller {
     }
 
     fn cleanup(&mut self) {
-        // Don't clear self.stream — it's shared with the binary's player
+        // Keep self.stream — it's shared with the binary's player
         self.decoder = None;
         self.connection.disconnect();
     }
 
     fn emit(&self, event: ClientEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+}
+
+/// Resolve once a `Stop` command arrives or every command sender is gone,
+/// discarding other commands (nothing to forward them to while disconnected).
+async fn wait_for_stop(command_rx: &mut mpsc::Receiver<ClientCommand>) {
+    while let Some(cmd) = command_rx.recv().await {
+        if matches!(cmd, ClientCommand::Stop) {
+            return;
+        }
     }
 }
 
@@ -578,6 +603,108 @@ mod tests {
     }
 
     // ---- session ----
+
+    fn wav_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"RIFF");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h.extend_from_slice(b"WAVE");
+        h.extend_from_slice(b"fmt ");
+        h.extend_from_slice(&16u32.to_le_bytes());
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.extend_from_slice(&2u16.to_le_bytes());
+        h.extend_from_slice(&48000u32.to_le_bytes());
+        h.extend_from_slice(&192000u32.to_le_bytes());
+        h.extend_from_slice(&4u16.to_le_bytes());
+        h.extend_from_slice(&16u16.to_le_bytes());
+        h.extend_from_slice(b"data");
+        h.extend_from_slice(&0u32.to_le_bytes());
+        h
+    }
+
+    /// Server stand-in: reads Hello, sends CodecHeader *before* ServerSettings,
+    /// then closes the connection.
+    async fn handshake_then_close(listener: tokio::net::TcpListener) {
+        use snapcast_proto::message::factory;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        while factory::take_frame(&mut buf).unwrap().is_none() {
+            assert!(sock.read_buf(&mut buf).await.unwrap() > 0);
+        }
+        let header = MessagePayload::CodecHeader(CodecHeader {
+            codec: "pcm".into(),
+            payload: wav_header(),
+        });
+        let settings = MessagePayload::ServerSettings(ServerSettings {
+            buffer_ms: 800,
+            latency: 100,
+            volume: 50,
+            muted: false,
+        });
+        for (msg_type, payload) in [
+            (MessageType::CodecHeader, header),
+            (MessageType::ServerSettings, settings),
+        ] {
+            let frame = factory::serialize(&mut base(msg_type), &payload).unwrap();
+            sock.write_all(&frame).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_applies_settings_and_resets_backoff() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(handshake_then_close(listener));
+
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (audio_tx, _audio_rx) = mpsc::channel(8);
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::default())));
+        let cfg = crate::ClientConfig {
+            host: "127.0.0.1".into(),
+            port,
+            latency: 50,
+            ..Default::default()
+        };
+        let tp = Arc::new(Mutex::new(TimeProvider::new()));
+        let mut ctrl =
+            Controller::new(cfg, event_tx, cmd_rx, audio_tx, tp, Arc::clone(&stream)).unwrap();
+        ctrl.failed_attempts = 5;
+
+        // The server hangs up after the handshake, so the session ends in error.
+        assert!(ctrl.session().await.is_err());
+        assert_eq!(ctrl.failed_attempts, 0, "handshake succeeded");
+        let s = stream.lock().unwrap();
+        assert_eq!(s.format().rate(), 48000);
+        assert_eq!(s.buffer_ms(), 800 - 100 - 50);
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_reconnect_delay() {
+        // A port nobody listens on: every connection attempt fails at once.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg = crate::ClientConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        let (mut client, mut events, _audio) = crate::SnapClient::new(cfg);
+        let cmd = client.command_sender();
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                if matches!(ev, ClientEvent::Disconnected { .. }) {
+                    cmd.send(ClientCommand::Stop).await.unwrap();
+                }
+            }
+        });
+        // The first reconnect delay is 1 s; Stop must end run() well before.
+        let res = tokio::time::timeout(Duration::from_millis(500), client.run()).await;
+        assert!(matches!(res, Ok(Ok(()))), "run() should stop promptly");
+    }
 
     #[tokio::test]
     async fn session_without_host_bails_before_connecting() {

@@ -1,6 +1,7 @@
 [package]
 name = "snapclient-rs"
 description = "Snapcast client — synchronized multiroom audio player"
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

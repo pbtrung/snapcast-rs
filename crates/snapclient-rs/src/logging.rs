@@ -2,7 +2,8 @@
 //!
 //! Sink options: `stdout`, `stderr`, `null`, `system`, `file:<path>`
 //! Filter format: `<tag>:<level>[,<tag>:<level>]*`
-//!   - tag: `*` (all) or a module name like `Stream`, `Controller`
+//!   - tag: `*` (all), a component like `Stream`, `Controller`, `Stats`, or a
+//!     tracing target
 //!   - level: trace, debug, info, notice, warning, error, fatal
 
 use anyhow::{Result, bail};
@@ -10,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 /// Convert snapcast-style log filter to tracing EnvFilter syntax.
 ///
-/// Snapcast: `*:info,Stream:debug` → tracing: `info,snapclient_rs::stream=debug`
+/// Snapcast: `*:info,Stream:debug` → tracing: `info,snapcast_client::stream=debug`
 fn convert_filter(filter: &str) -> String {
     filter
         .split(',')
@@ -28,18 +29,21 @@ fn convert_filter(filter: &str) -> String {
                 level.to_string()
             } else {
                 let tag_lower = tag.to_lowercase();
+                // Tracing targets: module paths in the client library, plus
+                // the literal `Stats` target of the stream's sync statistics.
                 let module = match tag_lower.as_str() {
-                    "stream" => "snapclient_rs::stream",
-                    "controller" => "snapclient_rs::controller",
-                    "connection" => "snapclient_rs::connection",
-                    "timeprovider" => "snapclient_rs::time_provider",
+                    "stream" => "snapcast_client::stream",
+                    "controller" => "snapcast_client::controller",
+                    "connection" => "snapcast_client::connection",
+                    "timeprovider" => "snapcast_client::time_provider",
                     "player" | "coreaudioplayer" | "alsaplayer" | "pulseplayer" => {
                         "snapclient_rs::player"
                     }
-                    "flac" | "flacdecoder" => "snapclient_rs::decoder::flac",
-                    "opus" | "opusdecoder" => "snapclient_rs::decoder::opus",
-                    "stats" | "latency" => "snapclient_rs::stream",
-                    other => other,
+                    "mixer" => "snapclient_rs::mixer",
+                    "flac" | "flacdecoder" => "snapcast_client::decoder::flac",
+                    "opus" | "opusdecoder" => "snapcast_client::decoder::opus",
+                    "stats" | "latency" => "Stats",
+                    _ => tag,
                 };
                 format!("{module}={level}")
             }
@@ -120,7 +124,7 @@ mod tests {
     #[test]
     fn convert_multi_filter() {
         let result = convert_filter("*:info,Stream:debug");
-        assert_eq!(result, "info,snapclient_rs::stream=debug");
+        assert_eq!(result, "info,snapcast_client::stream=debug");
     }
 
     #[test]
@@ -141,6 +145,11 @@ mod tests {
     #[test]
     fn convert_controller_tag() {
         let result = convert_filter("Controller:trace");
-        assert_eq!(result, "snapclient_rs::controller=trace");
+        assert_eq!(result, "snapcast_client::controller=trace");
+    }
+
+    #[test]
+    fn convert_stats_tag_to_stats_target() {
+        assert_eq!(convert_filter("Stats:debug"), "Stats=debug");
     }
 }

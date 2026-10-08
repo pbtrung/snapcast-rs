@@ -67,11 +67,13 @@ fn parse_riff_header(payload: &[u8]) -> Result<SampleFormat> {
             // byte_rate: u32 at +8 (skip)
             // block_align: u16 at +12 (skip)
             bits_per_sample = u16::from_le_bytes(payload[pos + 14..pos + 16].try_into().unwrap());
-            pos += chunk_size;
+            pos = pos.saturating_add(chunk_size);
         } else if chunk_id == b"data" {
             break;
         } else {
-            pos += chunk_size;
+            // Saturate: a huge size must end the walk, not wrap `pos` back
+            // into the payload (usize is 32 bits on e.g. armv7).
+            pos = pos.saturating_add(chunk_size);
         }
     }
 

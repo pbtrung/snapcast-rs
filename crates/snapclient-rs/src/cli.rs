@@ -27,11 +27,11 @@ pub struct Cli {
     #[arg(long = "hostID", default_value = "")]
     pub host_id: String,
 
-    /// List PCM devices
+    /// List PCM devices (macOS only)
     #[arg(short, long)]
     pub list: bool,
 
-    /// PCM device index or name
+    /// PCM device index or name (accepted for compatibility; the default output device is used)
     #[arg(short, long, default_value = "default")]
     pub soundcard: String,
 
@@ -39,15 +39,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub latency: i32,
 
-    /// Resample to `<rate>:<bits>:<channels>`
+    /// Resample to `<rate>:<bits>:<channels>` (accepted for compatibility; not applied)
     #[arg(long)]
     pub sampleformat: Option<String>,
 
-    /// Audio player backend and optional parameters: `<name>[:<params>|?]`
+    /// Audio player backend and optional parameters: `<name>[:<params>]` (accepted for compatibility; output always uses cpal)
     #[arg(long, default_value = "")]
     pub player: String,
 
-    /// Mixer mode: `software|hardware|script|none|?[:<params>]`
+    /// Mixer: `software[:poly|exp[:<param>]]`, `hardware[:<control>]`, `script` (falls back to software) or `none`
     #[arg(long, default_value = "software")]
     pub mixer: String,
 
@@ -56,12 +56,12 @@ pub struct Cli {
     #[arg(short, long)]
     pub daemon: Option<Option<i32>>,
 
-    /// The `user[:group]` to run snapclient as when daemonized
+    /// The `user[:group]` to run snapclient as when daemonized (not implemented yet)
     #[cfg(unix)]
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Log sink: null|system|stdout|stderr|file:`<path>`
+    /// Log sink: null|system|stdout|stderr|file:`<path>` (`system` logs to stderr)
     #[arg(long, default_value = "stdout")]
     pub logsink: String,
 

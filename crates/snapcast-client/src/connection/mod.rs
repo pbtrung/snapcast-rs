@@ -143,10 +143,13 @@ impl TcpConnection {
 
     /// Establish the TCP connection.
     pub async fn connect(&mut self) -> Result<()> {
-        let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect(&addr)
+        // A (host, port) pair also resolves bare IPv6 literals such as "::1",
+        // which a "host:port" string cannot express.
+        let stream = TcpStream::connect((self.host.as_str(), self.port))
             .await
-            .with_context(|| format!("connecting to {addr}"))?;
+            .with_context(|| format!("connecting to {}:{}", self.host, self.port))?;
+        // Time sync messages are tiny; don't let Nagle delay them.
+        stream.set_nodelay(true).context("setting TCP_NODELAY")?;
         self.stream = Some(stream);
         self.read_buf.clear();
         self.queued.clear();
@@ -538,6 +541,17 @@ mod tests {
             panic!("expected Time");
         };
         assert_eq!(t.latency.usec, 1, "unrelated message is kept for recv");
+    }
+
+    #[tokio::test]
+    async fn connect_to_bare_ipv6_literal() {
+        // Skip where the host has no IPv6 loopback.
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let mut conn = TcpConnection::new("::1", port);
+        conn.connect().await.unwrap();
     }
 
     // ---- steady-clock helpers ----

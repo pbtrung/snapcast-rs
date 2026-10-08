@@ -21,10 +21,11 @@ fn parse_opus_header(payload: &[u8]) -> Result<SampleFormat> {
     if payload.len() >= 19 && &payload[..8] == b"OpusHead" {
         let channels = payload[9] as u16;
         let rate = u32::from_le_bytes(payload[12..16].try_into().unwrap());
-        if channels == 0 || rate == 0 {
-            bail!("invalid OpusHead: rate={rate}, channels={channels}");
-        }
-        return Ok(SampleFormat::new(rate, 16, channels));
+        let format = SampleFormat::new(rate, 16, channels);
+        format
+            .validate_concrete_pcm()
+            .map_err(|e| anyhow::anyhow!("invalid OpusHead: {e}"))?;
+        return Ok(format);
     }
 
     if payload.len() < 12 {

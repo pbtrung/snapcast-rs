@@ -122,6 +122,19 @@ impl Resampler {
         Ok(())
     }
 
+    /// Input frames to pass to [`process`](Self::process) so that it emits
+    /// the next chunk of output (input already held back counts).
+    pub fn input_frames_until_output(&self) -> usize {
+        self.resampler
+            .input_frames_next()
+            .saturating_sub(self.pending.len() / self.channels)
+    }
+
+    /// Latency of the resampler in output frames.
+    pub fn output_delay(&self) -> usize {
+        self.resampler.output_delay()
+    }
+
     /// Output encoding is always f32.
     pub fn output_encoding(&self) -> SampleEncoding {
         SampleEncoding::Float32
@@ -205,5 +218,6 @@ mod tests {
         r.process(&mut data).unwrap();
         assert!(!data.is_empty());
         assert_eq!(r.pending.len(), (500 - frames) * 2);
+        assert_eq!(r.input_frames_until_output(), frames - (500 - frames));
     }
 }

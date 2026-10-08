@@ -52,15 +52,13 @@ impl TimeProvider {
         // Clear buffer if last sync was more than 60 seconds ago
         if let Some(last) = self.last_sync
             && now.duration_since(last) > Duration::from_secs(60)
-            && !self.diff_buffer.is_empty()
         {
-            self.diff_to_server_usec
-                .store((ms * 1000.0) as i64, Ordering::Relaxed);
             self.diff_buffer.clear();
         }
         self.last_sync = Some(now);
 
         self.diff_buffer.add((ms * 1000.0) as i64);
+        // Plain median, as C++ `TimeProvider::setDiffToServer`.
         let median = self.diff_buffer.median_simple();
         self.diff_to_server_usec.store(median, Ordering::Relaxed);
     }
