@@ -111,7 +111,7 @@ cargo build --release -p snapclient-rs --features resampler  # + client resampli
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.
 
-Pre-built Linux binaries for `x86_64` and `aarch64` are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>`. They need glibc 2.39+. They are built with Opus enabled. On Arch Linux, the server needs `avahi` and `opus` (`sudo pacman -S avahi opus`) and the client needs `alsa-lib`.
+Pre-built Linux binaries are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>` for `x86_64` and `aarch64`, each as `-unknown-linux-gnu` and `-unknown-linux-musl`. The server is built with Opus (libopus linked in statically). The gnu builds need glibc 2.34+, and the gnu client needs `alsa-lib`. The musl builds are fully static, but the static client can't load ALSA plugins such as PipeWire's, so use the gnu client on PipeWire/PulseAudio desktops. The binaries are built in an Arch Linux container with `docker-build/build.sh` (see [docker-build/README.md](docker-build/README.md)).
 
 Run the checks with `make check` (fmt, clippy, tests).
 

@@ -1,0 +1,33 @@
+#!/bin/sh
+# zig cc / zig c++ wrapper used as a musl cross C compiler.
+# Invoked through symlinks named <arch>-linux-musl-{cc,c++,ar,ranlib}.
+#
+# - strips the clang-style --target=<rust triple> that the cc crate adds
+#   (zig gets its own -target from the wrapper name);
+# - disables zig's default UBSan instrumentation (it would pull in the zig
+#   ubsan runtime, which rustc does not link) and stack probes.
+set -eu
+name=$(basename "$0")
+zigtarget=${name%-*}            # e.g. aarch64-linux-musl
+tool=${name##*-}                # cc | c++ | ar | ranlib
+case "$tool" in
+  ar)     exec zig ar "$@" ;;
+  ranlib) exec zig ranlib "$@" ;;
+  cc)     mode=cc ;;
+  c++)    mode=c++ ;;
+  *) echo "zig-cc-wrapper: unknown tool '$tool'" >&2; exit 2 ;;
+esac
+n=$#
+i=0
+skip_next=0
+for a in "$@"; do
+  i=$((i + 1))
+  if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+  case "$a" in
+    --target=*|-target=*) ;;                      # drop
+    -target|--target) skip_next=1 ;;              # drop with its value
+    *) set -- "$@" "$a" ;;
+  esac
+done
+shift "$n"
+exec zig "$mode" -target "$zigtarget" -fno-sanitize=all "$@"

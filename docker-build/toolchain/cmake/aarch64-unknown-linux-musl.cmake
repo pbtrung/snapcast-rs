@@ -1,0 +1,12 @@
+# CMake toolchain for aarch64-unknown-linux-musl (zig cc -target aarch64-linux-musl).
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_C_COMPILER /opt/toolchain/bin/aarch64-linux-musl-cc)
+set(CMAKE_CXX_COMPILER /opt/toolchain/bin/aarch64-linux-musl-c++)
+set(CMAKE_AR /opt/toolchain/bin/aarch64-linux-musl-ar CACHE FILEPATH "")
+set(CMAKE_RANLIB /opt/toolchain/bin/aarch64-linux-musl-ranlib CACHE FILEPATH "")
+set(CMAKE_FIND_ROOT_PATH /opt/sysroot/aarch64-unknown-linux-musl)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
