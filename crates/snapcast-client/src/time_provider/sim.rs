@@ -292,6 +292,34 @@ mod tests {
         assert!(stats.p95 < 200.0, "{stats}");
     }
 
+    fn scenario(name: &str) -> Scenario {
+        scenarios()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no scenario {name}"))
+    }
+
+    #[test]
+    fn symmetric_jitter_no_worse_than_plain_median() {
+        for name in ["symmetric jitter 300us", "symmetric jitter 2ms"] {
+            let s = scenario(name);
+            let plain = run(&s, &mut PlainMedian::new());
+            let tp = run(&s, &mut TimeProvider::new());
+            assert!(tp.p95 <= plain.p95 * 1.1, "{name}: {tp} vs {plain}");
+        }
+    }
+
+    #[test]
+    fn queued_replies_do_not_bias_the_estimate() {
+        for name in ["s2c queuing 50% x U(0,5ms)", "bursty load 80% x U(0,10ms)"] {
+            let stats = run(&scenario(name), &mut TimeProvider::new());
+            assert!(
+                stats.mean.abs() < 50.0 && stats.p95 < 100.0,
+                "{name}: {stats}"
+            );
+        }
+    }
+
     /// Prints the estimation error of the plain median (C++) and of
     /// `TimeProvider` for every scenario.
     #[test]
