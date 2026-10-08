@@ -3,8 +3,9 @@
 //! The Snapcast wire protocol carries FLAC as a header (the `fLaC` marker plus
 //! a STREAMINFO metadata block, sent once via [`Encoder::header`]) followed by
 //! a continuous run of raw FLAC frames — exactly one per `WireChunk`, since
-//! clients decode each chunk as a single packet, and never a per-chunk file. To produce that, this encoder buffers incoming interleaved
-//! PCM and emits fixed-size FLAC frames of [`BLOCK_SIZE`] samples each,
+//! clients decode each chunk as a single packet, and never a per-chunk file.
+//! To produce that, this encoder buffers incoming interleaved PCM and emits
+//! fixed-size FLAC frames of [`BLOCK_SIZE`] samples each,
 //! independent of how many frames the caller hands us per `encode` call. That
 //! matches the C++ Snapcast server (and the prior libFLAC-backed
 //! implementation): callers feed 1152-frame chunks for `pipe`/`tcp` sources

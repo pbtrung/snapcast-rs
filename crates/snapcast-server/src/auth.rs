@@ -109,7 +109,6 @@ impl AuthError {
 ///     }
 /// }
 /// ```
-/// Trait for validating streaming client credentials.
 pub trait AuthValidator: Send + Sync {
     /// Validate credentials from the Hello message's auth field.
     fn validate(&self, scheme: &str, param: &str) -> Result<AuthResult, AuthError>;

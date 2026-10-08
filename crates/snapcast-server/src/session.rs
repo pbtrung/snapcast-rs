@@ -11,17 +11,23 @@ use snapcast_proto::MessageType;
 use snapcast_proto::message::base::BaseMessage;
 use snapcast_proto::message::codec_header::CodecHeader;
 use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
+use snapcast_proto::message::hello::Hello;
 use snapcast_proto::message::server_settings::ServerSettings;
 use snapcast_proto::message::time::Time;
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 
 use crate::ClientSettingsUpdate;
 use crate::ServerEvent;
 use crate::WireChunkData;
 use crate::time::now_usec;
+
+/// Pause after a failed `accept`, so persistent failures (e.g. out of file
+/// descriptors) do not spin.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 // ── Routing ───────────────────────────────────────────────────
 
@@ -56,17 +62,16 @@ pub struct StreamCodecInfo {
 /// 0. `sessions` (active session per client id)
 /// 1. `shared_state` (server state — groups, clients, streams)
 /// 2. `routing_senders` (per-client watch channels)
-/// 3. `settings_senders` / `custom_senders` (per-client mpsc channels)
+/// 3. `settings_senders` (per-client watch channels)
 /// 4. `codec_headers` (per-stream codec info)
 ///
-/// Never hold a lower-numbered lock while acquiring a higher-numbered one.
+/// Never hold a higher-numbered lock while acquiring a lower-numbered one.
 /// In practice, most paths only need one or two locks:
 /// - Routing updates: `shared_state` → `routing_senders`
 /// - Settings push: `settings_senders` only
 /// - Codec lookup: `codec_headers` only
-/// - Client registration: `sessions`, then separately `shared_state`, then
-///   separately `routing_senders`
-/// - Client cleanup: `sessions` held while releasing everything else
+/// - Client registration and cleanup: `sessions` held while registering or
+///   releasing everything else
 struct SessionContext {
     buffer_ms: i32,
     auth: Option<Arc<dyn crate::auth::AuthValidator>>,
@@ -74,7 +79,9 @@ struct SessionContext {
     send_audio_to_muted: bool,
     /// Close a session that sends nothing for this long (`None` = never).
     idle_timeout: Option<Duration>,
-    settings_senders: Mutex<HashMap<String, mpsc::Sender<ClientSettingsUpdate>>>,
+    /// Latest settings per client. A watch channel, so pushing never waits
+    /// on a session that is stuck writing to its peer.
+    settings_senders: Mutex<HashMap<String, watch::Sender<ClientSettingsUpdate>>>,
     routing_senders: Mutex<HashMap<String, watch::Sender<SessionRouting>>>,
     codec_headers: Mutex<HashMap<String, StreamCodecInfo>>,
     /// The one live session per client id. A reconnect with the same id
@@ -93,23 +100,80 @@ struct ActiveSession {
     cancel: oneshot::Sender<()>,
 }
 
+/// What [`SessionContext::register_session`] hands a new session.
+struct Registration {
+    generation: u64,
+    /// Resolves when a newer session for the same client id takes over.
+    cancelled: oneshot::Receiver<()>,
+    settings_rx: watch::Receiver<ClientSettingsUpdate>,
+    routing_rx: watch::Receiver<SessionRouting>,
+    /// Settings to answer the Hello with.
+    initial_settings: ClientSettingsUpdate,
+    /// The client was in no group and got a new one.
+    joins_new_group: bool,
+}
+
 impl SessionContext {
-    /// Make a new session the owner of `client_id`, cancelling any previous
-    /// session for that id. Returns the new session's generation and its
-    /// cancellation signal.
-    async fn claim_session(&self, client_id: &str) -> (u64, oneshot::Receiver<()>) {
+    /// Make a new session the owner of `hello.id`, cancelling any previous
+    /// session for that id, and register its client and channels.
+    ///
+    /// `sessions` is held throughout, so registrations of two sessions for
+    /// the same id never interleave: otherwise a session replaced while
+    /// registering could overwrite its successor's channels.
+    async fn register_session(&self, hello: &Hello, peer: SocketAddr) -> Registration {
+        let client_id = &hello.id;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancelled) = oneshot::channel();
-        let previous = self
-            .sessions
-            .lock()
-            .await
-            .insert(client_id.to_string(), ActiveSession { generation, cancel });
+        let mut sessions = self.sessions.lock().await;
+        let previous = sessions.insert(client_id.clone(), ActiveSession { generation, cancel });
         if let Some(previous) = previous {
             tracing::info!(id = %client_id, "Client reconnected, replacing previous session");
             let _ = previous.cancel.send(());
         }
-        (generation, cancelled)
+
+        let (initial_settings, initial_routing, joins_new_group) = {
+            let mut s = self.shared_state.lock().await;
+            let c = s.get_or_create_client(client_id, &hello.host_name, &hello.mac);
+            c.update_from_hello(hello, &peer.ip().to_string());
+            c.connected = true;
+            let initial_settings = ClientSettingsUpdate {
+                client_id: client_id.clone(),
+                buffer_ms: self.buffer_ms,
+                latency: c.config.latency,
+                volume: c.config.volume.percent,
+                muted: c.config.volume.muted,
+            };
+            let joins_new_group = !s.groups.iter().any(|g| g.clients.contains(client_id));
+            s.group_for_client(client_id, &self.default_stream);
+            let initial_routing =
+                Self::build_routing(&s, client_id).unwrap_or_else(|| SessionRouting {
+                    stream_id: self.default_stream.clone(),
+                    client_muted: false,
+                    group_muted: false,
+                });
+            (initial_settings, initial_routing, joins_new_group)
+        };
+
+        let (routing_tx, routing_rx) = watch::channel(initial_routing);
+        self.routing_senders
+            .lock()
+            .await
+            .insert(client_id.clone(), routing_tx);
+        let (settings_tx, settings_rx) = watch::channel(initial_settings.clone());
+        self.settings_senders
+            .lock()
+            .await
+            .insert(client_id.clone(), settings_tx);
+        drop(sessions);
+
+        Registration {
+            generation,
+            cancelled,
+            settings_rx,
+            routing_rx,
+            initial_settings,
+            joins_new_group,
+        }
     }
 
     /// Release a session's registrations. Only the session that still owns
@@ -262,14 +326,13 @@ impl SessionServer {
         );
     }
 
-    /// Push a settings update to a specific streaming client.
+    /// Push a settings update to a specific streaming client. Never waits
+    /// for the client: a session that has not yet written an earlier update
+    /// writes only the latest one.
     pub async fn push_settings(&self, update: ClientSettingsUpdate) {
-        let tx = {
-            let senders = self.ctx.settings_senders.lock().await;
-            senders.get(&update.client_id).cloned()
-        };
-        if let Some(tx) = tx {
-            let _ = tx.send(update).await;
+        let senders = self.ctx.settings_senders.lock().await;
+        if let Some(tx) = senders.get(&update.client_id) {
+            tx.send_replace(update);
         }
     }
 
@@ -288,42 +351,60 @@ impl SessionServer {
         self.ctx.push_routing_all().await;
     }
 
-    /// Run the session server — accepts connections and spawns per-client tasks.
+    /// Run the session server — accepts connections and spawns per-client
+    /// tasks. Runs until dropped, which also ends every client session.
     pub async fn run(
         &self,
         listener: TcpListener,
         mut incoming: mpsc::Receiver<IncomingClient>,
         chunk_rx: broadcast::Sender<WireChunkData>,
         event_tx: mpsc::Sender<ServerEvent>,
-    ) -> Result<()> {
+    ) {
         tracing::info!(
             local_addr = ?listener.local_addr().ok(),
             "Stream server accepting clients"
         );
 
+        // Owned here so that dropping `run` (server stop) aborts every session.
+        let mut clients = JoinSet::new();
         let mut incoming_open = true;
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    stream.set_nodelay(true).ok();
-                    let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(10));
-                    let sock = socket2::SockRef::from(&stream);
-                    sock.set_tcp_keepalive(&ka).ok();
-                    self.spawn_client(stream, peer, "tcp", &chunk_rx, &event_tx);
-                }
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        stream.set_nodelay(true).ok();
+                        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10));
+                        let sock = socket2::SockRef::from(&stream);
+                        sock.set_tcp_keepalive(&ka).ok();
+                        self.spawn_client(&mut clients, stream, peer, "tcp", &chunk_rx, &event_tx);
+                    }
+                    // Failures such as an aborted handshake or running out of
+                    // file descriptors are transient: keep accepting.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Accepting a client failed");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    }
+                },
                 client = incoming.recv(), if incoming_open => match client {
                     Some(client) => {
-                        self.spawn_client(client.transport, client.peer, "external", &chunk_rx, &event_tx);
+                        self.spawn_client(&mut clients, client.transport, client.peer, "external", &chunk_rx, &event_tx);
                     }
                     None => incoming_open = false,
                 },
+                Some(joined) = clients.join_next() => {
+                    if let Err(e) = joined
+                        && e.is_panic()
+                    {
+                        tracing::error!(error = %e, "Client session panicked");
+                    }
+                }
             }
         }
     }
 
     fn spawn_client<S>(
         &self,
+        clients: &mut JoinSet<()>,
         stream: S,
         peer: SocketAddr,
         transport: &'static str,
@@ -336,7 +417,7 @@ impl SessionServer {
         let chunk_sub = chunk_rx.subscribe();
         let ctx = Arc::clone(&self.ctx);
         let event_tx = event_tx.clone();
-        tokio::spawn(async move {
+        clients.spawn(async move {
             let result = handle_client(stream, peer, chunk_sub, &ctx, event_tx).await;
             if let Err(e) = result {
                 tracing::debug!(%peer, error = %e, "Client session ended");
@@ -396,50 +477,15 @@ where
         .context("authenticating")??;
     }
 
-    // Become the client's only live session before registering anything.
-    let (generation, cancelled) = ctx.claim_session(&client_id).await;
-
-    // Register channels
-    let (settings_tx, settings_rx) = mpsc::channel(16);
-
-    ctx.settings_senders
-        .lock()
-        .await
-        .insert(client_id.clone(), settings_tx);
-
-    // Register in state + build initial routing
-    let initial_stream_id;
-    let initial_routing;
-    let joins_new_group;
-    let client_settings;
-    {
-        let mut s = ctx.shared_state.lock().await;
-        let c = s.get_or_create_client(&client_id, &hello.host_name, &hello.mac);
-        c.update_from_hello(&hello, &peer.ip().to_string());
-        c.connected = true;
-        client_settings = ServerSettings {
-            buffer_ms: ctx.buffer_ms,
-            latency: c.config.latency,
-            volume: c.config.volume.percent,
-            muted: c.config.volume.muted,
-        };
-        joins_new_group = !s.groups.iter().any(|g| g.clients.contains(&client_id));
-        s.group_for_client(&client_id, &ctx.default_stream);
-
-        initial_routing =
-            SessionContext::build_routing(&s, &client_id).unwrap_or_else(|| SessionRouting {
-                stream_id: ctx.default_stream.clone(),
-                client_muted: false,
-                group_muted: false,
-            });
-        initial_stream_id = initial_routing.stream_id.clone();
-    }
-
-    let (routing_tx, routing_rx) = watch::channel(initial_routing);
-    ctx.routing_senders
-        .lock()
-        .await
-        .insert(client_id.clone(), routing_tx);
+    let Registration {
+        generation,
+        cancelled,
+        settings_rx,
+        routing_rx,
+        initial_settings,
+        joins_new_group,
+    } = ctx.register_session(&hello, peer).await;
+    let initial_stream_id = routing_rx.borrow().stream_id.clone();
 
     // A client outside any group changes the topology. C++ snapserver
     // announces that with Server.OnUpdate, and control clients such as
@@ -463,7 +509,7 @@ where
         match send_initial_messages(
             &mut writer,
             ctx,
-            client_settings,
+            &initial_settings,
             hello_id,
             &initial_stream_id,
             &client_id,
@@ -561,7 +607,7 @@ impl Activity {
 async fn send_initial_messages<W: AsyncWrite + Unpin>(
     writer: &mut W,
     ctx: &SessionContext,
-    client_settings: ServerSettings,
+    settings: &ClientSettingsUpdate,
     hello_id: u16,
     initial_stream_id: &str,
     client_id: &str,
@@ -569,7 +615,7 @@ async fn send_initial_messages<W: AsyncWrite + Unpin>(
     // ServerSettings (refers_to must match Hello id for client's pending request)
     let ss_frame = serialize_msg(
         MessageType::ServerSettings,
-        &MessagePayload::ServerSettings(client_settings),
+        &MessagePayload::ServerSettings(server_settings(settings)),
         hello_id,
     )?;
     write_frame(writer, &ss_frame)
@@ -603,7 +649,7 @@ struct SessionLoop<'a, S> {
     frames: FrameReader<ReadHalf<S>>,
     writer: WriteHalf<S>,
     chunk_rx: broadcast::Receiver<WireChunkData>,
-    settings_rx: mpsc::Receiver<ClientSettingsUpdate>,
+    settings_rx: watch::Receiver<ClientSettingsUpdate>,
     routing_rx: watch::Receiver<SessionRouting>,
     event_tx: mpsc::Sender<ServerEvent>,
     client_id: String,
@@ -694,6 +740,8 @@ where
                                 c.config.volume.muted = info.muted;
                             }
                         }
+                        // The mute flag gates audio for this session.
+                        ctx.push_routing(&client_id).await;
                         let _ = event_tx.send(ServerEvent::ClientVolumeChanged {
                             client_id: client_id.clone(),
                             volume: info.volume,
@@ -703,9 +751,9 @@ where
                     _ => {}
                 }
             }
-            update = settings_rx.recv() => {
-                let Some(update) = update else { continue };
-                write_settings(&mut writer, update).await?;
+            Ok(()) = settings_rx.changed() => {
+                let update = settings_rx.borrow_and_update().clone();
+                write_settings(&mut writer, &update).await?;
             }
         }
     }
@@ -761,19 +809,22 @@ fn serialize_wire_chunk(chunk: &WireChunkData) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-async fn write_settings<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    update: ClientSettingsUpdate,
-) -> Result<()> {
-    let ss = ServerSettings {
+fn server_settings(update: &ClientSettingsUpdate) -> ServerSettings {
+    ServerSettings {
         buffer_ms: update.buffer_ms,
         latency: update.latency,
         volume: update.volume,
         muted: update.muted,
-    };
+    }
+}
+
+async fn write_settings<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    update: &ClientSettingsUpdate,
+) -> Result<()> {
     let frame = serialize_msg(
         MessageType::ServerSettings,
-        &MessagePayload::ServerSettings(ss),
+        &MessagePayload::ServerSettings(server_settings(update)),
         0,
     )?;
     write_frame(writer, &frame)
@@ -789,7 +840,7 @@ async fn write_settings<W: AsyncWrite + Unpin>(
 
 async fn validate_auth<S: AsyncWrite + Unpin>(
     validator: &dyn crate::auth::AuthValidator,
-    hello: &snapcast_proto::message::hello::Hello,
+    hello: &Hello,
     stream: &mut S,
     client_id: &str,
 ) -> Result<()> {
@@ -1089,6 +1140,168 @@ mod tests {
         let r_unmuted = routing("z1", false, false);
         assert!(!should_send_chunk(&chunk("z1"), &r_muted, false));
         assert!(should_send_chunk(&chunk("z1"), &r_unmuted, false));
+    }
+
+    // ── live sessions ─────────────────────────────────────────
+
+    fn test_server(state: crate::state::ServerState) -> SessionServer {
+        SessionServer::new(SessionServerConfig {
+            buffer_ms: 1000,
+            auth: None,
+            client_filter: None,
+            shared_state: Arc::new(Mutex::new(state)),
+            default_stream: "default".into(),
+            send_audio_to_muted: false,
+            idle_timeout: None,
+        })
+    }
+
+    fn hello(id: &str) -> Hello {
+        Hello {
+            mac: "00:11:22:33:44:55".into(),
+            host_name: "host".into(),
+            version: "0".into(),
+            client_name: "test".into(),
+            os: "os".into(),
+            arch: "arch".into(),
+            instance: 1,
+            id: id.into(),
+            snap_stream_protocol_version: 2,
+            auth: None,
+        }
+    }
+
+    type ClientSide<S> = (FrameReader<ReadHalf<S>>, WriteHalf<S>);
+
+    /// Send Hello over `stream` and read the ServerSettings answering it.
+    async fn handshake<S: AsyncRead + AsyncWrite>(stream: S, id: &str) -> ClientSide<S> {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut frames = FrameReader::new(reader);
+        send_msg(
+            &mut writer,
+            MessageType::Hello,
+            &MessagePayload::Hello(hello(id)),
+        )
+        .await
+        .unwrap();
+        let msg = frames.next().await.unwrap();
+        assert!(matches!(msg.payload, MessagePayload::ServerSettings(_)));
+        (frames, writer)
+    }
+
+    /// Serve one client over an in-memory pipe of `capacity` bytes. The
+    /// session lives as long as `chunk_tx`.
+    async fn connect_duplex(
+        server: &SessionServer,
+        clients: &mut JoinSet<()>,
+        chunk_tx: &broadcast::Sender<WireChunkData>,
+        id: &str,
+        capacity: usize,
+    ) -> ClientSide<tokio::io::DuplexStream> {
+        let (client, served) = tokio::io::duplex(capacity);
+        let (event_tx, _) = mpsc::channel(16);
+        let peer = "127.0.0.1:1".parse().unwrap();
+        server.spawn_client(clients, served, peer, "test", chunk_tx, &event_tx);
+        handshake(client, id).await
+    }
+
+    async fn routing_of(server: &SessionServer, id: &str) -> SessionRouting {
+        server.ctx.routing_senders.lock().await[id].borrow().clone()
+    }
+
+    #[tokio::test]
+    async fn client_unmuting_itself_resumes_audio() {
+        let mut state = crate::state::ServerState::default();
+        state
+            .get_or_create_client("c1", "host", "mac")
+            .config
+            .volume
+            .muted = true;
+        let server = test_server(state);
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel(16);
+        let (_frames, mut writer) =
+            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        assert!(routing_of(&server, "c1").await.client_muted);
+
+        send_msg(
+            &mut writer,
+            MessageType::ClientInfo,
+            &MessagePayload::ClientInfo(snapcast_proto::message::client_info::ClientInfo {
+                volume: 50,
+                muted: false,
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while routing_of(&server, "c1").await.client_muted {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("routing follows the client's own unmute");
+    }
+
+    #[tokio::test]
+    async fn push_settings_does_not_wait_for_a_stalled_client() {
+        let server = test_server(crate::state::ServerState::default());
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel(16);
+        // Room for about one settings frame: the session stalls on the next
+        // write while the client reads nothing.
+        let (mut frames, _writer) =
+            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 64).await;
+        let update = |volume| ClientSettingsUpdate {
+            client_id: "c1".into(),
+            buffer_ms: 1000,
+            latency: 0,
+            volume,
+            muted: false,
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for volume in 0..=100 {
+                server.push_settings(update(volume)).await;
+            }
+        })
+        .await
+        .expect("push_settings must not block on the session");
+
+        // The client still ends up with the latest settings.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let MessagePayload::ServerSettings(ss) = frames.next().await.unwrap().payload
+                    && ss.volume == 100
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("latest settings delivered");
+    }
+
+    #[tokio::test]
+    async fn dropping_run_ends_client_sessions() {
+        let server = Arc::new(test_server(crate::state::ServerState::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (chunk_tx, _) = broadcast::channel(16);
+        let (_incoming_tx, incoming_rx) = mpsc::channel(1);
+        let (event_tx, _events) = mpsc::channel(16);
+        let run = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.run(listener, incoming_rx, chunk_tx, event_tx).await }
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut frames, _writer) = handshake(stream, "c1").await;
+        run.abort();
+        let err = tokio::time::timeout(Duration::from_secs(2), frames.next())
+            .await
+            .expect("session closed after the server stopped")
+            .unwrap_err();
+        assert!(err.to_string().contains("connection closed"), "{err}");
     }
 
     #[test]

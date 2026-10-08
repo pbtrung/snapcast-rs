@@ -102,7 +102,8 @@ pub struct F32AudioSender {
 
 impl F32AudioSender {
     fn new(tx: mpsc::Sender<AudioFrame>, sample_rate: u32, channels: u16) -> Self {
-        let chunk_samples = (sample_rate as usize * 20 / 1000) * channels as usize;
+        // At least one frame per chunk, or `send` would never drain `buf`.
+        let chunk_samples = (sample_rate as usize * 20 / 1000).max(1) * channels as usize;
         Self {
             tx,
             buf: Vec::with_capacity(chunk_samples * 2),
@@ -372,7 +373,7 @@ pub enum ServerCommand {
     /// Request dynamic stream addition from an application shell.
     ///
     /// The embeddable library does not own stream readers. Binaries or embedders
-    /// must create streams before [`SnapServer::run`] or implement their own
+    /// must create streams before [`SnapServer::serve`] or implement their own
     /// orchestration around this command.
     AddStream {
         /// Stream source URI (e.g. `pipe:///tmp/snapfifo?name=default`).
@@ -535,7 +536,7 @@ pub struct SnapServer {
     event_tx: mpsc::Sender<ServerEvent>,
     command_tx: mpsc::Sender<ServerCommand>,
     command_rx: Option<mpsc::Receiver<ServerCommand>>,
-    /// Named audio streams — each gets its own encoder at run().
+    /// Named audio streams — each gets its own encoder at serve().
     streams: Vec<(String, StreamConfig, mpsc::Receiver<AudioFrame>)>,
     /// Broadcast channel for encoded chunks → sessions.
     chunk_tx: broadcast::Sender<WireChunkData>,
@@ -712,7 +713,7 @@ impl SnapServer {
 
         anyhow::ensure!(
             !self.streams.is_empty(),
-            "No streams configured — call add_stream() before run()"
+            "No streams configured — call add_stream() before serve()"
         );
 
         tracing::info!(
@@ -743,8 +744,8 @@ impl SnapServer {
         }
         let shared_state = Arc::new(tokio::sync::Mutex::new(initial_state));
 
-        // Create session server before stream registration
-        // (first_stream_name set in loop below, but SessionServer only needs it for default routing)
+        // Create the session server before stream registration; it only needs
+        // the first stream's name, as the default for clients without a group.
         let first_name = streams
             .first()
             .map(|(n, _, _)| n.clone())
@@ -819,18 +820,16 @@ impl SnapServer {
         let session_for_run = Arc::clone(&session_srv);
         let session_event_tx = event_tx.clone();
         let session_chunk_tx = self.chunk_tx.clone();
+        // Aborting this task on stop also ends every client session.
         let session_handle = tokio::spawn(async move {
-            if let Err(e) = session_for_run
+            session_for_run
                 .run(
                     listener,
                     incoming_clients,
                     session_chunk_tx,
                     session_event_tx,
                 )
-                .await
-            {
-                tracing::error!(error = %e, "Session server error");
-            }
+                .await;
         });
 
         let dispatcher = command::Dispatcher {
@@ -997,6 +996,20 @@ mod tests {
             ..Default::default()
         });
         assert!(server.add_f32_stream("f").is_err());
+    }
+
+    #[tokio::test]
+    async fn f32_sender_at_a_very_low_rate_still_chunks() {
+        let (mut server, _events) = SnapServer::new(ServerConfig {
+            sample_format: "40:16:1".into(),
+            ..Default::default()
+        });
+        let mut sender = server.add_f32_stream("f").unwrap();
+        // Less than one frame per 20 ms: chunks must still hold a frame.
+        tokio::time::timeout(std::time::Duration::from_secs(1), sender.send(&[0.0]))
+            .await
+            .expect("send returns")
+            .unwrap();
     }
 
     #[tokio::test]

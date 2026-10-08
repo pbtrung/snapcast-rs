@@ -1,4 +1,4 @@
-//! Server state model — clients, groups, streams with JSON persistence.
+//! Server state model — clients, groups, streams; serializable so the embedder can persist it.
 
 use std::collections::HashMap;
 

@@ -1,8 +1,8 @@
 //! Command dispatch — handles each [`ServerCommand`] against shared state.
 //!
-//! Extracted from the `run()` loop so the state machine is one focused unit and
+//! Extracted from the `serve()` loop so the state machine is one focused unit and
 //! the crate root keeps to API types plus the server facade. `Stop`/`None`
-//! terminate the loop and are handled by `run()` itself; every other command
+//! terminate the loop and are handled by `serve()` itself; every other command
 //! lands here.
 
 use std::sync::Arc;
@@ -216,7 +216,7 @@ impl Dispatcher {
                     "Dynamic stream addition requires application-owned stream orchestration"
                 );
                 let _ = response_tx.send(Err(
-                    "dynamic Stream.AddStream is not supported by the embeddable server after run(); create streams before run()".into(),
+                    "dynamic Stream.AddStream is not supported by the embeddable server after serve(); create streams before serve()".into(),
                 ));
             }
             ServerCommand::RemoveStream { stream_id } => {
