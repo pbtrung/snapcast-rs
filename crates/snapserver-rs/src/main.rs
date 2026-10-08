@@ -70,16 +70,6 @@ struct Cli {
     #[arg(long = "auth-secret")]
     auth_secret: Option<String>,
 
-    /// Disable mDNS advertisement
-    #[cfg(feature = "mdns")]
-    #[arg(long = "mdns-disable")]
-    mdns_disable: bool,
-
-    /// mDNS service name (default: Snapserver)
-    #[cfg(feature = "mdns")]
-    #[arg(long)]
-    mdns_name: Option<String>,
-
     /// Log filter
     #[arg(long, default_value = "info")]
     logfilter: String,
@@ -93,14 +83,6 @@ fn parse_pcm_format(value: &str) -> anyhow::Result<snapcast_proto::SampleFormat>
         .map_err(|e| anyhow::anyhow!("invalid sample format '{value}': {e}"))?;
     format.validate_concrete_pcm()?;
     Ok(format)
-}
-
-/// Sample format a source scheme always produces, used when its URI sets no
-/// `sampleformat`: librespot and shairport-sync output 44.1 kHz, so the
-/// 48 kHz server default would play them too fast.
-fn default_source_format(scheme: &str) -> Option<snapcast_proto::SampleFormat> {
-    matches!(scheme, "librespot" | "airplay")
-        .then(|| snapcast_proto::SampleFormat::new(44100, 16, 2))
 }
 
 /// Library stream config for a configured source whose reader produces
@@ -125,10 +107,6 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     // Load config file, then merge CLI overrides
-    #[cfg(feature = "mdns")]
-    let mdns_disable = cli.mdns_disable;
-    #[cfg(feature = "mdns")]
-    let mdns_name = cli.mdns_name.clone();
     let file_config = config::parse_config_file(&cli.config);
     let server_config = config::merge_cli(
         file_config,
@@ -146,10 +124,6 @@ fn main() -> anyhow::Result<()> {
             sources: cli.sources,
             auth_enabled: cli.auth,
             auth_secret: cli.auth_secret,
-            #[cfg(feature = "mdns")]
-            no_mdns: cli.mdns_disable,
-            #[cfg(feature = "mdns")]
-            mdns_name: cli.mdns_name,
         },
     );
 
@@ -208,7 +182,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                 },
-                None => default_source_format(&parsed.scheme).unwrap_or(default_format),
+                None => default_format,
             };
 
             let tx = server.add_stream_with_config(&name, source_stream_config(source, format));
@@ -232,14 +206,6 @@ fn main() -> anyhow::Result<()> {
                 "file" => stream::file::start(parsed, format, chunk_frames, tx),
                 "process" => stream::process::start(parsed, format, chunk_frames, tx),
                 "tcp" => stream::tcp::start(parsed, format, chunk_frames, tx),
-                "librespot" => {
-                    let (meta_tx, _) = tokio::sync::mpsc::channel(32);
-                    stream::librespot::start(parsed, format, tx, meta_tx)
-                }
-                "airplay" => {
-                    let (meta_tx, _) = tokio::sync::mpsc::channel(32);
-                    stream::airplay::start(parsed, format, tx, meta_tx)
-                }
                 other => {
                     tracing::error!(scheme = other, "Unsupported stream scheme");
                     continue;
@@ -250,37 +216,6 @@ fn main() -> anyhow::Result<()> {
                 tracing::error!(source, error = %e, "Failed to start stream reader");
             }
         }
-
-        // mDNS advertisement (held alive for the lifetime of the server)
-        #[cfg(feature = "mdns")]
-        let _mdns = if !mdns_disable {
-            let name = mdns_name
-                .as_deref()
-                .unwrap_or(snapcast_proto::DEFAULT_SERVER_NAME);
-            let regtype = snapcast_proto::DEFAULT_MDNS_SERVICE_TYPE
-                .trim_end_matches("local.")
-                .trim_end_matches('.');
-            match astro_dnssd::DNSServiceBuilder::new(regtype, server_config.stream_port)
-                .with_name(name)
-                .register()
-            {
-                Ok(svc) => {
-                    tracing::info!(
-                        port = server_config.stream_port,
-                        service_type = regtype,
-                        name,
-                        "mDNS: advertising"
-                    );
-                    Some(svc)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "mDNS advertisement failed");
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // JSON-RPC control servers
         let (notify_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
@@ -451,14 +386,6 @@ mod tests {
         for bad in ["48000:16", "0:16:2", "48000:*:2", "48000:12:2", "garbage"] {
             assert!(parse_pcm_format(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn spotify_and_airplay_default_to_44k1() {
-        let cd = snapcast_proto::SampleFormat::new(44100, 16, 2);
-        assert_eq!(default_source_format("librespot"), Some(cd));
-        assert_eq!(default_source_format("airplay"), Some(cd));
-        assert_eq!(default_source_format("pipe"), None);
     }
 
     #[test]

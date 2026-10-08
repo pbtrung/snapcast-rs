@@ -203,10 +203,6 @@ pub(crate) struct CliOverrides {
     pub auth_enabled: bool,
     /// Override the auth secret.
     pub auth_secret: Option<String>,
-    #[cfg(feature = "mdns")]
-    pub no_mdns: bool,
-    #[cfg(feature = "mdns")]
-    pub mdns_name: Option<String>,
 }
 
 /// Merge CLI overrides into config.
@@ -250,8 +246,6 @@ pub(crate) fn merge_cli(mut config: BinaryConfig, cli: CliOverrides) -> BinaryCo
     if let Some(v) = cli.auth_secret {
         config.auth.secret = v;
     }
-    #[cfg(feature = "mdns")]
-    let _ = (cli.no_mdns, cli.mdns_name); // handled in main.rs
 
     config
 }
@@ -318,10 +312,6 @@ mod tests {
                 sources: vec![],
                 auth_enabled: false,
                 auth_secret: None,
-                #[cfg(feature = "mdns")]
-                no_mdns: false,
-                #[cfg(feature = "mdns")]
-                mdns_name: None,
             },
         );
         assert_eq!(merged.stream_bind_address, "::1");
@@ -348,10 +338,6 @@ mod tests {
             sources: vec![],
             auth_enabled: false,
             auth_secret: None,
-            #[cfg(feature = "mdns")]
-            no_mdns: false,
-            #[cfg(feature = "mdns")]
-            mdns_name: None,
         }
     }
 

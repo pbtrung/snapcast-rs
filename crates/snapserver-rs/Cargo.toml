@@ -30,13 +30,11 @@ libc = { workspace = true }
 axum = { version = "0.8.8", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
 futures-util = { workspace = true }
-astro-dnssd = { version = "0.3", optional = true }
 
 [dev-dependencies]
 snapcast-client = { workspace = true, features = ["websocket"] }
 
 [features]
-default = ["snapcast-server/default", "mdns"]
+default = ["snapcast-server/default"]
 flac = ["snapcast-server/flac"]
 opus = ["snapcast-server/opus"]
-mdns = ["dep:astro-dnssd"]

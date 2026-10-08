@@ -7,9 +7,7 @@ use snapcast_server::{AudioData, AudioFrame};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-pub(crate) mod airplay;
 pub(crate) mod file;
-pub(crate) mod librespot;
 pub(crate) mod pipe;
 pub(crate) mod process;
 pub(crate) mod tcp;

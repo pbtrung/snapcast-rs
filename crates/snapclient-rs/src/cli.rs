@@ -11,12 +11,11 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
     version,
     about,
     after_help = "\
-  With 'url' = tcp://<snapserver host, IP, or mDNS service name>[:port]\n\
-  For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'\n\
-  If 'url' is not configured, snapclient defaults to 'tcp://_snapcast._tcp'"
+  With 'url' = tcp://<snapserver host or IP>[:port]\n\
+  For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'"
 )]
 pub struct Cli {
-    /// Snapserver URL: `tcp://<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
+    /// Snapserver URL (required): `tcp://<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
     pub url: Option<String>,
 
     /// Instance id when running multiple instances on the same host
@@ -73,8 +72,9 @@ pub struct Cli {
 impl Cli {
     /// Parse CLI args and build a [`ClientSettings`].
     pub fn into_settings(self) -> Result<ClientSettings> {
-        let default_url = "tcp://_snapcast._tcp";
-        let url = self.url.as_deref().unwrap_or(default_url);
+        let Some(url) = self.url.as_deref() else {
+            bail!("no server URL given, e.g. tcp://192.168.1.1:1704");
+        };
         let server = parse_url(url)?;
 
         // Player
@@ -295,25 +295,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_mdns_service_name() {
-        let s = parse_url("tcp://_snapcast._tcp").unwrap();
-        assert_eq!(s.scheme, "tcp");
-        assert_eq!(s.host, "_snapcast._tcp");
-        assert_eq!(s.port, 1704);
-    }
-
-    #[test]
-    fn default_url_with_mdns() {
+    fn url_is_required() {
         let cli = Cli::parse_from(["snapclient-rs"]);
         assert!(cli.url.is_none());
-        let settings = cli.into_settings().unwrap();
-        // With mdns feature, default host is mDNS service name
-        assert!(settings.server.host == "_snapcast._tcp" || settings.server.host == "localhost");
+        assert!(cli.into_settings().is_err());
     }
 
     #[test]
     fn cli_into_settings_mixer() {
-        let cli = Cli::parse_from(["snapclient-rs", "--mixer", "hardware:hw:0"]);
+        let cli = Cli::parse_from(["snapclient-rs", "tcp://host", "--mixer", "hardware:hw:0"]);
         let s = cli.into_settings().unwrap();
         assert_eq!(s.player.mixer.mode, MixerMode::Hardware);
         assert_eq!(s.player.mixer.parameter, "hw:0");

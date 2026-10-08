@@ -16,8 +16,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    #[cfg_attr(not(feature = "mdns"), allow(unused_mut))]
-    let mut settings = cli.into_settings()?;
+    let settings = cli.into_settings()?;
 
     #[cfg(unix)]
     if let Some(ref daemon) = settings.daemon {
@@ -25,23 +24,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     warn_unsupported_options(&settings);
-
-    // mDNS discovery if no host specified (the default URL names the service)
-    #[cfg(feature = "mdns")]
-    if settings.server.host.is_empty() || settings.server.host == MDNS_SERVICE_HOST {
-        tracing::info!("No server specified, browsing mDNS for _snapcast._tcp...");
-        match discover_snapcast() {
-            Ok((host, port)) => {
-                settings.server.host = host;
-                settings.server.port = port;
-            }
-            Err(e) => anyhow::bail!("mDNS discovery failed: {e}"),
-        }
-    }
-    #[cfg(not(feature = "mdns"))]
-    if settings.server.host.is_empty() || settings.server.host == MDNS_SERVICE_HOST {
-        anyhow::bail!("no server URL given, and mDNS discovery is not built in (`mdns` feature)");
-    }
 
     tracing::info!(
         server = %format!(
@@ -147,9 +129,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Host of the default URL: browse mDNS for a server instead of resolving it.
-const MDNS_SERVICE_HOST: &str = "_snapcast._tcp";
-
 /// Warn about upstream snapclient options that are accepted but not acted on.
 fn warn_unsupported_options(settings: &snapcast_client::config::ClientSettings) {
     let player = &settings.player;
@@ -202,43 +181,4 @@ fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result
 
     tracing::info!("Daemonized");
     Ok(())
-}
-
-#[cfg(feature = "mdns")]
-fn discover_snapcast() -> anyhow::Result<(String, u16)> {
-    use std::time::Duration;
-    let mdns = mdns_sd::ServiceDaemon::new()?;
-    let service_type = "_snapcast._tcp.local.";
-    let receiver = mdns.browse(service_type)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            mdns.stop_browse(service_type).ok();
-            anyhow::bail!("timed out after 5s");
-        }
-        match receiver.recv_timeout(remaining) {
-            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                // Prefer IPv4: IPv6 results are often link-local, which need a
-                // scope id to connect.
-                let host = info
-                    .get_addresses_v4()
-                    .into_iter()
-                    .next()
-                    .map(|a| a.to_string())
-                    .or_else(|| info.get_addresses().iter().next().map(|a| a.to_string()))
-                    .unwrap_or_else(|| info.get_hostname().trim_end_matches('.').to_string());
-                let port = info.get_port();
-                tracing::info!(host = %host, port, "Discovered snapserver via mDNS");
-                mdns.stop_browse(service_type).ok();
-                return Ok((host, port));
-            }
-            Ok(_) => continue,
-            Err(_) => {
-                mdns.stop_browse(service_type).ok();
-                anyhow::bail!("mDNS discovery timed out after 5s");
-            }
-        }
-    }
 }

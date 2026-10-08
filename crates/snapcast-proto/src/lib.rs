@@ -49,8 +49,6 @@ pub const PCM_24BIT_MAX: f32 = 8_388_607.0;
 pub const DEFAULT_SAMPLE_FORMAT_STRING: &str = "48000:16:2";
 /// Default playout buffer size in milliseconds.
 pub const DEFAULT_BUFFER_MS: u32 = 1000;
-/// Default mDNS service type for Snapcast discovery.
-pub const DEFAULT_MDNS_SERVICE_TYPE: &str = "_snapcast._tcp.local.";
 /// Default client display name.
 pub const DEFAULT_CLIENT_NAME: &str = "Snapclient";
 /// Default server display name.

@@ -19,7 +19,7 @@ use snapcast_proto::status::percent_decode;
 /// Parsed stream URI.
 #[derive(Debug, Clone)]
 pub struct StreamUri {
-    /// Scheme: pipe, file, process, tcp, alsa, librespot, airplay, meta, etc.
+    /// Scheme: pipe, file, process, tcp.
     pub scheme: String,
     /// Host (for tcp scheme).
     pub host: String,

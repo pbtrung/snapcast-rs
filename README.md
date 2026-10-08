@@ -36,14 +36,12 @@ Server (`snapserver-rs`; `flac` and `opus` also on the `snapcast-server` library
 | Feature  | Default | C dep     | Description |
 |----------|---------|-----------|-------------|
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
-| `opus`   | —       | libopus   | Opus encoding |
-| `mdns`   | ✅      | avahi     | mDNS service advertisement (binary only) |
+| `opus`   | —       | none (bundled libopus, needs cmake) | Opus encoding |
 
 Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pure Rust):
 
 | Feature     | Default | C dep | Description |
 |-------------|---------|-------|-------------|
-| `mdns`      | ✅      | none  | mDNS server discovery (mdns-sd) |
 | `websocket` | ✅      | none  | `ws://` streaming transport |
 | `resampler` | —       | none  | Resample when the device can't play the stream format |
 
@@ -55,8 +53,6 @@ Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pu
 - `file:///path/to/file.pcm`: raw PCM (or 44-byte-header WAV) file, played in real time and looped
 - `process:///path/to/binary?params=...`: a child process's stdout
 - `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953)
-- `librespot:///?devicename=...`: Spotify Connect via `librespot` (run from `PATH`)
-- `airplay:///?devicename=...`: AirPlay via `shairport-sync` (run from `PATH`)
 
 Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root`).
 
@@ -84,7 +80,7 @@ Library users set `ServerConfig::client_idle_timeout` and
 |--------|---------|-------|-----------|---------|
 | PCM    | ✅ always | none | 16/24/32-bit | zero |
 | FLAC   | ✅ default | none | 16/24-bit (decoded to f32) | 24ms (block size) |
-| Opus   | optional | libopus | 16-bit | 20ms |
+| Opus   | optional | bundled libopus | 16-bit | 20ms |
 
 FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond that.
 
@@ -98,9 +94,9 @@ Codec options go after the codec name, separated by `:`, as in C++ snapserver (`
 Requires Rust **1.94.1+**. Install the system libraries first (Arch Linux):
 
 ```bash
-sudo pacman -S base-devel pkgconf alsa-lib avahi
-# only for the optional Opus codec:
-sudo pacman -S opus
+sudo pacman -S base-devel pkgconf alsa-lib
+# only for the optional Opus codec (libopus is built from source):
+sudo pacman -S cmake
 ```
 
 Then build from source:
@@ -108,7 +104,7 @@ Then build from source:
 ```bash
 git clone https://github.com/pbtrung/snapcast-rs.git
 cd snapcast-rs
-cargo build --release                              # default: flac + mdns
+cargo build --release                              # default: flac
 cargo build --release -p snapserver-rs --features opus  # + Opus
 cargo build --release -p snapclient-rs --features resampler  # + client resampling
 ```
@@ -133,7 +129,6 @@ snapserver-rs --help
 snapclient-rs tcp://192.168.1.50:1704
 snapclient-rs tcp://[::1]:1704
 snapclient-rs ws://192.168.1.50:1780                     # WebSocket (server HTTP port)
-snapclient-rs                                            # mDNS auto-discovery
 snapclient-rs --help
 
 # Feed audio
@@ -145,7 +140,7 @@ ffmpeg -re -i music.mp3 -f s16le -ar 48000 -ac 2 pipe:1 > /tmp/snapfifo
 - The control API's `--auth` / `[auth]` gate is not access control yet: `Server.GetToken` issues a token for any username without checking credentials.
 - Server state (client names, groups, latency) is kept in memory only; it is not saved across restarts.
 - `Stream.AddStream` is rejected (streams are fixed at startup), and `Stream.Control` is accepted but not acted on.
-- librespot/AirPlay track metadata is not published to control clients.
+- No mDNS: the server doesn't advertise itself and the client needs a server URL.
 
 ## License
 

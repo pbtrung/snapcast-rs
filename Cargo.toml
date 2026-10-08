@@ -1,8 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/snapcast-proto", "crates/snapcast-client", "crates/snapcast-server", "crates/snapclient-rs", "crates/snapserver-rs", "crates/snapcast-tests"]
-# Third-party crates patched below; not linted or formatted as our code.
-exclude = ["vendor"]
 
 [workspace.package]
 version = "0.999.12"
@@ -59,6 +57,7 @@ futures-util = "0.3"
 
 # Audio decoding
 symphonia = { version = "0.6", default-features = false, features = ["flac"] }
+# Builds libopus from source (opusic-sys `bundled`); needs cmake + a C compiler.
 opus = "0.4"
 
 # Audio resampling
@@ -67,15 +66,6 @@ rubato = "5"
 # Audio backends
 alsa = "0.11"  # must match the version cpal uses (shared alsa-sys)
 
-# mDNS
-mdns-sd = "0.21"
-
-
-# opus 0.4 pulls opusic-sys with its default `bundled` feature (libopus built
-# from source with cmake). The vendored copy only turns that default off so
-# the system libopus is linked; see vendor/opus/Cargo.toml.
-[patch.crates-io]
-opus = { path = "vendor/opus" }
 
 [profile.release]
 lto = true
