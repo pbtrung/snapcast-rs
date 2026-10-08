@@ -190,10 +190,11 @@ impl Controller {
     }
 
     async fn receive_loop(&mut self) -> Result<()> {
-        let mut sync_timer = tokio::time::interval(SYNC_INTERVAL);
         const INITIAL_QUICK_SYNCS: u32 = 50;
         let mut quick_syncs_remaining = INITIAL_QUICK_SYNCS;
-        let mut quick_sync_timer = tokio::time::interval(QUICK_SYNC_INTERVAL);
+        let mut sync_jitter = SyncJitter::new();
+        let sync_timer = tokio::time::sleep(sync_jitter.next(QUICK_SYNC_INTERVAL));
+        tokio::pin!(sync_timer);
 
         self.connection
             .send(MessageType::Time, &MessagePayload::Time(Time::new()))
@@ -228,24 +229,26 @@ impl Controller {
                         }
                     }
                 }
-                _ = quick_sync_timer.tick(), if quick_syncs_remaining > 0 => {
-                    quick_syncs_remaining -= 1;
+                () = &mut sync_timer => {
                     self.connection
                         .send(MessageType::Time, &MessagePayload::Time(Time::new()))
                         .await
                         .ok();
-                    if quick_syncs_remaining == 0 {
-                        let diff = self.time_provider.lock().unwrap_or_else(|e| e.into_inner()).diff_to_server_usec();
-                        let diff_ms = diff as f64 / 1000.0;
-                        tracing::info!(diff_ms, "Time sync complete");
-                        self.emit(ClientEvent::TimeSyncComplete { diff_ms });
-                    }
-                }
-                _ = sync_timer.tick(), if quick_syncs_remaining == 0 => {
-                    self.connection
-                        .send(MessageType::Time, &MessagePayload::Time(Time::new()))
-                        .await
-                        .ok();
+                    let interval = if quick_syncs_remaining > 0 {
+                        quick_syncs_remaining -= 1;
+                        if quick_syncs_remaining == 0 {
+                            let diff = self.time_provider.lock().unwrap_or_else(|e| e.into_inner()).diff_to_server_usec();
+                            let diff_ms = diff as f64 / 1000.0;
+                            tracing::info!(diff_ms, "Time sync complete");
+                            self.emit(ClientEvent::TimeSyncComplete { diff_ms });
+                        }
+                        QUICK_SYNC_INTERVAL
+                    } else {
+                        SYNC_INTERVAL
+                    };
+                    sync_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + sync_jitter.next(interval));
                 }
             }
         }
@@ -374,6 +377,31 @@ impl Controller {
     }
 }
 
+/// Randomizes the time between sync requests.
+///
+/// The server writes audio in chunks on a fixed period (20-26 ms) and the
+/// sync interval is a multiple of it, so requests sent on a fixed schedule
+/// can keep hitting the same phase: every reply then waits behind a chunk
+/// and the estimate never sees an unqueued exchange. Spreading each interval
+/// over 75-125 % samples every phase, with the same mean rate.
+struct SyncJitter(u64);
+
+impl SyncJitter {
+    fn new() -> Self {
+        // Any seed but 0 works for xorshift; vary it between clients.
+        Self(crate::connection::now_usec() as u64 | 1)
+    }
+
+    fn next(&mut self, interval: Duration) -> Duration {
+        // xorshift64
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        let unit = (self.0 >> 11) as f64 / (1u64 << 53) as f64;
+        interval.mul_f64(0.75 + 0.5 * unit)
+    }
+}
+
 /// Resolve once a `Stop` command arrives or every command sender is gone,
 /// discarding other commands (nothing to forward them to while disconnected).
 async fn wait_for_stop(command_rx: &mut mpsc::Receiver<ClientCommand>) {
@@ -487,6 +515,19 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    // ---- sync schedule ----
+
+    #[test]
+    fn sync_jitter_spreads_intervals_around_the_mean() {
+        let mut jitter = SyncJitter::new();
+        let samples: Vec<Duration> = (0..1000).map(|_| jitter.next(SYNC_INTERVAL)).collect();
+        let (min, max) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
+        assert!(*min >= Duration::from_millis(750) && *max <= Duration::from_millis(1250));
+        assert!(*max - *min > Duration::from_millis(400), "covers the range");
+        let mean = samples.iter().sum::<Duration>() / 1000;
+        assert!(mean.abs_diff(SYNC_INTERVAL) < Duration::from_millis(30));
     }
 
     // ---- samples_to_f32 ----

@@ -475,7 +475,7 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
     }
 }
 
-/// A bare client sending a Time request every 100 ms and recording the raw
+/// A bare client sending a Time request about every 100 ms and recording the raw
 /// exchanges. Reads run in their own task and stamp arrival when the read
 /// returns, as the client does.
 async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
@@ -543,9 +543,12 @@ async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
             }
         }
     });
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // Randomized like the client's schedule (75-125 ms), so requests don't
+    // phase-lock to the audio chunks.
+    let mut rng = Rng(0x5eed);
     while begin.elapsed() < duration {
-        tick.tick().await;
+        let pause = Duration::from_millis(75).mul_f64(1.0 + rng.uniform() * 2.0 / 3.0);
+        tokio::time::sleep(pause).await;
         let req = frame(MessageType::Time, &MessagePayload::Time(Time::new()));
         if wr.write_all(&req).await.is_err() {
             break;
