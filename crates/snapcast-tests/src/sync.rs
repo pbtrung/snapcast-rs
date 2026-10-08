@@ -336,6 +336,8 @@ pub struct ProbeReport {
     pub diff: Stats,
     /// Per-exchange round trip `c2s + s2c`.
     pub rtt: Stats,
+    /// Diff of the fifth of the exchanges with the lowest round trips.
+    pub low_rtt_diff: Stats,
 }
 
 impl std::fmt::Display for SyncReport {
@@ -350,6 +352,7 @@ impl std::fmt::Display for SyncReport {
         if let Some(p) = &self.probe {
             writeln!(f, "  raw exchange diff  : {}", p.diff)?;
             writeln!(f, "  raw exchange rtt   : {}", p.rtt)?;
+            writeln!(f, "  raw low-rtt diff   : {}", p.low_rtt_diff)?;
         }
         Ok(())
     }
@@ -556,10 +559,15 @@ async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
     }
     drop(wr);
     reader.abort();
-    let (diffs, rtts): (Vec<f64>, Vec<f64>) = samples.lock().unwrap().iter().copied().unzip();
+    let mut samples = samples.lock().unwrap().clone();
+    let (diffs, rtts): (Vec<f64>, Vec<f64>) = samples.iter().copied().unzip();
+    samples.sort_by(|a, b| a.1.total_cmp(&b.1));
+    samples.truncate(samples.len().div_ceil(5));
+    let low_rtt: Vec<f64> = samples.iter().map(|s| s.0).collect();
     ProbeReport {
         diff: Stats::from_errors(&diffs),
         rtt: Stats::from_errors(&rtts),
+        low_rtt_diff: Stats::from_errors(&low_rtt),
     }
 }
 

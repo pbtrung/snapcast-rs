@@ -259,6 +259,11 @@ impl Stream {
         self.buffer_ms
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_hard_syncing(&self) -> bool {
+        self.hard_sync
+    }
+
     /// Enqueue a decoded PCM chunk.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
         self.chunks.push_back(chunk);
