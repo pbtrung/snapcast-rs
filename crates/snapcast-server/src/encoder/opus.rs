@@ -59,9 +59,8 @@ pub struct OpusEncoder {
     encoder: OpusEnc,
     header: Vec<u8>,
     frame_size: usize,
-    /// Interleaved 16-bit samples not yet filling a whole Opus frame.
-    pending: Vec<i16>,
-    warned: bool,
+    /// Interleaved samples not yet filling a whole Opus frame.
+    pending: Vec<f32>,
 }
 
 impl OpusEncoder {
@@ -100,7 +99,8 @@ impl OpusEncoder {
         );
 
         // C++ snapserver's pseudo header (see snapcast_proto::OPUS_HEADER_ID).
-        // Samples are encoded from 16-bit PCM, so 16 bits are announced.
+        // It announces 16 bits whatever the input, as C++ snapserver does:
+        // clients decode Opus to 16-bit PCM.
         let mut header = Vec::with_capacity(12);
         header.extend_from_slice(&snapcast_proto::OPUS_HEADER_ID.to_le_bytes());
         header.extend_from_slice(&format.rate().to_le_bytes());
@@ -116,7 +116,6 @@ impl OpusEncoder {
             header,
             frame_size,
             pending: Vec::new(),
-            warned: false,
         })
     }
 }
@@ -131,60 +130,42 @@ impl Encoder for OpusEncoder {
     }
 
     fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
-        let pcm = match input {
-            AudioData::Pcm(data) if self.format.bits() == 16 => {
-                std::borrow::Cow::Borrowed(data.as_slice())
-            }
-            AudioData::Pcm(data) => {
-                if !self.warned {
-                    self.warned = true;
-                    tracing::warn!(
-                        codec = "opus",
-                        bits = self.format.bits(),
-                        "PCM input requires quantization to 16-bit for Opus"
-                    );
-                }
-                let samples = super::pcm_to_f32(data, self.format.bits());
-                std::borrow::Cow::Owned(super::f32_to_pcm(&samples, 16))
-            }
-            AudioData::F32(samples) => {
-                if !self.warned {
-                    self.warned = true;
-                    tracing::warn!(
-                        codec = "opus",
-                        "F32 input requires quantization to 16-bit — consider pcm for lossless path"
-                    );
-                }
-                std::borrow::Cow::Owned(super::f32_to_pcm(samples, 16))
-            }
-        };
-
         let channels = self.format.channels() as usize;
-        let frame_samples = self.frame_size * channels;
         // Frames carried from earlier input start before this input does.
         let carried_frames = (self.pending.len() / channels) as i64;
+        let before = self.pending.len();
+        match input {
+            // libopus works in float: f32 input is encoded as is, and 16-bit
+            // PCM is scaled exactly as opus_encode() does, so neither is
+            // quantized here.
+            AudioData::F32(samples) => self.pending.extend_from_slice(samples),
+            AudioData::Pcm(data) if self.format.bits() == 16 => self.pending.extend(
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0),
+            ),
+            AudioData::Pcm(data) => self
+                .pending
+                .extend(super::pcm_to_f32(data, self.format.bits())),
+        }
         // Whole inter-channel frames only, so interleaving never shifts.
-        let aligned = pcm.len() - pcm.len() % (channels * 2);
-        self.pending.extend(
-            pcm[..aligned]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b)),
-        );
+        self.pending
+            .truncate(before + (self.pending.len() - before) / channels * channels);
         tracing::trace!(
             codec = "opus",
-            input_bytes = pcm.len(),
+            input_samples = self.pending.len() - before,
             pending_frames = self.pending.len() / channels,
             "encode"
         );
+        let frame_samples = self.frame_size * channels;
 
         let mut packets = Vec::new();
         let mut encode_buf = [0u8; 4096];
         let mut consumed = 0;
         while self.pending.len() - consumed >= frame_samples {
             let samples = &self.pending[consumed..consumed + frame_samples];
-            let len = match self.encoder.encode(samples, &mut encode_buf) {
+            let len = match self.encoder.encode_float(samples, &mut encode_buf) {
                 Ok(len) => len,
                 Err(e) => {
                     tracing::warn!(codec = "opus", error = %e, "encode failed");
@@ -281,6 +262,28 @@ mod tests {
             assert_eq!(n, 960, "each packet decodes to exactly one frame");
         }
         assert_eq!(enc.pending.len(), (300 + 480) * 2, "remainder is carried");
+    }
+
+    /// f32 input goes straight to libopus: packets decode back to the tone.
+    #[test]
+    fn f32_input_is_encoded() {
+        let mut enc = OpusEncoder::new(SampleFormat::new(48000, 16, 2), "").unwrap();
+        let samples: Vec<f32> = (0..960 * 2 * 5)
+            .map(|n| ((n / 2) as f32 * 0.05).sin() * 0.25)
+            .collect();
+        let packets = enc.encode(&AudioData::F32(samples)).unwrap();
+        assert_eq!(packets.len(), 5);
+        assert!(enc.pending.is_empty());
+
+        let mut dec = opus::Decoder::new(48000, Channels::Stereo).unwrap();
+        let mut out = vec![0f32; 5760 * 2];
+        let mut peak = 0f32;
+        for p in &packets {
+            let n = dec.decode_float(&p.data, &mut out, false).unwrap();
+            assert_eq!(n, 960);
+            peak = out[..n * 2].iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        assert!((0.2..0.3).contains(&peak), "decoded peak {peak}");
     }
 
     #[test]

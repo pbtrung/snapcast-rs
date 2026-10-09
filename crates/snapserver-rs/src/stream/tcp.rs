@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PumpEnd, pump_pcm};
+use super::{PcmEncoding, PumpEnd, pump_pcm};
 
 /// Start a TCP listener that reads PCM from connecting clients.
 pub fn start(
@@ -24,7 +24,8 @@ pub fn start(
         uri.host.clone()
     };
     let port = if uri.port == 0 { 4953 } else { uri.port };
-    let chunk_bytes = chunk_frames * format.frame_size() as usize;
+    let encoding = PcmEncoding::from_uri(&uri)?;
+    let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
 
     Ok(tokio::spawn(async move {
         let listener = match TcpListener::bind((host.as_str(), port)).await {
@@ -43,7 +44,16 @@ pub fn start(
             match listener.accept().await {
                 Ok((mut stream, peer)) => {
                     tracing::info!(%peer, "TCP stream client connected");
-                    match pump_pcm(&mut stream, &mut ts, chunk_frames, chunk_bytes, &tx, None).await
+                    match pump_pcm(
+                        &mut stream,
+                        &mut ts,
+                        chunk_frames,
+                        chunk_bytes,
+                        encoding,
+                        &tx,
+                        None,
+                    )
+                    .await
                     {
                         PumpEnd::SourceEnded => {
                             tracing::info!(%peer, "TCP stream client disconnected");

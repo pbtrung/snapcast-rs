@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PumpEnd, pump_pcm};
+use super::{PcmEncoding, PumpEnd, pump_pcm};
 
 /// Start a child process and read PCM from its stdout.
 pub fn start(
@@ -20,7 +20,8 @@ pub fn start(
 ) -> Result<JoinHandle<()>> {
     let path = uri.path.clone();
     let params = uri.param("params").unwrap_or("").to_string();
-    let chunk_bytes = chunk_frames * format.frame_size() as usize;
+    let encoding = PcmEncoding::from_uri(&uri)?;
+    let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
 
     Ok(tokio::spawn(async move {
         let mut ts = ChunkTimestamper::new(format.rate());
@@ -46,8 +47,16 @@ pub fn start(
                 continue;
             };
 
-            if let PumpEnd::TxClosed =
-                pump_pcm(&mut stdout, &mut ts, chunk_frames, chunk_bytes, &tx, None).await
+            if let PumpEnd::TxClosed = pump_pcm(
+                &mut stdout,
+                &mut ts,
+                chunk_frames,
+                chunk_bytes,
+                encoding,
+                &tx,
+                None,
+            )
+            .await
             {
                 let _ = child.kill().await;
                 return;

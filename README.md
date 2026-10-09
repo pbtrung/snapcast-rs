@@ -54,6 +54,8 @@ Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pu
 - `process:///path/to/binary?params=...`: a child process's stdout
 - `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953)
 
+Sources send signed little-endian integer PCM by default. Add `&encoding=float` to send 32-bit little-endian floats instead (ffmpeg `-f f32le`). The Opus encoder then works on the floats directly, so nothing is quantized to 16 bits before encoding. With `float`, the bit depth in `sampleformat` only sets what the PCM and FLAC codecs convert to.
+
 Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root`).
 
 ## Inactive Clients
@@ -187,6 +189,7 @@ Run the checks with `make check` (fmt, clippy, tests).
 snapserver-rs --source "pipe:///tmp/snapfifo?name=Music"   # creates the FIFO if missing (&mode=read to only open it)
 snapserver-rs --codec flac
 snapserver-rs --codec "opus:BITRATE:256000,COMPLEXITY:10"  # needs the opus feature
+snapserver-rs --codec opus --source "pipe:///tmp/snapfifo?name=Music&encoding=float"  # f32le in, no 16-bit step
 snapserver-rs --stream-bind-address 127.0.0.1             # bind audio listener to loopback
 snapserver-rs --help
 
