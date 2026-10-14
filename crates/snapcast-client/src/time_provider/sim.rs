@@ -76,6 +76,9 @@ pub(super) struct Scenario {
     pub queue_max_usec: f64,
     /// Load alternates on/off with this period (s); 0 = always loaded.
     pub load_period_s: f64,
+    /// Sound card sample clock rate relative to the client clock (ppm), for
+    /// [`run_playout`].
+    pub dac_ppm: f64,
     pub seed: u64,
 }
 
@@ -92,6 +95,7 @@ impl Scenario {
             queue_prob: 0.0,
             queue_max_usec: 0.0,
             load_period_s: 0.0,
+            dac_ppm: 0.0,
             seed: 1,
         }
     }
@@ -157,6 +161,15 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             queue_max_usec: 5_000.0,
             ..Scenario::base("skew 50ppm + s2c queuing")
         },
+        Scenario {
+            dac_ppm: 50.0,
+            ..Scenario::base("sound card +50ppm")
+        },
+        Scenario {
+            skew_ppm: 30.0,
+            dac_ppm: -50.0,
+            ..Scenario::base("skew 30ppm, sound card -50ppm")
+        },
     ]
 }
 
@@ -164,6 +177,10 @@ pub(super) fn scenarios() -> Vec<Scenario> {
 pub(super) trait Estimator {
     fn add(&mut self, local_usec: i64, c2s_usec: i64, s2c_usec: i64);
     fn diff_at(&self, local_usec: i64) -> i64;
+    /// Whether playback may start (as the player checks).
+    fn synced(&self) -> bool {
+        true
+    }
 }
 
 impl Estimator for TimeProvider {
@@ -173,6 +190,10 @@ impl Estimator for TimeProvider {
 
     fn diff_at(&self, local_usec: i64) -> i64 {
         self.diff_to_server_usec_at(local_usec)
+    }
+
+    fn synced(&self) -> bool {
+        self.is_synced()
     }
 }
 
@@ -298,7 +319,8 @@ pub(super) struct Playout {
 }
 
 /// Play `scenario` through a [`Stream`](crate::stream::Stream) driven by a
-/// DAC on the client clock (480 frames every 10 ms) and `est` as the time
+/// DAC (480 frames every 10 ms of its own clock, [`Scenario::dac_ppm`] off
+/// the client clock) and `est` as the time
 /// provider, the server stamping 20 ms chunks on its own clock. Every frame
 /// carries its index, so each played frame identifies its server time.
 pub(super) fn run_playout(scenario: &Scenario, est: &mut dyn Estimator) -> Playout {
@@ -364,7 +386,7 @@ pub(super) fn run_playout(scenario: &Scenario, est: &mut dyn Estimator) -> Playo
 
         let server_now = t as i64 + est.diff_at(t as i64);
         buf.fill(0);
-        let played = stream.get_player_chunk(server_now, 0, &mut buf, DAC_FRAMES);
+        let played = est.synced() && stream.get_player_chunk(server_now, 0, &mut buf, DAC_FRAMES);
         let hard_syncing = stream.is_hard_syncing();
         if hard_syncing && !was_hard_syncing {
             hard_syncs += 1;
@@ -376,7 +398,7 @@ pub(super) fn run_playout(scenario: &Scenario, est: &mut dyn Estimator) -> Playo
             let ideal = server_clock(t) - (BUFFER_MS * 1000) as f64;
             errors.push(ts - ideal);
         }
-        t += f64::from(DAC_FRAMES) * 1e6 / RATE as f64;
+        t += f64::from(DAC_FRAMES) * 1e6 / RATE as f64 / (1.0 + scenario.dac_ppm * 1e-6);
     }
     Playout {
         error: Stats::from_errors(&errors),
@@ -494,8 +516,23 @@ mod tests {
         };
         let playout = run_playout(&s, &mut TimeProvider::new());
         assert_eq!(playout.hard_syncs, 0);
-        // The stream lets up to ~100 µs build up before soft sync corrects.
-        assert!(playout.error.p95 < 300.0, "{}", playout.error);
+        // As close as the estimate itself (p95 about 26 µs).
+        assert!(playout.error.p95 < 60.0, "{}", playout.error);
+    }
+
+    #[test]
+    fn stream_follows_a_drifting_sound_card() {
+        for name in ["sound card +50ppm", "skew 30ppm, sound card -50ppm"] {
+            let s = Scenario {
+                duration_s: 300.0,
+                ..scenario(name)
+            };
+            let playout = run_playout(&s, &mut TimeProvider::new());
+            assert_eq!(playout.hard_syncs, 0, "{name}");
+            // The integral term takes the drift: no lasting error.
+            assert!(playout.error.mean.abs() < 20.0, "{name}: {}", playout.error);
+            assert!(playout.error.p95 < 60.0, "{name}: {}", playout.error);
+        }
     }
 
     /// Prints the estimation error of the plain median (C++) and of

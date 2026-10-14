@@ -1,22 +1,23 @@
 //! Monotonic clock — the single source of truth for time synchronization.
 //!
-//! Both ends of a Snapcast connection MUST sample the *same* clock domain or
-//! time sync silently produces wrong offsets. This module is that shared
-//! source: `snapcast-client` and `snapcast-server` both call [`now_usec`]
-//! rather than each carrying their own copy of the platform FFI (which could
-//! drift out of sync with no compile error).
+//! The client estimates the constant offset between its clock and the
+//! server's, so the two ends need not share a clock domain; what matters is
+//! that each end timestamps everything (time exchanges, audio chunks) with
+//! one clock that never jumps. This module is that clock: `snapcast-client`
+//! and `snapcast-server` both call [`now_usec`] rather than each carrying
+//! their own copy of the platform FFI.
 //!
 //! Matches C++ `std::chrono::steady_clock`:
-//! - macOS: `mach_continuous_time` (note: differs from `CLOCK_MONOTONIC` by
-//!   ~2 s, so the choice matters), scaled by `mach_timebase_info`.
+//! - macOS: `mach_continuous_time`, scaled by `mach_timebase_info`.
 //! - Linux / other Unix: `CLOCK_MONOTONIC` via `clock_gettime`.
-//! - Non-Unix: falls back to wall-clock `SystemTime` (best effort).
+//! - Non-Unix: `std::time::Instant` (`QueryPerformanceCounter` on Windows,
+//!   as C++), offset to the wall clock at first use so values look alike.
 
 /// Current monotonic time in microseconds.
 ///
 /// Equivalent to the C++ `chronos::steadytimeofday` — microseconds on a
-/// monotonic timeline (since boot on Unix). Use this for any cross-endpoint
-/// timestamp so client and server agree on the clock.
+/// monotonic timeline (since boot on Unix). Use this for every timestamp
+/// sent to the peer.
 pub fn now_usec() -> i64 {
     monotonic_usec()
 }
@@ -26,8 +27,8 @@ pub fn now_usec() -> i64 {
 fn monotonic_usec() -> i64 {
     #[cfg(target_os = "macos")]
     {
-        // macOS: C++ steady_clock uses mach_continuous_time, not CLOCK_MONOTONIC.
-        // These differ by ~2s on macOS; we must match the peer's clock exactly.
+        // macOS: C++ steady_clock uses mach_continuous_time, not
+        // CLOCK_MONOTONIC; unlike it, this keeps counting during sleep.
         unsafe extern "C" {
             fn mach_continuous_time() -> u64;
             fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
@@ -63,11 +64,18 @@ fn monotonic_usec() -> i64 {
     }
     #[cfg(not(unix))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64
+        // The wall clock jumps when NTP steps it, so only its reading at
+        // first use is taken; the monotonic Instant counts from there.
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        static ANCHOR: std::sync::OnceLock<(Instant, i64)> = std::sync::OnceLock::new();
+        let (start, start_usec) = *ANCHOR.get_or_init(|| {
+            let wall = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as i64;
+            (Instant::now(), wall.max(1))
+        });
+        start_usec + start.elapsed().as_micros() as i64
     }
 }
 

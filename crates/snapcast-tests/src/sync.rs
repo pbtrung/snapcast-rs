@@ -617,10 +617,14 @@ fn dac_loop(
         let now = begin_usec + (tick * n).as_micros() as i64;
         let record = at - begin > warmup;
         for ((tp, stream), out) in clients.iter().zip(&mut samples) {
-            let diff = tp.lock().unwrap().diff_to_server_usec();
+            let (synced, diff) = {
+                let tp = tp.lock().unwrap();
+                (tp.is_synced(), tp.diff_to_server_usec())
+            };
             buf.fill(0);
-            let played =
-                stream
+            // As the player: silence until the clock is known.
+            let played = synced
+                && stream
                     .lock()
                     .unwrap()
                     .get_player_chunk(now + diff, 0, &mut buf, DAC_FRAMES);

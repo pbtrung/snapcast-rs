@@ -116,8 +116,6 @@ impl PcmChunk {
     }
 }
 
-/// Correction threshold — soft sync starts when |short_median| > 100µs
-const CORRECTION_BEGIN_USEC: i64 = 100;
 /// Hard sync: |median| exceeds this (µs).
 const HARD_SYNC_MEDIAN_USEC: i64 = 2000;
 /// Hard sync: |short_median| exceeds this (µs).
@@ -128,13 +126,18 @@ const HARD_SYNC_MINI_MEDIAN_USEC: i64 = 50000;
 const HARD_SYNC_AGE_USEC: i64 = 500_000;
 /// Minimum |age| for hard sync re-trigger (µs).
 const HARD_SYNC_MIN_AGE_USEC: i64 = 500;
-/// Minimum |mini_median| for soft sync (µs).
-const SOFT_SYNC_MIN_USEC: i64 = 50;
-/// Maximum playback rate correction factor.
+/// Largest playback rate correction (500 ppm, as C++).
 const MAX_RATE_CORRECTION: f64 = 0.0005;
-/// Rate correction scaling factor.
-const RATE_CORRECTION_SCALE: f64 = 0.00005;
-/// DoubleBuffer capacity for mini (fast) drift detection.
+/// Proportional gain of the playout controller (per second): an error is
+/// corrected with a time constant of `1 / KP` (2 s), 1 ms at the most
+/// within it.
+const KP: f64 = 0.5;
+/// Integral gain (per second²), critically damped with [`KP`]. The integral
+/// learns the rate difference between the sound card and the server clock,
+/// which a proportional correction alone would leave as a constant error.
+const KI: f64 = KP * KP / 4.0;
+/// DoubleBuffer capacity for mini (fast) drift detection; its median is the
+/// error the playout controller corrects.
 const MINI_BUFFER_SIZE: usize = 20;
 /// DoubleBuffer capacity for short-term drift detection.
 const SHORT_BUFFER_SIZE: usize = 100;
@@ -164,10 +167,14 @@ const DISCONTINUITY_HARD_SYNC_USEC: i64 = HARD_SYNC_AGE_USEC;
 ///    correct smoothly (long-term median > 2ms, short-term median > 5ms, mini
 ///    median > 50ms, or a single age > 500ms). The stream skips forward in the
 ///    buffer or inserts silence to reach the desired target time exactly.
-/// 2. **Soft Sync**: Used for fine-tuning when the short-term median drift
-///    exceeds 100µs. Instead of jumping, the stream adjusts the playback rate
-///    (by at most 0.05%) by adding or removing single frames at regular
-///    intervals. This is inaudible to most listeners.
+/// 2. **Soft Sync**: Used for everything else. Instead of jumping, the
+///    stream adjusts the playback rate (by at most 0.05%) by adding or
+///    removing single frames, spread out evenly. A PI controller sets the
+///    rate from the median age of the last 20 buffers: the proportional term
+///    removes an error within a few seconds, the integral term learns the
+///    rate difference between the sound card and the server clock. The rate
+///    is applied fractionally, so even a correction of a few ppm is exact on
+///    average. This is inaudible to most listeners.
 ///
 /// ### Drift Detection
 ///
@@ -175,8 +182,8 @@ const DISCONTINUITY_HARD_SYNC_USEC: i64 = HARD_SYNC_AGE_USEC;
 /// *should* have been played (server time) and when it *is* being played (now).
 ///
 /// The stream maintains three `DoubleBuffer` instances to track drift over different timescales:
-/// - **Mini Buffer** (20 samples): Fast reaction to sudden network or system jitter.
-/// - **Short Buffer** (100 samples): Used for calculating soft sync rate corrections.
+/// - **Mini Buffer** (20 samples): The error the soft sync corrects.
+/// - **Short Buffer** (100 samples): Hard sync re-triggering.
 /// - **Long Buffer** (500 samples): Long-term stability tracking and hard sync re-triggering.
 ///
 /// The median value of these buffers is used to filter out outliers and ensure stable
@@ -205,10 +212,13 @@ pub struct Stream {
     short_median: i64,
 
     // Soft sync (rate correction) state
-    /// Number of frames played at the current (corrected) rate.
-    played_frames: u32,
-    /// How many frames to play before adding/removing a single sample (0 if no correction).
-    correct_after_x_frames: i32,
+    /// Fraction of the playback rate removed (positive: frames are dropped,
+    /// playing faster).
+    rate_correction: f64,
+    /// Integral of the error (µs·s).
+    error_integral: f64,
+    /// Frames owed to the rate correction, less than one either way.
+    correction_frames: f64,
     /// Cumulative difference in frames caused by rate correction (for logging).
     frame_delta: i32,
     /// Internal buffer used for sample insertion/removal.
@@ -238,8 +248,9 @@ impl Stream {
             buffer: DoubleBuffer::new(BUFFER_SIZE),
             median: 0,
             short_median: 0,
-            played_frames: 0,
-            correct_after_x_frames: 0,
+            rate_correction: 0.0,
+            error_integral: 0.0,
+            correction_frames: 0.0,
             frame_delta: 0,
             read_buf: Vec::new(),
             last_log_sec: 0,
@@ -300,14 +311,25 @@ impl Stream {
         self.short_buffer.add(age);
     }
 
-    fn set_real_sample_rate(&mut self, sample_rate: f64) {
-        let nominal = self.format.rate() as f64;
-        if (sample_rate - nominal).abs() < f64::EPSILON {
-            self.correct_after_x_frames = 0;
-        } else {
-            let ratio = nominal / sample_rate;
-            self.correct_after_x_frames = (ratio / (ratio - 1.0)).round() as i32;
-        }
+    /// Forget the soft sync state, so a hard sync's jump isn't learned as
+    /// drift. Kept across underruns: the drift hasn't changed.
+    fn reset_soft_sync(&mut self) {
+        self.rate_correction = 0.0;
+        self.error_integral = 0.0;
+        self.correction_frames = 0.0;
+    }
+
+    /// Set the rate correction from the filtered age `error_usec` after
+    /// playing `frames` frames.
+    fn update_soft_sync(&mut self, error_usec: f64, frames: u32) {
+        let dt = f64::from(frames) / f64::from(self.format.rate());
+        // Clamped so the integral term alone stays within the rate limit
+        // (no windup).
+        let max_integral = MAX_RATE_CORRECTION * 1e6 / KI;
+        self.error_integral =
+            (self.error_integral + error_usec * dt).clamp(-max_integral, max_integral);
+        self.rate_correction = ((KP * error_usec + KI * self.error_integral) * 1e-6)
+            .clamp(-MAX_RATE_CORRECTION, MAX_RATE_CORRECTION);
     }
 
     /// Fill `output` with time-synchronized PCM data. Returns false if no data available.
@@ -396,15 +418,11 @@ impl Stream {
 
         // --- Normal playback with drift correction ---
 
-        // Compute frames correction from current rate adjustment
-        let mut frames_correction: i32 = 0;
-        if self.correct_after_x_frames != 0 {
-            self.played_frames += frames;
-            if self.played_frames >= self.correct_after_x_frames.unsigned_abs() {
-                frames_correction = self.played_frames as i32 / self.correct_after_x_frames;
-                self.played_frames %= self.correct_after_x_frames.unsigned_abs();
-            }
-        }
+        // Whole frames to drop (positive) or repeat at the current rate; the
+        // fraction carries over.
+        self.correction_frames += self.rate_correction * f64::from(frames);
+        let frames_correction = self.correction_frames.trunc() as i32;
+        self.correction_frames -= f64::from(frames_correction);
 
         // Read with correction (or plain read if correction == 0)
         let chunk_start = match self.read_with_correction(output, frames, frames_correction) {
@@ -413,9 +431,6 @@ impl Stream {
         };
 
         let age_usec = playout_usec - chunk_start;
-
-        // Reset sample rate to nominal, soft sync may override below
-        self.set_real_sample_rate(self.format.rate() as f64);
 
         // Hard sync re-trigger thresholds (matching C++)
         if self.buffer.full()
@@ -449,29 +464,20 @@ impl Stream {
         } else if age_usec.abs() > HARD_SYNC_AGE_USEC {
             tracing::info!(age_usec, "Hard sync: |age| > 500ms");
             self.hard_sync = true;
-        } else if self.short_buffer.full() {
-            // Soft sync: adjust playback speed based on drift
-            let mini_median = self.mini_buffer.median_simple();
-            if self.short_median > CORRECTION_BEGIN_USEC
-                && mini_median > SOFT_SYNC_MIN_USEC
-                && age_usec > SOFT_SYNC_MIN_USEC
-            {
-                let rate = (self.short_median as f64 / 100.0) * RATE_CORRECTION_SCALE;
-                let rate = 1.0 - rate.min(MAX_RATE_CORRECTION);
-                self.set_real_sample_rate(self.format.rate() as f64 * rate);
-            } else if self.short_median < -CORRECTION_BEGIN_USEC
-                && mini_median < -SOFT_SYNC_MIN_USEC
-                && age_usec < -SOFT_SYNC_MIN_USEC
-            {
-                let rate = (-self.short_median as f64 / 100.0) * RATE_CORRECTION_SCALE;
-                let rate = 1.0 + rate.min(MAX_RATE_CORRECTION);
-                self.set_real_sample_rate(self.format.rate() as f64 * rate);
+        }
+
+        if self.hard_sync {
+            self.reset_soft_sync();
+        } else {
+            self.update_buffers(age_usec);
+            if self.mini_buffer.full() {
+                let error = self.mini_buffer.median_simple();
+                self.update_soft_sync(error as f64, frames);
             }
         }
 
-        self.update_buffers(age_usec);
-
-        // Stats logging (once per second)
+        // The long medians only re-trigger hard syncs; once a second is
+        // enough. Stats are logged with them.
         let now_sec = server_now_usec / 1_000_000;
         if now_sec != self.last_log_sec {
             self.last_log_sec = now_sec;
@@ -479,7 +485,7 @@ impl Stream {
             self.short_median = self.short_buffer.median_simple();
             tracing::debug!(
                 target: "Stats",
-                "Chunk: {}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "Chunk: {}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}ppm",
                 age_usec,
                 self.mini_buffer.median_simple(),
                 self.short_median,
@@ -487,6 +493,7 @@ impl Stream {
                 self.buffer.len(),
                 output_buffer_dac_time_usec / 1000,
                 self.frame_delta,
+                self.rate_correction * 1e6,
             );
             self.frame_delta = 0;
         }
@@ -770,14 +777,51 @@ mod tests {
     }
 
     #[test]
-    fn set_real_sample_rate_correction() {
-        let f = fmt();
-        let mut stream = Stream::new(f);
-        stream.set_real_sample_rate(48000.0);
-        assert_eq!(stream.correct_after_x_frames, 0);
+    fn soft_sync_rate_is_proportional_and_clamped() {
+        let mut stream = Stream::new(fmt());
+        stream.update_soft_sync(100.0, 0);
+        assert!((stream.rate_correction - KP * 100e-6).abs() < 1e-12);
+        stream.update_soft_sync(-10_000.0, 0);
+        assert_eq!(stream.rate_correction, -MAX_RATE_CORRECTION);
+    }
 
-        stream.set_real_sample_rate(47999.0);
-        assert_ne!(stream.correct_after_x_frames, 0);
+    #[test]
+    fn soft_sync_integral_learns_a_constant_drift() {
+        let mut stream = Stream::new(fmt());
+        // Error from a constant 30 ppm drift, integrated over a minute
+        // (a 10 ms buffer each step) with the error held at 0: the integral
+        // term alone keeps correcting.
+        for _ in 0..6000 {
+            stream.update_soft_sync(60.0, 480);
+        }
+        let learned = stream.rate_correction;
+        stream.update_soft_sync(0.0, 480);
+        assert!(stream.rate_correction > 0.0);
+        assert!(stream.rate_correction <= learned);
+        stream.reset_soft_sync();
+        stream.update_soft_sync(0.0, 480);
+        assert_eq!(stream.rate_correction, 0.0, "a hard sync forgets it");
+    }
+
+    #[test]
+    fn fractional_rate_drops_frames_exactly() {
+        // 1/7680 (130 ppm) is 1/16 frame per 480: one frame dropped every
+        // 16th buffer, 64 (1.3 ms, short of a hard sync) over 1024.
+        let f = fmt();
+        let mut s = Stream::new(f);
+        s.set_buffer_ms(1000);
+        s.add_chunk(counter_chunk(99_000_000, 0, 48_000 * 20));
+        let mut buf = vec![0u8; 480 * 4];
+        assert!(s.get_player_chunk(100_000_000, 0, &mut buf, 480));
+        let calls = 1024;
+        for i in 1..=calls {
+            // Held, instead of what the controller makes of the age.
+            s.rate_correction = 1.0 / 7680.0;
+            assert!(s.get_player_chunk(100_000_000 + i * 10_000, 0, &mut buf, 480));
+        }
+        assert!(!s.hard_sync);
+        let last = *indices(&buf).last().unwrap();
+        assert_eq!(last - 480 * (calls as u32 + 1), 64);
     }
 
     #[test]

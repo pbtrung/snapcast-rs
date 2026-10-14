@@ -5,9 +5,12 @@
 //! one binary-protocol frame.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use snapcast_proto::MessageType;
 use snapcast_proto::message::base::BaseMessage;
@@ -24,10 +27,12 @@ type WsStream = WebSocketStream<StampedStream>;
 /// A TCP stream that records when its last read returned data.
 ///
 /// The WebSocket layer reads the socket itself; a message's arrival time is
-/// that of the read completing it, as on the plain TCP transport.
+/// that of the read completing it, as on the plain TCP transport. The time
+/// (µs) is shared with the reader task, which only has the stream's read
+/// half.
 struct StampedStream {
     inner: TcpStream,
-    read_at: Timeval,
+    read_at: Arc<AtomicI64>,
 }
 
 impl AsyncRead for StampedStream {
@@ -39,7 +44,8 @@ impl AsyncRead for StampedStream {
         let filled = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > filled {
-            self.read_at = super::steady_time_of_day();
+            self.read_at
+                .store(snapcast_proto::time::now_usec(), Ordering::Relaxed);
         }
         poll
     }
@@ -78,7 +84,7 @@ fn stream_url(scheme: &str, host: &str, port: u16) -> String {
 
 /// Send one binary Snapcast frame over the WebSocket stream.
 async fn send_frame(
-    ws: &mut WsStream,
+    ws: &mut SplitSink<WsStream, Message>,
     msg_type: MessageType,
     payload: &MessagePayload,
 ) -> Result<()> {
@@ -98,7 +104,7 @@ async fn send_frame(
 }
 
 /// Receive one binary Snapcast frame from the WebSocket stream.
-async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
+async fn recv_frame(ws: &mut SplitStream<WsStream>, read_at: &AtomicI64) -> Result<TypedMessage> {
     loop {
         let msg = ws
             .next()
@@ -117,7 +123,7 @@ async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
                     "{} trailing bytes after frame in WebSocket message",
                     buf.len()
                 );
-                msg.base.received = ws.get_ref().read_at;
+                msg.base.received = Timeval::from_usec(read_at.load(Ordering::Relaxed));
                 return Ok(msg);
             }
             Message::Close(_) => anyhow::bail!("WebSocket closed"),
@@ -128,7 +134,8 @@ async fn recv_frame(ws: &mut WsStream) -> Result<TypedMessage> {
 
 /// WebSocket transport for Snapcast binary frames.
 pub struct WsConnection {
-    ws: Option<WsStream>,
+    sink: Option<SplitSink<WsStream, Message>>,
+    reader: Option<super::Reader>,
     host: String,
     port: u16,
 }
@@ -137,7 +144,8 @@ impl WsConnection {
     /// Create a new WebSocket connection descriptor.
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            ws: None,
+            sink: None,
+            reader: None,
             host: host.to_string(),
             port,
         }
@@ -151,26 +159,32 @@ impl WsConnection {
             .with_context(|| format!("connecting to {}:{}", self.host, self.port))?;
         // Time sync messages are tiny; don't let Nagle delay them.
         tcp.set_nodelay(true).context("setting TCP_NODELAY")?;
+        let read_at = Arc::new(AtomicI64::new(0));
         let stream = StampedStream {
             inner: tcp,
-            read_at: Timeval::default(),
+            read_at: Arc::clone(&read_at),
         };
         let (ws, _) = tokio_tungstenite::client_async(&url, stream)
             .await
             .with_context(|| format!("WebSocket connect to {url}"))?;
-        self.ws = Some(ws);
+        let (sink, mut stream) = ws.split();
+        self.reader = Some(super::Reader::spawn(|tx| async move {
+            while super::forward(&tx, recv_frame(&mut stream, &read_at).await).await {}
+        }));
+        self.sink = Some(sink);
         Ok(())
     }
 
     /// Close the WebSocket connection.
     pub fn disconnect(&mut self) {
-        self.ws = None;
+        self.sink = None;
+        self.reader = None;
     }
 
     /// Send one binary Snapcast frame.
     pub async fn send(&mut self, msg_type: MessageType, payload: &MessagePayload) -> Result<()> {
         send_frame(
-            self.ws.as_mut().context("not connected")?,
+            self.sink.as_mut().context("not connected")?,
             msg_type,
             payload,
         )
@@ -179,7 +193,7 @@ impl WsConnection {
 
     /// Receive one binary Snapcast frame.
     pub async fn recv(&mut self) -> Result<TypedMessage> {
-        recv_frame(self.ws.as_mut().context("not connected")?).await
+        self.reader.as_mut().context("not connected")?.recv().await
     }
 }
 

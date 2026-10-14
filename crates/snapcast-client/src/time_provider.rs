@@ -22,6 +22,15 @@
 //! would add more noise at the window's end than a zero-skew median has.
 //! The offset is the weighted median diff of the last 200 exchanges, each
 //! moved to the current time along the skew.
+//!
+//! The history is only valid for one server clock. A diff is within half
+//! its round trip of the true difference, so an exchange further than that
+//! (plus [`JUMP_USEC`]) from the estimate proves the server clock changed:
+//! another server, a restarted one, or a client that was suspended (the
+//! monotonic clock stops during suspend). After [`RESTART_SAMPLES`] such
+//! exchanges in a row the history is replaced by them. On a new connection
+//! the first [`PROBATION_SAMPLES`] exchanges are held back and decide
+//! together, by their median, whether the history is kept.
 
 use std::collections::VecDeque;
 
@@ -68,6 +77,16 @@ const MAX_SLEW: f64 = 250e-6;
 /// ...unless the fit is further off than this: a real change (another
 /// server), followed at once (it takes a hard sync anyway).
 const JUMP_USEC: f64 = 5_000.0;
+/// Consecutive exchanges further than [`JUMP_USEC`] plus half their round
+/// trip from the estimate that replace the history.
+const RESTART_SAMPLES: usize = 3;
+/// Exchanges held back after a new connection, which decide by their median
+/// whether the history (and its skew) is still valid.
+const PROBATION_SAMPLES: usize = 5;
+/// Exchanges needed before the estimate is used for playback (one second of
+/// the controller's quick syncs): a single reply may have waited behind
+/// audio.
+const SYNCED_SAMPLES: usize = 10;
 
 /// The clock difference as a line: `offset + skew * (t - anchor)`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,7 +110,16 @@ struct Sample {
     /// `c2s + s2c`: the round trip minus the server's turnaround.
     rtt_usec: i64,
     /// `(c2s - s2c) / 2`: the clock difference plus half the path asymmetry.
-    diff_usec: i64,
+    diff_usec: f64,
+}
+
+impl Sample {
+    /// Whether this exchange rules out `model`: its diff is within half
+    /// its round trip of the true difference.
+    fn contradicts(&self, model: &Line) -> bool {
+        let bound = JUMP_USEC + self.rtt_usec.max(0) as f64 / 2.0;
+        (self.diff_usec - model.at(self.local_usec)).abs() > bound
+    }
 }
 
 /// Provides the estimated server time based on time sync messages.
@@ -104,6 +132,11 @@ pub struct TimeProvider {
     ///
     /// [`now_usec`]: snapcast_proto::time::now_usec
     last_sync_usec: Option<i64>,
+    /// Exchanges held back from `samples`: during probation, or while they
+    /// contradict the estimate.
+    pending: Vec<Sample>,
+    /// Exchanges still to hold back for the probation of a new connection.
+    probation: usize,
 }
 
 impl Default for TimeProvider {
@@ -119,7 +152,28 @@ impl TimeProvider {
             samples: VecDeque::with_capacity(SKEW_WINDOW),
             model: Line::default(),
             last_sync_usec: None,
+            pending: Vec::new(),
+            probation: 0,
         }
+    }
+
+    /// Start the probation of a new connection: the next
+    /// [`PROBATION_SAMPLES`] exchanges decide whether the history (from the
+    /// same server clock, as after a network drop) is kept or replaced (a
+    /// restarted or other server). Call before the first time request.
+    pub fn new_connection(&mut self) {
+        self.pending.clear();
+        self.probation = if self.samples.is_empty() {
+            0
+        } else {
+            PROBATION_SAMPLES
+        };
+    }
+
+    /// Whether the estimate is good enough to play by: enough exchanges
+    /// since the start (or a restart) and no probation running.
+    pub fn is_synced(&self) -> bool {
+        self.probation == 0 && self.samples.len() >= SYNCED_SAMPLES
     }
 
     /// Set the time diff from a c2s/s2c latency pair (as received in Time messages).
@@ -146,7 +200,7 @@ impl TimeProvider {
         let sample = Sample {
             local_usec,
             rtt_usec: c2s_usec + s2c_usec,
-            diff_usec: (c2s_usec - s2c_usec) / 2,
+            diff_usec: (c2s_usec - s2c_usec) as f64 / 2.0,
         };
         tracing::trace!(
             diff_usec = sample.diff_usec,
@@ -158,14 +212,76 @@ impl TimeProvider {
         let since_last = self.last_sync_usec.map_or(0, |last| local_usec - last);
         if since_last > RESET_AFTER_USEC {
             self.samples.clear();
+            self.pending.clear();
+            self.probation = 0;
         }
         self.last_sync_usec = Some(local_usec);
 
+        if self.probation > 0 {
+            self.pending.push(sample);
+            self.probation -= 1;
+            if self.probation == 0 {
+                self.end_probation(local_usec, since_last);
+            }
+            return;
+        }
+        if !self.samples.is_empty() && sample.contradicts(&self.model) {
+            self.pending.push(sample);
+            if self.pending.len() >= RESTART_SAMPLES {
+                tracing::info!(
+                    diff_usec = sample.diff_usec,
+                    estimate_usec = self.model.at(local_usec),
+                    "Server clock changed, restarting time sync"
+                );
+                self.restart(local_usec);
+            }
+            return;
+        }
+        self.pending.clear();
+        self.push(sample);
+        self.update_model(local_usec, since_last);
+    }
+
+    /// Decide on the exchanges held back since a new connection: keep the
+    /// history if their median agrees with the estimate, else replace it.
+    fn end_probation(&mut self, local_usec: i64, since_last: i64) {
+        let mut diffs: Vec<f64> = self.pending.iter().map(|s| s.diff_usec).collect();
+        let mut rtts: Vec<f64> = self.pending.iter().map(|s| s.rtt_usec as f64).collect();
+        let (Some(diff), Some(rtt)) = (median(&mut diffs), median(&mut rtts)) else {
+            return;
+        };
+        let estimate = self.model.at(local_usec);
+        if (diff - estimate).abs() > JUMP_USEC + rtt.max(0.0) / 2.0 {
+            tracing::info!(
+                diff_usec = diff,
+                estimate_usec = estimate,
+                "New connection to another server clock, restarting time sync"
+            );
+            self.restart(local_usec);
+        } else {
+            for sample in std::mem::take(&mut self.pending) {
+                self.push(sample);
+            }
+            self.update_model(local_usec, since_last);
+        }
+    }
+
+    /// Replace the history by the held back exchanges.
+    fn restart(&mut self, local_usec: i64) {
+        self.samples.clear();
+        self.samples.extend(self.pending.drain(..));
+        self.model = self.fit(local_usec);
+    }
+
+    fn push(&mut self, sample: Sample) {
         if self.samples.len() == SKEW_WINDOW {
             self.samples.pop_front();
         }
         self.samples.push_back(sample);
+    }
 
+    /// Move the estimate towards the fit of `samples`.
+    fn update_model(&mut self, local_usec: i64, since_last: i64) {
         let fit = self.fit(local_usec);
         self.model = if self.samples.len() < SETTLED_SAMPLES {
             fit
@@ -194,7 +310,7 @@ impl TimeProvider {
         let mut offsets: Vec<(f64, f64)> = rtt_weights(&window)
             .into_iter()
             .zip(&window)
-            .map(|(w, s)| (s.diff_usec as f64 - skew * (s.local_usec - now) as f64, w))
+            .map(|(w, s)| (s.diff_usec - skew * (s.local_usec - now) as f64, w))
             .collect();
         Line {
             anchor_usec: now,
@@ -244,7 +360,7 @@ fn skew_of(samples: &[Sample]) -> Option<f64> {
     let points: Vec<(i64, f64)> = samples
         .chunks(samples.len().div_ceil(SKEW_BINS))
         .filter_map(|group| {
-            let mut diffs: Vec<f64> = group.iter().map(|s| s.diff_usec as f64).collect();
+            let mut diffs: Vec<f64> = group.iter().map(|s| s.diff_usec).collect();
             Some((group[group.len() / 2].local_usec, median(&mut diffs)?))
         })
         .collect();
@@ -271,7 +387,7 @@ fn skew_of(samples: &[Sample]) -> Option<f64> {
         / samples.len() as f64;
     let mut residuals: Vec<f64> = samples
         .iter()
-        .map(|s| s.diff_usec as f64 - slope * (s.local_usec - t0) as f64)
+        .map(|s| s.diff_usec - slope * (s.local_usec - t0) as f64)
         .collect();
     let center = median(&mut residuals)?;
     let mut deviations: Vec<f64> = residuals.iter().map(|r| (r - center).abs()).collect();
@@ -425,10 +541,13 @@ mod tests {
     #[test]
     fn skew_is_clamped() {
         let mut tp = TimeProvider::new();
+        // 1000 ppm, beyond the clamp. The 2 s round trip keeps the
+        // estimate, trailing behind, from counting as a clock change.
         for i in 0..200 {
-            let diff = 2_000 * i; // 2000 ppm
-            tp.add_sample_at(i * 1_000_000, 1_000 + diff, 1_000 - diff);
+            let diff = 1_000 * i;
+            tp.add_sample_at(i * 1_000_000, 1_000_000 + diff, 1_000_000 - diff);
         }
+        assert_eq!(tp.samples.len(), 200, "no restart");
         assert!((tp.model.skew - MAX_SKEW_PPM * 1e-6).abs() < 1e-12);
     }
 
@@ -459,6 +578,103 @@ mod tests {
             tp.add_sample_at(i * 1_000_000, 11_500, -8_500);
         }
         assert_eq!(tp.diff_to_server_usec_at(300_000_000), 10_000);
+    }
+
+    /// Exchanges once per second from `from` s to `to` s on a link with
+    /// 1 ms each way and a server clock `diff` µs ahead.
+    fn feed(tp: &mut TimeProvider, from: i64, to: i64, diff: i64) {
+        for i in from..to {
+            tp.add_sample_at(i * 1_000_000, 1_000 + diff, 1_000 - diff);
+        }
+    }
+
+    #[test]
+    fn diff_keeps_half_microseconds() {
+        let mut tp = TimeProvider::new();
+        tp.add_sample_at(0, 1_001, 1_000);
+        assert_eq!(tp.samples[0].diff_usec, 0.5);
+    }
+
+    #[test]
+    fn reconnect_to_the_same_clock_keeps_the_history() {
+        let mut tp = TimeProvider::new();
+        // 50 ppm skew, learned over 10 minutes.
+        for i in 0..600 {
+            let diff = 5_000 + 50 * i;
+            tp.add_sample_at(i * 1_000_000, 1_000 + diff, 1_000 - diff);
+        }
+        let skew = tp.model.skew;
+        assert!((skew * 1e6 - 50.0).abs() < 1.0);
+        tp.new_connection();
+        assert!(!tp.is_synced(), "probation holds playback");
+        for i in 0..PROBATION_SAMPLES as i64 {
+            let t = 603 + i;
+            let diff = 5_000 + 50 * t;
+            tp.add_sample_at(t * 1_000_000, 1_000 + diff, 1_000 - diff);
+        }
+        assert!(tp.is_synced());
+        assert_eq!(tp.samples.len(), 600 + PROBATION_SAMPLES);
+        assert_eq!(tp.model.skew, skew, "the skew survives");
+    }
+
+    #[test]
+    fn reconnect_to_another_clock_restarts_within_the_probation() {
+        let mut tp = TimeProvider::new();
+        feed(&mut tp, 0, 600, 5_000_000);
+        tp.new_connection();
+        feed(&mut tp, 602, 602 + PROBATION_SAMPLES as i64, -3_000_000);
+        assert_eq!(tp.diff_to_server_usec_at(607_000_000), -3_000_000);
+        assert_eq!(tp.samples.len(), PROBATION_SAMPLES);
+        assert_eq!(tp.model.skew, 0.0, "no slope across the two clocks");
+        assert!(!tp.is_synced(), "too few exchanges yet");
+        feed(&mut tp, 607, 612, -3_000_000);
+        assert!(tp.is_synced());
+    }
+
+    #[test]
+    fn clock_change_without_reconnect_restarts() {
+        // As after a suspend: the same connection, another clock difference.
+        let mut tp = TimeProvider::new();
+        feed(&mut tp, 0, 600, 5_000);
+        feed(&mut tp, 600, 600 + RESTART_SAMPLES as i64 - 1, 900_000);
+        assert_eq!(tp.diff_to_server_usec_at(602_000_000), 5_000, "not yet");
+        feed(&mut tp, 602, 603, 900_000);
+        assert_eq!(tp.diff_to_server_usec_at(603_000_000), 900_000);
+        assert_eq!(tp.samples.len(), RESTART_SAMPLES);
+    }
+
+    #[test]
+    fn a_stray_exchange_is_dropped() {
+        let mut tp = TimeProvider::new();
+        feed(&mut tp, 0, 100, 5_000);
+        feed(&mut tp, 100, 101, 900_000);
+        feed(&mut tp, 101, 110, 5_000);
+        assert_eq!(tp.diff_to_server_usec_at(110_000_000), 5_000);
+        assert_eq!(tp.samples.len(), 109);
+        assert!(tp.pending.is_empty());
+    }
+
+    #[test]
+    fn a_queued_reply_does_not_count_as_a_clock_change() {
+        // 20 ms behind audio shifts the diff by 10 ms, within its bound.
+        let mut tp = TimeProvider::new();
+        feed(&mut tp, 0, 100, 0);
+        for i in 100..110 {
+            tp.add_sample_at(i * 1_000_000, 1_000, 21_000);
+        }
+        assert!(tp.pending.is_empty());
+        assert_eq!(tp.samples.len(), 110);
+    }
+
+    #[test]
+    fn synced_after_enough_exchanges() {
+        let mut tp = TimeProvider::new();
+        assert!(!tp.is_synced());
+        tp.new_connection();
+        feed(&mut tp, 0, SYNCED_SAMPLES as i64 - 1, 0);
+        assert!(!tp.is_synced());
+        feed(&mut tp, 9, 10, 0);
+        assert!(tp.is_synced());
     }
 
     #[test]

@@ -119,6 +119,12 @@ impl Controller {
             port = self.settings.port,
             "Connected"
         );
+        // The server may have restarted, or be another one: the next time
+        // exchanges decide whether the clock history still holds.
+        self.time_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .new_connection();
         self.emit(ClientEvent::Connected {
             host: self.settings.host.clone(),
             port: self.settings.port,
@@ -196,10 +202,7 @@ impl Controller {
         let sync_timer = tokio::time::sleep(sync_jitter.next(QUICK_SYNC_INTERVAL));
         tokio::pin!(sync_timer);
 
-        self.connection
-            .send(MessageType::Time, &MessagePayload::Time(Time::new()))
-            .await
-            .ok();
+        self.send_time_request().await;
 
         loop {
             tokio::select! {
@@ -230,18 +233,22 @@ impl Controller {
                     }
                 }
                 () = &mut sync_timer => {
-                    self.connection
-                        .send(MessageType::Time, &MessagePayload::Time(Time::new()))
-                        .await
-                        .ok();
-                    let interval = if quick_syncs_remaining > 0 {
+                    self.send_time_request().await;
+                    let (synced, diff) = {
+                        let tp = self.time_provider.lock().unwrap_or_else(|e| e.into_inner());
+                        (tp.is_synced(), tp.diff_to_server_usec())
+                    };
+                    if quick_syncs_remaining > 0 {
                         quick_syncs_remaining -= 1;
                         if quick_syncs_remaining == 0 {
-                            let diff = self.time_provider.lock().unwrap_or_else(|e| e.into_inner()).diff_to_server_usec();
                             let diff_ms = diff as f64 / 1000.0;
                             tracing::info!(diff_ms, "Time sync complete");
                             self.emit(ClientEvent::TimeSyncComplete { diff_ms });
                         }
+                    }
+                    // Also quick while playback waits for the estimate, as
+                    // after a server clock change.
+                    let interval = if quick_syncs_remaining > 0 || !synced {
                         QUICK_SYNC_INTERVAL
                     } else {
                         SYNC_INTERVAL
@@ -252,6 +259,13 @@ impl Controller {
                 }
             }
         }
+    }
+
+    async fn send_time_request(&mut self) {
+        self.connection
+            .send(MessageType::Time, &MessagePayload::Time(Time::new()))
+            .await
+            .ok();
     }
 
     fn handle_message(&mut self, msg: TypedMessage) -> Result<()> {
@@ -305,11 +319,16 @@ impl Controller {
                 self.init_audio_pipeline(&ch)?;
             }
             MessagePayload::Time(t) => {
+                // Timed by the arrival, not by when it is handled here.
                 let s2c = msg.base.received - msg.base.sent;
                 self.time_provider
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .set_diff(&t.latency, &s2c);
+                    .add_sample_at(
+                        msg.base.received.to_usec(),
+                        t.latency.to_usec(),
+                        s2c.to_usec(),
+                    );
             }
             MessagePayload::Error(e) => {
                 tracing::error!(code = e.code, error = %e.error, "Server error");

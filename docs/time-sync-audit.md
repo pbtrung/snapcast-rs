@@ -14,6 +14,43 @@ proposed fixes. Date: 2026-10-10 (at 0.999.15).
 - One suspected bug: the cpal player plays one audio period early.
 - None of the fixes needs a protocol change.
 
+## Implementation status (2026-10-14)
+
+| Item | Status |
+|---|---|
+| #1 Reconnect to another server clock | Done: 5-sample probation on each new connection, plus restart after 3 consecutive impossible exchanges (`TimeProvider::new_connection`, `RESTART_SAMPLES`) |
+| #2 Suspend/resume | Done: covered by the restart check |
+| #3 Output delay | Done: `num_frames` term dropped. Every cpal 0.18 backend (ALSA, CoreAudio, WASAPI, PulseAudio) sets `playback` to when the first frame of the buffer is heard. Not yet measured with a loopback |
+| #4 Playback starts on the first sample | Done: the player plays silence until `TimeProvider::is_synced` (10 exchanges, no probation running); the controller keeps quick syncs going while not synced |
+| #5 Receive stamps include decode time | Done: TCP and WebSocket connections read on their own task |
+| #6 Minor | Done: half-µs diffs kept; non-Unix clock is `Instant`-based; clock comment corrected |
+| PI playout controller | Done: median of the last 20 ages, `KP` = 0.5/s, `KI` = `KP²/4`, ±500 ppm, fractional frame accumulator |
+| Burst syncs | Tried and dropped: with 3 requests per sync and the fastest reply kept, the backlog-in-server-socket scenario of `sync_accuracy` got worse (client time diff −370 to −1190 µs against −95 to −160 µs with single requests). The replies wait behind the same backlog and arrive together, so the fastest one is not the least queued. No gain showed elsewhere |
+| Kernel timestamps, PTP mode | Not done |
+
+Simulator, steady state (from 120 s), absolute playout error p50 / p95 in µs:
+
+| Scenario | Before | After | Estimator |
+|---|---|---|---|
+| Bursty load 80 % × U(0, 10 ms) | 83 / 83 | 21 / 21 | 11 / 20 |
+| Skew 50 ppm | 118 / 156 | 11 / 27 | 11 / 26 |
+| Skew −120 ppm, jitter 1 ms | 271 / 442 | 44 / 204 | 46 / 206 |
+| Skew 50 ppm + s2c queuing | 135 / 187 | 18 / 63 | 18 / 64 |
+| Sound card +50 ppm (new) | n/a | 8 / 20 | 9 / 14 |
+| Skew 30 ppm, sound card −50 ppm (new) | n/a | 10 / 27 | 10 / 26 |
+
+Playout now matches the estimator.
+
+End to end (`sync_accuracy` report, real time on one host), each client's
+playout now stays within about 10–30 µs of its own time estimate; before,
+the dead band left constant offsets of up to about 100 µs. The time estimate
+itself varies too much between runs to rank the changes. On the
+backlog-in-server-socket scenario, client 1's mean time diff was −60, −74,
+−146 µs (isolated runs) and −280 µs (full report) before, and −95, −98, −109,
+−162, −256 µs (isolated) and −775 µs (full report) after. The estimator's
+fit is unchanged for that link, so this is probably noise, but a small
+regression is not ruled out.
+
 ## Components reviewed
 
 | Component | File |

@@ -4,11 +4,17 @@
 //! feature `websocket`, the server's HTTP port 1780). The WebSocket transport
 //! connects to [`snapcast_proto::WS_STREAM_PATH`] and carries one
 //! binary-protocol frame per binary message, as C++ snapserver/snapclient do.
+//!
+//! Each connection reads on its own task (as the server does), so a frame
+//! is read, and its arrival stamped, when it arrives, even while the
+//! controller decodes audio: a time reply stamped late would count the
+//! decode as network latency.
 
 #[cfg(feature = "websocket")]
 pub mod ws;
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,6 +24,49 @@ use snapcast_proto::message::factory::{self, MessagePayload, TypedMessage};
 use snapcast_proto::types::Timeval;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::mpsc;
+
+/// Frames a reader task may read ahead of the controller (about 5 s of
+/// 20 ms chunks). A full queue stops the reader, so arrivals are stamped
+/// late only once the controller falls that far behind.
+const INCOMING_QUEUE: usize = 256;
+
+/// A task reading a connection's frames into a queue. Aborted on drop.
+struct Reader {
+    rx: mpsc::Receiver<Result<TypedMessage>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Reader {
+    /// Spawn `read`, which reads frames and hands each to [`forward`].
+    fn spawn<Fut>(read: impl FnOnce(mpsc::Sender<Result<TypedMessage>>) -> Fut) -> Self
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(INCOMING_QUEUE);
+        let task = tokio::spawn(read(tx));
+        Self { rx, task }
+    }
+
+    /// The next frame, or the read error that ended the connection.
+    async fn recv(&mut self) -> Result<TypedMessage> {
+        self.rx.recv().await.context("connection reader stopped")?
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Queue a frame (or the read error) for the [`Reader`]; false once reading
+/// should stop: after an error, or when nothing receives any more.
+async fn forward(tx: &mpsc::Sender<Result<TypedMessage>>, msg: Result<TypedMessage>) -> bool {
+    let failed = msg.is_err();
+    tx.send(msg).await.is_ok() && !failed
+}
 
 /// Received bytes not yet assembled into frames.
 #[derive(Debug, Default)]
@@ -26,12 +75,6 @@ struct RecvBuf {
     /// When the last read returned: the arrival time of every frame it
     /// completed, however long the frame then waits to be taken.
     read_at: Timeval,
-}
-
-impl RecvBuf {
-    fn clear(&mut self) {
-        self.bytes.clear();
-    }
 }
 
 /// Read a complete frame (header + payload) from an async reader.
@@ -79,9 +122,8 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
 
 /// TCP connection to a snapserver.
 pub struct TcpConnection {
-    stream: Option<TcpStream>,
-    /// Received bytes not yet assembled into a complete frame.
-    read_buf: RecvBuf,
+    writer: Option<OwnedWriteHalf>,
+    reader: Option<Reader>,
     host: String,
     port: u16,
     /// Messages read by [`TcpConnection::send_request`] while waiting for its
@@ -155,8 +197,8 @@ impl TcpConnection {
     /// Create a new connection to the given host and port.
     pub fn new(host: &str, port: u16) -> Self {
         Self {
-            stream: None,
-            read_buf: RecvBuf::default(),
+            writer: None,
+            reader: None,
             host: host.to_string(),
             port,
             queued: VecDeque::new(),
@@ -173,8 +215,13 @@ impl TcpConnection {
             .with_context(|| format!("connecting to {}:{}", self.host, self.port))?;
         // Time sync messages are tiny; don't let Nagle delay them.
         stream.set_nodelay(true).context("setting TCP_NODELAY")?;
-        self.stream = Some(stream);
-        self.read_buf.clear();
+        let (mut read_half, write_half) = stream.into_split();
+        let reader = Reader::spawn(|tx| async move {
+            let mut buf = RecvBuf::default();
+            while forward(&tx, read_frame(&mut read_half, &mut buf).await).await {}
+        });
+        self.writer = Some(write_half);
+        self.reader = Some(reader);
         self.queued.clear();
         self.next_id = 1;
         Ok(())
@@ -182,17 +229,14 @@ impl TcpConnection {
 
     /// Close the connection.
     pub fn disconnect(&mut self) {
-        self.stream = None;
+        self.writer = None;
+        self.reader = None;
         self.queued.clear();
-    }
-
-    fn stream_mut(&mut self) -> Result<&mut TcpStream> {
-        self.stream.as_mut().context("not connected")
     }
 
     /// Send a message without waiting for a response.
     pub async fn send(&mut self, msg_type: MessageType, payload: &MessagePayload) -> Result<()> {
-        let stream = self.stream_mut()?;
+        let writer = self.writer.as_mut().context("not connected")?;
         let mut base = BaseMessage {
             msg_type,
             id: 0,
@@ -202,7 +246,7 @@ impl TcpConnection {
             size: 0,
         };
         stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await
+        write_frame(writer, &mut base, payload).await
     }
 
     /// Send a request and wait for the response (matched by `refersTo`).
@@ -220,7 +264,7 @@ impl TcpConnection {
         // 0 means "refers to nothing", so a response could never match it.
         self.next_id = self.next_id.checked_add(1).unwrap_or(1);
 
-        let stream = self.stream_mut()?;
+        let writer = self.writer.as_mut().context("not connected")?;
         let mut base = BaseMessage {
             msg_type,
             id,
@@ -230,12 +274,12 @@ impl TcpConnection {
             size: 0,
         };
         stamp_sent(&mut base);
-        write_frame(stream, &mut base, payload).await?;
+        write_frame(writer, &mut base, payload).await?;
 
         tokio::time::timeout(timeout, async {
             loop {
-                let stream = self.stream.as_mut().context("not connected")?;
-                let msg = read_frame(stream, &mut self.read_buf).await?;
+                let reader = self.reader.as_mut().context("not connected")?;
+                let msg = reader.recv().await?;
                 if msg.base.refers_to == id {
                     return Ok(msg);
                 }
@@ -252,8 +296,7 @@ impl TcpConnection {
         if let Some(msg) = self.queued.pop_front() {
             return Ok(msg);
         }
-        let stream = self.stream.as_mut().context("not connected")?;
-        read_frame(stream, &mut self.read_buf).await
+        self.reader.as_mut().context("not connected")?.recv().await
     }
 }
 
@@ -419,7 +462,7 @@ mod tests {
     #[test]
     fn tcp_connection_new() {
         let conn = TcpConnection::new("localhost", 1704);
-        assert!(conn.stream.is_none());
+        assert!(conn.writer.is_none());
         assert_eq!(conn.host, "localhost");
         assert_eq!(conn.port, 1704);
     }
@@ -530,7 +573,7 @@ mod tests {
             payload: MessagePayload::Time(Time::default()),
         });
         conn.disconnect();
-        assert!(conn.stream.is_none());
+        assert!(conn.writer.is_none());
         assert!(conn.queued.is_empty());
     }
 

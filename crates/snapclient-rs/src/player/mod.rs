@@ -152,15 +152,25 @@ fn run_cpal(
         move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let num_frames = data.len() / device_channels;
 
+            // When the first frame of `data` reaches the DAC: every cpal
+            // backend sets `playback` to that instant (ALSA from
+            // snd_pcm_delay, CoreAudio from the device latency, WASAPI from
+            // the frames still queued), so the buffer's own length is not
+            // added.
             let buffer_dac_usec = info
                 .timestamp()
                 .playback
                 .duration_since(info.timestamp().callback)
-                .as_micros() as i64
-                + (num_frames as i64 * 1_000_000) / device_rate as i64;
+                .as_micros() as i64;
 
             let server_now = {
                 let tp = tp_cb.lock().unwrap_or_else(|e| e.into_inner());
+                // Not before the clock is known: the first hard sync would
+                // align to a guess.
+                if !tp.is_synced() {
+                    data.fill(0.0);
+                    return;
+                }
                 now_usec() + tp.diff_to_server_usec()
             };
 
