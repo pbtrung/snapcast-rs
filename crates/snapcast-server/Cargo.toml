@@ -20,6 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+uuid = { version = "1.23.0", features = ["v4"] }
 
 # Encoders — all optional.
 # flacenc is a pure-Rust FLAC encoder (no C toolchain / system library needed).
@@ -28,14 +29,11 @@ anyhow = { workspace = true }
 # docs/flac-encoder-evaluation.md for the evaluation behind this choice.
 flacenc = { version = "0.5", default-features = false, optional = true }
 opus = { workspace = true, optional = true }
-uuid = { version = "1.23.0", features = ["v4"] }
 
 [features]
 default = ["flac"]
 flac = ["dep:flacenc"]
 opus = ["dep:opus"]
-
-[dev-dependencies]
 
 [package.metadata.docs.rs]
 all-features = false
