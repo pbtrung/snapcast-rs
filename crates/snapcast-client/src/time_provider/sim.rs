@@ -198,21 +198,28 @@ impl Estimator for TimeProvider {
 }
 
 /// The C++ estimator: plain median of the last 200 diffs (reference).
-pub(super) struct PlainMedian(DoubleBuffer);
+pub(super) struct PlainMedian {
+    diffs: DoubleBuffer,
+    median: i64,
+}
 
 impl PlainMedian {
     pub(super) fn new() -> Self {
-        Self(DoubleBuffer::new(200))
+        Self {
+            diffs: DoubleBuffer::new(200),
+            median: 0,
+        }
     }
 }
 
 impl Estimator for PlainMedian {
     fn add(&mut self, _local_usec: i64, c2s_usec: i64, s2c_usec: i64) {
-        self.0.add((c2s_usec - s2c_usec) / 2);
+        self.diffs.add((c2s_usec - s2c_usec) / 2);
+        self.median = self.diffs.median();
     }
 
     fn diff_at(&self, _local_usec: i64) -> i64 {
-        self.0.median_simple()
+        self.median
     }
 }
 

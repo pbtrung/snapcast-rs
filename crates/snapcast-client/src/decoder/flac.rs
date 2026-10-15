@@ -62,6 +62,8 @@ pub struct FlacDecoder {
     decoder: Box<dyn AudioDecoder>,
     sample_format: SampleFormat,
     packet_id: u64,
+    /// Decoded samples, reused across packets.
+    samples: Vec<f32>,
 }
 
 impl FlacDecoder {
@@ -75,6 +77,7 @@ impl FlacDecoder {
             decoder,
             sample_format: output_format,
             packet_id: 0,
+            samples: Vec::new(),
         })
     }
 }
@@ -113,14 +116,12 @@ impl Decoder for FlacDecoder {
             }
         };
 
-        let mut samples: Vec<f32> = Vec::new();
-        decoded.copy_to_vec_interleaved(&mut samples);
+        decoded.copy_to_vec_interleaved(&mut self.samples);
 
-        let mut out = Vec::with_capacity(samples.len() * 4);
-        for &s in &samples {
-            out.extend_from_slice(&s.to_le_bytes());
-        }
-
+        // A new buffer: the chunk takes it over, so the input's (much
+        // smaller) one would only be reallocated.
+        let mut out = Vec::with_capacity(self.samples.len() * 4);
+        out.extend(self.samples.iter().flat_map(|s| s.to_le_bytes()));
         *data = out;
         Ok(true)
     }

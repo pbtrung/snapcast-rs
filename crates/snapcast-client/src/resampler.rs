@@ -17,9 +17,10 @@ pub struct Resampler {
     resampler: Fft<f32>,
     /// Interleaved f32 input frames not yet consumed by the resampler.
     pending: Vec<f32>,
+    /// One resampler chunk of output, reused across calls.
+    output: Vec<f32>,
     in_format: SampleFormat,
     in_encoding: SampleEncoding,
-    out_format: SampleFormat,
     channels: usize,
 }
 
@@ -51,14 +52,16 @@ impl Resampler {
         Ok(Some(Self {
             resampler,
             pending: Vec::new(),
+            output: Vec::new(),
             in_format,
             in_encoding,
-            out_format,
             channels,
         }))
     }
 
-    /// Resample interleaved sample data in-place.
+    /// Resample interleaved sample data in-place, into interleaved
+    /// little-endian `f32` (`data` keeps its allocation, so a buffer reused
+    /// across calls stops allocating).
     ///
     /// Output may be shorter or longer than a rate-scaled copy of the input:
     /// frames that don't fill a whole resampler chunk are held back until the
@@ -69,32 +72,13 @@ impl Resampler {
             bail!("cannot resample zero-sized frames");
         }
 
-        for sample_bytes in data.chunks_exact(sample_size) {
-            let sample = match sample_size {
-                2 => {
-                    i16::from_le_bytes([sample_bytes[0], sample_bytes[1]]) as f32 / i16::MAX as f32
-                }
-                4 => {
-                    let bytes = [
-                        sample_bytes[0],
-                        sample_bytes[1],
-                        sample_bytes[2],
-                        sample_bytes[3],
-                    ];
-                    if self.in_encoding == SampleEncoding::Float32 {
-                        f32::from_le_bytes(bytes)
-                    } else if self.in_format.bits() == 24 {
-                        i32::from_le_bytes(bytes) as f32 / snapcast_proto::PCM_24BIT_MAX
-                    } else {
-                        i32::from_le_bytes(bytes) as f32 / i32::MAX as f32
-                    }
-                }
-                _ => 0.0,
-            };
-            self.pending.push(sample);
-        }
+        let (encoding, bits) = (self.in_encoding, self.in_format.bits());
+        self.pending.extend(
+            data.chunks_exact(sample_size)
+                .map(|b| encoding.sample_to_f32(b, bits)),
+        );
+        data.clear();
 
-        let mut out = Vec::new();
         let mut consumed = 0;
         loop {
             let need = self.resampler.input_frames_next();
@@ -103,22 +87,22 @@ impl Resampler {
                 break;
             }
             let input = InterleavedSlice::new(&self.pending[consumed..], self.channels, need)?;
-            let mut output = vec![0.0f32; self.resampler.output_frames_next() * self.channels];
-            let out_capacity = output.len() / self.channels;
+            let out_capacity = self.resampler.output_frames_next();
+            self.output.resize(out_capacity * self.channels, 0.0);
             let (in_frames, out_frames) = {
                 let mut output_adapter =
-                    InterleavedSlice::new_mut(&mut output, self.channels, out_capacity)?;
+                    InterleavedSlice::new_mut(&mut self.output, self.channels, out_capacity)?;
                 self.resampler
                     .process_into_buffer(&input, &mut output_adapter, None)?
             };
             consumed += in_frames * self.channels;
-            for s in &output[..out_frames * self.channels] {
-                out.extend_from_slice(&s.to_le_bytes());
-            }
+            data.extend(
+                self.output[..out_frames * self.channels]
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes()),
+            );
         }
         self.pending.drain(..consumed);
-
-        *data = out;
         Ok(())
     }
 
@@ -133,16 +117,6 @@ impl Resampler {
     /// Latency of the resampler in output frames.
     pub fn output_delay(&self) -> usize {
         self.resampler.output_delay()
-    }
-
-    /// Output encoding is always f32.
-    pub fn output_encoding(&self) -> SampleEncoding {
-        SampleEncoding::Float32
-    }
-
-    /// Output format: same channels as input, 32-bit, at the target rate.
-    pub fn output_format(&self) -> SampleFormat {
-        SampleFormat::new(self.out_format.rate(), 32, self.in_format.channels())
     }
 }
 

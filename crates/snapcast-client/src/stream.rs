@@ -16,6 +16,27 @@ pub enum SampleEncoding {
     Float32,
 }
 
+impl SampleEncoding {
+    /// Convert one sample, as stored in a [`PcmChunk`] (`bits` wide,
+    /// little-endian, 24-bit padded to 4 bytes), to `f32` at full scale ±1.
+    /// A width this encoding doesn't store, or too few bytes, is silence.
+    pub fn sample_to_f32(self, bytes: &[u8], bits: u16) -> f32 {
+        match (self, bits) {
+            (Self::Float32, _) => bytes.first_chunk().map_or(0.0, |b| f32::from_le_bytes(*b)),
+            (Self::PcmInt, 16) => bytes.first_chunk().map_or(0.0, |b| {
+                f32::from(i16::from_le_bytes(*b)) / f32::from(i16::MAX)
+            }),
+            (Self::PcmInt, 24) => bytes.first_chunk().map_or(0.0, |b| {
+                i32::from_le_bytes(*b) as f32 / snapcast_proto::PCM_24BIT_MAX
+            }),
+            (Self::PcmInt, 32) => bytes
+                .first_chunk()
+                .map_or(0.0, |b| i32::from_le_bytes(*b) as f32 / i32::MAX as f32),
+            _ => 0.0,
+        }
+    }
+}
+
 /// A decoded PCM chunk with a server-time timestamp and a read cursor.
 #[derive(Debug, Clone)]
 pub struct PcmChunk {
@@ -311,8 +332,9 @@ impl Stream {
         self.short_buffer.add(age);
     }
 
-    /// Forget the soft sync state, so a hard sync's jump isn't learned as
-    /// drift. Kept across underruns: the drift hasn't changed.
+    /// Forget the soft sync state once a hard sync completes (whatever
+    /// started it), so its jump isn't learned as drift. Kept across
+    /// underruns: the drift hasn't changed.
     fn reset_soft_sync(&mut self) {
         self.rate_correction = 0.0;
         self.error_integral = 0.0;
@@ -379,8 +401,12 @@ impl Stream {
                         break;
                     }
                     if a < c.end_usec() - c.start_usec() {
-                        let skip = (self.format.rate() as f64 * a as f64 / 1_000_000.0) as u32;
-                        c.seek(skip);
+                        // Rounded up: a seek short of the playout point
+                        // leaves the chunk too old by a fraction of a frame,
+                        // and the hard sync would fail again.
+                        let rate = i64::from(self.format.rate());
+                        let skip = (a * rate + 999_999) / 1_000_000;
+                        c.seek(skip as u32);
                         self.current = Some(c);
                         break;
                     }
@@ -410,6 +436,7 @@ impl Stream {
                 if silent_frames < frames {
                     self.hard_sync = false;
                     self.reset_buffers();
+                    self.reset_soft_sync();
                 }
                 return true;
             }
@@ -452,12 +479,12 @@ impl Stream {
             );
             self.hard_sync = true;
         } else if self.mini_buffer.full()
-            && self.mini_buffer.median_simple().abs() > HARD_SYNC_MINI_MEDIAN_USEC
+            && self.mini_buffer.median().abs() > HARD_SYNC_MINI_MEDIAN_USEC
             && age_usec.abs() > HARD_SYNC_MIN_AGE_USEC
         {
             tracing::info!(
                 age_usec,
-                mini_median = self.mini_buffer.median_simple(),
+                mini_median = self.mini_buffer.median(),
                 "Hard sync: mini buffer full, |mini_median| > 50ms"
             );
             self.hard_sync = true;
@@ -466,12 +493,10 @@ impl Stream {
             self.hard_sync = true;
         }
 
-        if self.hard_sync {
-            self.reset_soft_sync();
-        } else {
+        if !self.hard_sync {
             self.update_buffers(age_usec);
             if self.mini_buffer.full() {
-                let error = self.mini_buffer.median_simple();
+                let error = self.mini_buffer.median();
                 self.update_soft_sync(error as f64, frames);
             }
         }
@@ -481,13 +506,13 @@ impl Stream {
         let now_sec = server_now_usec / 1_000_000;
         if now_sec != self.last_log_sec {
             self.last_log_sec = now_sec;
-            self.median = self.buffer.median_simple();
-            self.short_median = self.short_buffer.median_simple();
+            self.median = self.buffer.median();
+            self.short_median = self.short_buffer.median();
             tracing::debug!(
                 target: "Stats",
                 "Chunk: {}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.1}ppm",
                 age_usec,
-                self.mini_buffer.median_simple(),
+                self.mini_buffer.median(),
                 self.short_median,
                 self.median,
                 self.buffer.len(),
@@ -498,7 +523,7 @@ impl Stream {
             self.frame_delta = 0;
         }
 
-        age_usec.abs() < 500_000
+        age_usec.abs() < HARD_SYNC_AGE_USEC
     }
 
     /// Fill `output` with silence.
@@ -907,6 +932,27 @@ mod tests {
         assert!(chunk.is_end());
     }
 
+    // ---- sample conversion ----
+
+    #[test]
+    fn sample_to_f32_full_scale() {
+        let pcm = SampleEncoding::PcmInt;
+        assert_eq!(pcm.sample_to_f32(&i16::MAX.to_le_bytes(), 16), 1.0);
+        assert_eq!(pcm.sample_to_f32(&(-i16::MAX).to_le_bytes(), 16), -1.0);
+        assert_eq!(pcm.sample_to_f32(&8_388_607i32.to_le_bytes(), 24), 1.0);
+        assert_eq!(pcm.sample_to_f32(&i32::MAX.to_le_bytes(), 32), 1.0);
+        let f = SampleEncoding::Float32;
+        assert_eq!(f.sample_to_f32(&0.5f32.to_le_bytes(), 32), 0.5);
+    }
+
+    #[test]
+    fn sample_to_f32_short_or_unsupported_is_silence() {
+        let pcm = SampleEncoding::PcmInt;
+        assert_eq!(pcm.sample_to_f32(&[0x7F], 16), 0.0);
+        assert_eq!(pcm.sample_to_f32(&[0x7F, 0x7F], 8), 0.0);
+        assert_eq!(SampleEncoding::Float32.sample_to_f32(&[1, 2], 32), 0.0);
+    }
+
     // ---- Stream accessors / encoding ----
 
     #[test]
@@ -983,6 +1029,40 @@ mod tests {
         assert!(!s.hard_sync, "hard sync completes after seeking");
         let pos = s.current.as_ref().unwrap().read_pos / f.frame_size() as usize;
         assert_eq!(pos, 24000 + 480, "seeked 0.5 s, then played one buffer");
+    }
+
+    #[test]
+    fn hard_sync_seek_off_the_frame_grid_completes_at_once() {
+        // The playout point falls between two frames (20.83 µs apart at
+        // 48 kHz): the seek must land on or after it, not leave the chunk a
+        // fraction of a frame too old (which failed the hard sync on nearly
+        // every call).
+        for usec in [500_010, 500_001, 499_990] {
+            let mut s = Stream::new(fmt());
+            s.set_buffer_ms(1000);
+            s.add_chunk(counter_chunk(98_000_000 + usec, 0, 48_000));
+            let mut buf = vec![0u8; 480 * 4];
+            assert!(s.get_player_chunk(100_000_000, 0, &mut buf, 480), "{usec}");
+            assert!(!s.hard_sync, "{usec}");
+        }
+    }
+
+    #[test]
+    fn hard_sync_resets_the_soft_sync() {
+        let f = fmt();
+        let mut s = Stream::new(f);
+        s.set_buffer_ms(1000);
+        s.add_chunk(make_chunk(99, 0, 48_000, f));
+        s.rate_correction = 1e-4;
+        s.error_integral = 100.0;
+        s.correction_frames = 0.5;
+        let mut buf = vec![0u8; 480 * f.frame_size() as usize];
+        assert!(s.get_player_chunk(100_000_000, 0, &mut buf, 480));
+        assert!(!s.hard_sync);
+        assert_eq!(
+            (s.rate_correction, s.error_integral, s.correction_frames),
+            (0.0, 0.0, 0.0)
+        );
     }
 
     #[test]

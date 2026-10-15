@@ -1,8 +1,9 @@
 //! Server time synchronization.
 //!
 //! Port of the C++ `TimeProvider`. Receives client-to-server and server-to-client
-//! latency pairs, estimates the clock difference from them, and provides
-//! `server_now()` — the estimated current server time.
+//! latency pairs and estimates the clock difference from them
+//! ([`TimeProvider::diff_to_server_usec`]): the server time is the local time
+//! plus that difference.
 //!
 //! Unlike C++ (a plain median of the last 200 diffs), exchanges are
 //! weighted by their round trip. A reply that waited behind audio (in the
@@ -208,8 +209,11 @@ impl TimeProvider {
             "time sample"
         );
 
-        // Clear buffer if last sync was more than 60 seconds ago
-        let since_last = self.last_sync_usec.map_or(0, |last| local_usec - last);
+        // Clear buffer if last sync was more than 60 seconds ago. (Never
+        // negative: it bounds the estimate's step in `update_model`.)
+        let since_last = self
+            .last_sync_usec
+            .map_or(0, |last| (local_usec - last).max(0));
         if since_last > RESET_AFTER_USEC {
             self.samples.clear();
             self.pending.clear();
@@ -319,7 +323,8 @@ impl TimeProvider {
         }
     }
 
-    /// Set the time diff directly in milliseconds.
+    /// Add an exchange, at the current time, that measured a clock
+    /// difference of `ms` milliseconds over a zero round trip.
     pub fn set_diff_ms(&mut self, ms: f64) {
         let usec = (ms * 1000.0) as i64;
         // A zero round trip: c2s - s2c = 2 * diff, c2s + s2c = 0.
@@ -586,6 +591,14 @@ mod tests {
         for i in from..to {
             tp.add_sample_at(i * 1_000_000, 1_000 + diff, 1_000 - diff);
         }
+    }
+
+    #[test]
+    fn exchange_stamped_before_the_last_does_not_panic() {
+        let mut tp = TimeProvider::new();
+        feed(&mut tp, 0, SETTLED_SAMPLES as i64 + 1, 1_000);
+        tp.add_sample_at(0, 3_000, -1_000);
+        assert_eq!(tp.diff_to_server_usec_at(0), 1_000);
     }
 
     #[test]

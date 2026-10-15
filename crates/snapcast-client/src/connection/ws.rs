@@ -114,7 +114,9 @@ async fn recv_frame(ws: &mut SplitStream<WsStream>, read_at: &AtomicI64) -> Resu
         match msg {
             Message::Binary(data) => {
                 // Each binary message carries exactly one complete frame.
-                let mut buf = data.to_vec();
+                // (Taking the buffer over doesn't copy it while the message
+                // owns it alone.)
+                let mut buf = Vec::from(data);
                 let mut msg = factory::take_frame(&mut buf)
                     .map_err(|e| anyhow::anyhow!("parse frame: {e}"))?
                     .context("incomplete frame in WebSocket message")?;

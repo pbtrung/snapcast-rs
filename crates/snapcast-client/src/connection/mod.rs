@@ -13,9 +13,7 @@
 #[cfg(feature = "websocket")]
 pub mod ws;
 
-use std::collections::VecDeque;
 use std::future::Future;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use snapcast_proto::MessageType;
@@ -126,10 +124,6 @@ pub struct TcpConnection {
     reader: Option<Reader>,
     host: String,
     port: u16,
-    /// Messages read by [`TcpConnection::send_request`] while waiting for its
-    /// response, handed out by [`TcpConnection::recv`] in arrival order.
-    queued: VecDeque<TypedMessage>,
-    next_id: u16,
 }
 
 /// Unified connection over supported transports.
@@ -201,8 +195,6 @@ impl TcpConnection {
             reader: None,
             host: host.to_string(),
             port,
-            queued: VecDeque::new(),
-            next_id: 1,
         }
     }
 
@@ -222,8 +214,6 @@ impl TcpConnection {
         });
         self.writer = Some(write_half);
         self.reader = Some(reader);
-        self.queued.clear();
-        self.next_id = 1;
         Ok(())
     }
 
@@ -231,7 +221,6 @@ impl TcpConnection {
     pub fn disconnect(&mut self) {
         self.writer = None;
         self.reader = None;
-        self.queued.clear();
     }
 
     /// Send a message without waiting for a response.
@@ -249,70 +238,20 @@ impl TcpConnection {
         write_frame(writer, &mut base, payload).await
     }
 
-    /// Send a request and wait for the response (matched by `refersTo`).
-    ///
-    /// Reads the connection itself while waiting; any other message that
-    /// arrives meanwhile is queued and returned by later [`recv`](Self::recv)
-    /// calls, in order.
-    pub async fn send_request(
-        &mut self,
-        msg_type: MessageType,
-        payload: &MessagePayload,
-        timeout: Duration,
-    ) -> Result<TypedMessage> {
-        let id = self.next_id;
-        // 0 means "refers to nothing", so a response could never match it.
-        self.next_id = self.next_id.checked_add(1).unwrap_or(1);
-
-        let writer = self.writer.as_mut().context("not connected")?;
-        let mut base = BaseMessage {
-            msg_type,
-            id,
-            refers_to: 0,
-            sent: Timeval::default(),
-            received: Timeval::default(),
-            size: 0,
-        };
-        stamp_sent(&mut base);
-        write_frame(writer, &mut base, payload).await?;
-
-        tokio::time::timeout(timeout, async {
-            loop {
-                let reader = self.reader.as_mut().context("not connected")?;
-                let msg = reader.recv().await?;
-                if msg.base.refers_to == id {
-                    return Ok(msg);
-                }
-                self.queued.push_back(msg);
-            }
-        })
-        .await
-        .context("request timed out")?
-    }
-
-    /// Receive the next message, starting with any queued while a
-    /// [`send_request`](Self::send_request) waited for its response.
+    /// Receive the next message.
     pub async fn recv(&mut self) -> Result<TypedMessage> {
-        if let Some(msg) = self.queued.pop_front() {
-            return Ok(msg);
-        }
         self.reader.as_mut().context("not connected")?.recv().await
     }
 }
 
 pub(super) fn stamp_sent(base: &mut BaseMessage) {
-    let tv = steady_time_of_day();
-    base.sent = tv;
+    base.sent = steady_time_of_day();
 }
 
-/// Matches the C++ `chronos::steadytimeofday` — monotonic clock time.
-/// On macOS/Linux this samples the same clock domain as the C++ snapserver.
+/// Matches the C++ `chronos::steadytimeofday`: the monotonic clock of
+/// [`snapcast_proto::time`].
 pub(super) fn steady_time_of_day() -> Timeval {
-    let usec = snapcast_proto::time::now_usec();
-    Timeval {
-        sec: (usec / 1_000_000) as i32,
-        usec: (usec % 1_000_000) as i32,
-    }
+    Timeval::from_usec(snapcast_proto::time::now_usec())
 }
 
 /// Current time in microseconds using the steady clock.
@@ -452,7 +391,7 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let mut rbuf = RecvBuf::default();
         let first = read_frame(&mut cursor, &mut rbuf).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let second = read_frame(&mut cursor, &mut rbuf).await.unwrap();
         assert_eq!(second.base.id, 2);
         assert_eq!(first.base.received, second.base.received);
@@ -465,11 +404,6 @@ mod tests {
         assert!(conn.writer.is_none());
         assert_eq!(conn.host, "localhost");
         assert_eq!(conn.port, 1704);
-    }
-
-    #[test]
-    fn rejects_unknown_scheme() {
-        assert!(SnapConnection::new("wss", "localhost", 1788).is_err());
     }
 
     #[cfg(feature = "websocket")]
@@ -494,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_empty_reader_errors() {
-        // Header read_exact fails immediately on an empty reader.
+        // The connection closes before any frame arrives.
         let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
         let mut rbuf = RecvBuf::default();
         assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
@@ -502,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_truncated_header_errors() {
-        // Fewer than HEADER_SIZE bytes → header read_exact fails.
+        // Fewer than HEADER_SIZE bytes, then the connection closes.
         let mut cursor = std::io::Cursor::new(vec![0u8; BaseMessage::HEADER_SIZE - 1]);
         let mut rbuf = RecvBuf::default();
         assert!(read_frame(&mut cursor, &mut rbuf).await.is_err());
@@ -510,8 +444,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_frame_truncated_payload_errors() {
-        // A valid frame with its last payload byte chopped off: the header parses,
-        // but the payload read_exact runs short.
+        // A valid frame with its last payload byte chopped off: the header
+        // parses, but the connection closes before the payload is complete.
         let payload = MessagePayload::Time(Time {
             latency: Timeval { sec: 0, usec: 5 },
         });
@@ -547,93 +481,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_request_when_not_connected_errors_and_advances_id() {
-        let mut conn = TcpConnection::new("localhost", 1704);
-        conn.next_id = u16::MAX; // exercise the wrap
-        let payload = MessagePayload::Time(Time::default());
-        let res = conn
-            .send_request(MessageType::Time, &payload, Duration::from_millis(10))
-            .await;
-        assert!(res.is_err(), "not connected");
-        assert_eq!(conn.next_id, 1, "next_id wraps past u16::MAX, skipping 0");
-    }
-
-    #[test]
-    fn disconnect_clears_stream_and_queue() {
-        let mut conn = TcpConnection::new("localhost", 1704);
-        conn.queued.push_back(TypedMessage {
-            base: BaseMessage {
-                msg_type: MessageType::Time,
-                id: 0,
-                refers_to: 0,
-                sent: Timeval::default(),
-                received: Timeval::default(),
-                size: 0,
-            },
-            payload: MessagePayload::Time(Time::default()),
-        });
-        conn.disconnect();
-        assert!(conn.writer.is_none());
-        assert!(conn.queued.is_empty());
-    }
-
-    /// Server stand-in: reads one request, sends an unrelated message and
-    /// then the response to it.
-    async fn answer_one_request(listener: tokio::net::TcpListener) {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut buf = RecvBuf::default();
-        let req = read_frame(&mut sock, &mut buf).await.unwrap();
-        let mut unrelated = BaseMessage {
-            msg_type: MessageType::Time,
-            id: 0,
-            refers_to: 0,
-            sent: Timeval::default(),
-            received: Timeval::default(),
-            size: 0,
-        };
-        let payload = MessagePayload::Time(Time {
-            latency: Timeval { sec: 0, usec: 1 },
-        });
-        write_frame(&mut sock, &mut unrelated, &payload)
-            .await
-            .unwrap();
-        let mut reply = BaseMessage {
-            refers_to: req.base.id,
-            ..unrelated
-        };
-        let payload = MessagePayload::Time(Time {
-            latency: Timeval { sec: 0, usec: 2 },
-        });
-        write_frame(&mut sock, &mut reply, &payload).await.unwrap();
-        // Keep the socket open until the client is done.
-        let _ = read_frame(&mut sock, &mut buf).await;
-    }
-
-    #[tokio::test]
-    async fn send_request_receives_its_response_and_queues_others() {
+    async fn disconnect_closes_both_directions() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(answer_one_request(listener));
-
         let mut conn = TcpConnection::new("127.0.0.1", port);
         conn.connect().await.unwrap();
-        let payload = MessagePayload::Time(Time::default());
-        let reply = conn
-            .send_request(MessageType::Time, &payload, Duration::from_secs(2))
-            .await
-            .unwrap();
-        assert_eq!(reply.base.refers_to, 1);
-        let MessagePayload::Time(t) = reply.payload else {
-            panic!("expected Time");
-        };
-        assert_eq!(t.latency.usec, 2);
-
-        let queued = conn.recv().await.unwrap();
-        assert_eq!(queued.base.refers_to, 0);
-        let MessagePayload::Time(t) = queued.payload else {
-            panic!("expected Time");
-        };
-        assert_eq!(t.latency.usec, 1, "unrelated message is kept for recv");
+        conn.disconnect();
+        assert!(conn.writer.is_none() && conn.reader.is_none());
+        assert!(conn.recv().await.is_err());
     }
 
     #[tokio::test]

@@ -446,38 +446,13 @@ fn get_mac_address() -> String {
 }
 
 fn samples_to_f32(data: &[u8], format: SampleFormat, encoding: SampleEncoding) -> Vec<f32> {
-    match encoding {
-        SampleEncoding::Float32 => data
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        SampleEncoding::PcmInt => match format.bits() {
-            16 => data
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
-                .collect(),
-            24 => data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| {
-                    i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32
-                        / snapcast_proto::PCM_24BIT_MAX
-                })
-                .collect(),
-            32 => data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / i32::MAX as f32)
-                .collect(),
-            _ => Vec::new(),
-        },
+    let sample_size = usize::from(format.sample_size());
+    if sample_size == 0 {
+        return Vec::new();
     }
+    data.chunks_exact(sample_size)
+        .map(|b| encoding.sample_to_f32(b, format.bits()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -574,9 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn samples_to_f32_unsupported_bit_depth_is_empty() {
-        let f = SampleFormat::new(48000, 8, 2);
-        assert!(samples_to_f32(&[1, 2, 3, 4], f, SampleEncoding::PcmInt).is_empty());
+    fn samples_to_f32_drops_a_trailing_partial_sample() {
+        let f = SampleFormat::new(48000, 16, 2);
+        let out = samples_to_f32(&[0, 0, 0xFF], f, SampleEncoding::PcmInt);
+        assert_eq!(out, vec![0.0]);
     }
 
     // ---- handle_message branches ----
