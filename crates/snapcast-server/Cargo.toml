@@ -20,7 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-uuid = { version = "1.23.0", features = ["v4"] }
+uuid = { version = "1.28.0", features = ["v4"] }
 
 # Encoders — all optional.
 # flacenc is a pure-Rust FLAC encoder (no C toolchain / system library needed).
