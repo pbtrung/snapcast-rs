@@ -197,7 +197,8 @@ pub enum StreamStatus {
     Playing,
     /// Stream disabled by configuration.
     Disabled,
-    /// Status not recognized.
+    /// Status not recognized (also what any unrecognized string deserializes to).
+    #[serde(other)]
     Unknown,
 }
 
@@ -404,6 +405,15 @@ mod tests {
         assert_eq!(percent_decode("%C3%9Cber"), "Über", "encoded UTF-8");
         assert_eq!(percent_decode("caf%C3%A9%20bar"), "café bar");
         assert_eq!(percent_decode("%FF"), "\u{FFFD}", "invalid UTF-8");
+    }
+
+    #[test]
+    fn stream_status_unrecognized_deserializes_to_unknown() {
+        let s: StreamStatus = serde_json::from_str(r#""playing""#).unwrap();
+        assert_eq!(s, StreamStatus::Playing);
+        let s: StreamStatus = serde_json::from_str(r#""buffering""#).unwrap();
+        assert_eq!(s, StreamStatus::Unknown);
+        assert_eq!(serde_json::to_string(&s).unwrap(), r#""unknown""#);
     }
 
     #[test]

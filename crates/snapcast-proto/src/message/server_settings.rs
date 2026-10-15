@@ -10,25 +10,27 @@ use crate::message::base::ProtoError;
 use crate::message::wire;
 
 /// Server settings JSON payload.
+///
+/// Absent keys take the C++ defaults (`bufferMs` 0, `latency` 0, `volume`
+/// 100, `muted` false), as C++ `ServerSettings` reads them with `get(key, def)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
     /// Buffer size in milliseconds.
+    #[serde(default)]
     pub buffer_ms: i32,
     /// Additional latency in milliseconds.
+    #[serde(default)]
     pub latency: i32,
     /// Playback volume (0–100).
+    #[serde(default = "wire::default_volume")]
     pub volume: u16,
     /// Whether the client is muted.
+    #[serde(default)]
     pub muted: bool,
 }
 
 impl ServerSettings {
-    /// Wire size of the JSON payload including length prefix.
-    pub fn wire_size(&self) -> u32 {
-        wire::json_wire_size(self)
-    }
-
     /// Deserialize server settings from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         wire::read_json(r)
@@ -64,6 +66,15 @@ mod tests {
         let json = r#"{"bufferMs":1000,"latency":0,"muted":false,"volume":100}"#;
         let ss: ServerSettings = serde_json::from_str(json).unwrap();
         assert_eq!(ss.buffer_ms, 1000);
+        assert_eq!(ss.volume, 100);
+        assert!(!ss.muted);
+    }
+
+    #[test]
+    fn missing_keys_take_cpp_defaults() {
+        let ss: ServerSettings = serde_json::from_str(r#"{"bufferMs":800}"#).unwrap();
+        assert_eq!(ss.buffer_ms, 800);
+        assert_eq!(ss.latency, 0);
         assert_eq!(ss.volume, 100);
         assert!(!ss.muted);
     }

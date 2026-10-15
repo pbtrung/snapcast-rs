@@ -20,8 +20,12 @@ pub struct Auth {
 }
 
 /// Hello message JSON payload.
+///
+/// Like C++ `Hello`, an absent `Instance` or `SnapStreamProtocolVersion`
+/// reads as 1 and an absent `ID` as the MAC address, so Hellos from older
+/// clients that predate those keys are still accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", from = "HelloJson")]
 pub struct Hello {
     /// Client MAC address.
     #[serde(rename = "MAC")]
@@ -49,12 +53,51 @@ pub struct Hello {
     pub auth: Option<Auth>,
 }
 
-impl Hello {
-    /// Wire size: u32 length prefix + JSON bytes.
-    pub fn wire_size(&self) -> u32 {
-        wire::json_wire_size(self)
-    }
+/// Deserialization shape of [`Hello`]: the optional keys, before the C++
+/// defaults are applied.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct HelloJson {
+    #[serde(rename = "MAC")]
+    mac: String,
+    host_name: String,
+    version: String,
+    client_name: String,
+    #[serde(rename = "OS")]
+    os: String,
+    arch: String,
+    #[serde(default = "default_one")]
+    instance: u32,
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    #[serde(default = "default_one")]
+    snap_stream_protocol_version: u32,
+    #[serde(default)]
+    auth: Option<Auth>,
+}
 
+fn default_one() -> u32 {
+    1
+}
+
+impl From<HelloJson> for Hello {
+    fn from(h: HelloJson) -> Self {
+        Self {
+            id: h.id.unwrap_or_else(|| h.mac.clone()),
+            mac: h.mac,
+            host_name: h.host_name,
+            version: h.version,
+            client_name: h.client_name,
+            os: h.os,
+            arch: h.arch,
+            instance: h.instance,
+            snap_stream_protocol_version: h.snap_stream_protocol_version,
+            auth: h.auth,
+        }
+    }
+}
+
+impl Hello {
     /// Deserialize a Hello message from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         wire::read_json(r)
@@ -132,6 +175,23 @@ mod tests {
         assert_eq!(hello.mac, "aa:bb:cc:dd:ee:ff");
         assert_eq!(hello.snap_stream_protocol_version, 2);
         assert!(hello.auth.is_none());
+    }
+
+    #[test]
+    fn missing_optional_keys_take_cpp_defaults() {
+        // A Hello from a client predating the ID / Instance / protocol keys.
+        let json = r#"{"Arch":"armv7l","ClientName":"Snapclient","HostName":"pi","MAC":"aa:bb:cc:dd:ee:ff","OS":"Raspbian","Version":"0.15.0"}"#;
+        let hello: Hello = serde_json::from_str(json).unwrap();
+        assert_eq!(hello.id, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(hello.instance, 1);
+        assert_eq!(hello.snap_stream_protocol_version, 1);
+        assert!(hello.auth.is_none());
+
+        // An explicit ID, even an empty one, is kept as sent.
+        let json =
+            r#"{"Arch":"","ClientName":"","HostName":"","ID":"","MAC":"m","OS":"","Version":""}"#;
+        let hello: Hello = serde_json::from_str(json).unwrap();
+        assert_eq!(hello.id, "");
     }
 
     #[test]

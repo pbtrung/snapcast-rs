@@ -17,11 +17,12 @@ pub struct Timeval {
 
 impl Timeval {
     /// Create from microseconds since epoch.
+    ///
+    /// Normalized like the arithmetic below: `usec` is in `0..1_000_000`, so a
+    /// negative time has a negative `sec` and a positive `usec`, as C++ `tv`
+    /// subtraction yields.
     pub fn from_usec(usec: i64) -> Self {
-        Self {
-            sec: (usec / 1_000_000) as i32,
-            usec: (usec % 1_000_000) as i32,
-        }
+        Self::normalized(0, usec)
     }
 
     /// Convert to microseconds since epoch.
@@ -149,6 +150,20 @@ mod tests {
         };
         assert_eq!((a + b).to_usec(), 2_500_000);
         assert_eq!((a - b).to_usec(), 7_500_000);
+    }
+
+    #[test]
+    fn from_usec_normalizes_negative_values() {
+        assert_eq!(
+            Timeval::from_usec(-1_500_000),
+            Timeval {
+                sec: -2,
+                usec: 500_000
+            }
+        );
+        for usec in [-1_500_000, -1, 0, 1, 1_234_567] {
+            assert_eq!(Timeval::from_usec(usec).to_usec(), usec);
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::message::error::Error;
 use crate::message::hello::Hello;
 use crate::message::server_settings::ServerSettings;
 use crate::message::time::Time;
+use crate::message::wire;
 use crate::message::wire_chunk::WireChunk;
 
 /// A deserialized typed message with its base header.
@@ -100,22 +101,21 @@ pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<TypedMessage>, ProtoError>
 ///
 /// The `base` header's `size` field will be set to the payload size.
 pub fn serialize(base: &mut BaseMessage, payload: &MessagePayload) -> Result<Vec<u8>, ProtoError> {
-    let mut payload_buf = Vec::new();
+    // The payload is written straight after a placeholder header, which is
+    // filled in once the payload size is known — no intermediate buffer.
+    let mut frame = vec![0u8; BaseMessage::HEADER_SIZE];
     match payload {
-        MessagePayload::Time(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::Hello(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::ServerSettings(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::CodecHeader(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::WireChunk(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::ClientInfo(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::Error(m) => m.write_to(&mut payload_buf)?,
-        MessagePayload::StreamTags(data) => payload_buf.extend_from_slice(data),
+        MessagePayload::Time(m) => m.write_to(&mut frame)?,
+        MessagePayload::Hello(m) => m.write_to(&mut frame)?,
+        MessagePayload::ServerSettings(m) => m.write_to(&mut frame)?,
+        MessagePayload::CodecHeader(m) => m.write_to(&mut frame)?,
+        MessagePayload::WireChunk(m) => m.write_to(&mut frame)?,
+        MessagePayload::ClientInfo(m) => m.write_to(&mut frame)?,
+        MessagePayload::Error(m) => m.write_to(&mut frame)?,
+        MessagePayload::StreamTags(data) => frame.extend_from_slice(data),
     }
-    base.size = payload_buf.len() as u32;
-
-    let mut frame = Vec::with_capacity(BaseMessage::HEADER_SIZE + payload_buf.len());
-    base.write_to(&mut frame)?;
-    frame.extend_from_slice(&payload_buf);
+    base.size = wire::checked_u32_len(frame.len() - BaseMessage::HEADER_SIZE)?;
+    base.write_to(&mut &mut frame[..BaseMessage::HEADER_SIZE])?;
     Ok(frame)
 }
 
@@ -289,6 +289,9 @@ mod tests {
         // size should now be set
         assert!(base.size > 0);
         assert_eq!(frame.len(), BaseMessage::HEADER_SIZE + base.size as usize);
+        // The header written into the frame carries the same size.
+        let header = BaseMessage::read_from(&mut &frame[..]).unwrap();
+        assert_eq!(header, base);
     }
 
     #[test]

@@ -18,11 +18,6 @@ pub struct CodecHeader {
 }
 
 impl CodecHeader {
-    /// Wire size: u32+codec + u32+payload.
-    pub fn wire_size(&self) -> u32 {
-        wire::string_wire_size(&self.codec) + wire::bytes_wire_size(&self.payload)
-    }
-
     /// Deserialize a codec header from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         let codec = wire::read_string(r)?;
@@ -70,15 +65,5 @@ mod tests {
         let mut buf = Vec::new();
         msg.write_to(&mut buf).unwrap();
         assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn wire_size() {
-        let msg = CodecHeader {
-            codec: "opus".into(),
-            payload: vec![0; 12],
-        };
-        // (4+4) + (4+12) = 24
-        assert_eq!(msg.wire_size(), 24);
     }
 }

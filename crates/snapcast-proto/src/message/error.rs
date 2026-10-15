@@ -21,11 +21,6 @@ pub struct Error {
 }
 
 impl Error {
-    /// Wire size: u32 code + (u32+error) + (u32+message).
-    pub fn wire_size(&self) -> u32 {
-        4 + wire::string_wire_size(&self.error) + wire::string_wire_size(&self.message)
-    }
-
     /// Deserialize an error message from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         let code = r.read_u32::<LittleEndian>()?;
@@ -81,16 +76,5 @@ mod tests {
         let mut buf = Vec::new();
         msg.write_to(&mut buf).unwrap();
         assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn wire_size() {
-        let msg = Error {
-            code: 0,
-            error: "err".into(),
-            message: "msg".into(),
-        };
-        // 4 (code) + (4+3) + (4+3) = 18
-        assert_eq!(msg.wire_size(), 18);
     }
 }

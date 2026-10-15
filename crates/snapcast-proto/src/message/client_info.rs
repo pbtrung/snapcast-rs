@@ -10,20 +10,20 @@ use crate::message::base::ProtoError;
 use crate::message::wire;
 
 /// Client info JSON payload.
+///
+/// Absent keys take the C++ defaults (`volume` 100, `muted` false), as C++
+/// `ClientInfo` reads them with `get(key, def)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClientInfo {
     /// Playback volume (0–100).
+    #[serde(default = "wire::default_volume")]
     pub volume: u16,
     /// Whether the client is muted.
+    #[serde(default)]
     pub muted: bool,
 }
 
 impl ClientInfo {
-    /// Wire size of the JSON payload including length prefix.
-    pub fn wire_size(&self) -> u32 {
-        wire::json_wire_size(self)
-    }
-
     /// Deserialize client info from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         wire::read_json(r)
@@ -58,5 +58,14 @@ mod tests {
         let ci: ClientInfo = serde_json::from_str(json).unwrap();
         assert_eq!(ci.volume, 100);
         assert!(!ci.muted);
+    }
+
+    #[test]
+    fn missing_keys_take_cpp_defaults() {
+        let ci: ClientInfo = serde_json::from_str(r#"{"muted":true}"#).unwrap();
+        assert_eq!(ci.volume, 100);
+        assert!(ci.muted);
+        let ci: ClientInfo = serde_json::from_str("{}").unwrap();
+        assert_eq!((ci.volume, ci.muted), (100, false));
     }
 }

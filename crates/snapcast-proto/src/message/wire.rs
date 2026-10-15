@@ -26,18 +26,18 @@ fn read_checked_len<R: Read>(r: &mut R) -> Result<usize, ProtoError> {
 }
 
 /// Read a length-prefixed string (u32 LE length + UTF-8 bytes).
+///
+/// Invalid UTF-8 is replaced with U+FFFD rather than rejected.
 pub fn read_string<R: Read>(r: &mut R) -> Result<String, ProtoError> {
-    let len = read_checked_len(r)?;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let buf = read_bytes(r)?;
+    // Valid UTF-8 (the normal case) reuses the buffer; only a lossy fix-up copies.
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Write a length-prefixed string (u32 LE length + UTF-8 bytes).
 pub fn write_string<W: Write>(w: &mut W, s: &str) -> Result<(), ProtoError> {
-    w.write_u32::<LittleEndian>(s.len() as u32)?;
-    w.write_all(s.as_bytes())?;
-    Ok(())
+    write_bytes(w, s.as_bytes())
 }
 
 /// Read a length-prefixed byte array (u32 LE length + bytes).
@@ -49,15 +49,22 @@ pub fn read_bytes<R: Read>(r: &mut R) -> Result<Vec<u8>, ProtoError> {
 }
 
 /// Write a length-prefixed byte array (u32 LE length + bytes).
+///
+/// A field longer than `u32::MAX` bytes cannot be length-prefixed; it is
+/// rejected rather than written with a truncated prefix that would desync the
+/// peer's framing.
 pub fn write_bytes<W: Write>(w: &mut W, data: &[u8]) -> Result<(), ProtoError> {
-    w.write_u32::<LittleEndian>(data.len() as u32)?;
+    w.write_u32::<LittleEndian>(checked_u32_len(data.len())?)?;
     w.write_all(data)?;
     Ok(())
 }
 
-/// Size of a length-prefixed string on the wire.
-pub fn string_wire_size(s: &str) -> u32 {
-    4 + s.len() as u32
+/// Convert an outgoing length to the u32 the wire carries, or fail.
+pub(crate) fn checked_u32_len(len: usize) -> Result<u32, ProtoError> {
+    u32::try_from(len).map_err(|_| ProtoError::PayloadTooLarge {
+        len,
+        max: u32::MAX as usize,
+    })
 }
 
 /// Read a length-prefixed JSON payload (u32 LE length + UTF-8 JSON).
@@ -76,19 +83,10 @@ pub fn write_json<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<(), Pr
     write_string(w, &json)
 }
 
-/// Wire size of a value serialized as a length-prefixed JSON payload.
-///
-/// The JSON-bodied payloads are plain structs whose serialization cannot fail,
-/// so a serialization error here would be a logic bug — panic loudly rather
-/// than silently returning a wrong on-wire size.
-pub fn json_wire_size<T: Serialize>(value: &T) -> u32 {
-    let json = serde_json::to_string(value).expect("JSON payload serialization is infallible");
-    string_wire_size(&json)
-}
-
-/// Size of a length-prefixed byte array on the wire.
-pub fn bytes_wire_size(data: &[u8]) -> u32 {
-    4 + data.len() as u32
+/// Default `volume` of the JSON-bodied messages when the key is absent,
+/// matching C++ `get("volume", static_cast<uint16_t>(100))`.
+pub(crate) fn default_volume() -> u16 {
+    100
 }
 
 #[cfg(test)]
@@ -114,6 +112,14 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&buf);
         let decoded = read_bytes(&mut cursor).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn invalid_utf8_string_is_replaced() {
+        let mut buf = Vec::new();
+        write_bytes(&mut buf, &[b'a', 0xFF, b'b']).unwrap();
+        let mut cursor = std::io::Cursor::new(&buf);
+        assert_eq!(read_string(&mut cursor).unwrap(), "a\u{FFFD}b");
     }
 
     #[test]

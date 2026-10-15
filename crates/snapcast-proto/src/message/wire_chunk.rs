@@ -18,11 +18,6 @@ pub struct WireChunk {
 }
 
 impl WireChunk {
-    /// Wire size: timestamp (8) + u32 len + payload.
-    pub fn wire_size(&self) -> u32 {
-        8 + wire::bytes_wire_size(&self.payload)
-    }
-
     /// Deserialize a wire chunk from a reader.
     pub fn read_from<R: Read>(r: &mut R) -> Result<Self, ProtoError> {
         let timestamp = Timeval::read_from(r)?;
@@ -73,15 +68,5 @@ mod tests {
         let mut buf = Vec::new();
         msg.write_to(&mut buf).unwrap();
         assert_eq!(buf, expected);
-    }
-
-    #[test]
-    fn wire_size() {
-        let msg = WireChunk {
-            timestamp: Timeval::default(),
-            payload: vec![0; 960],
-        };
-        // 8 (timestamp) + 4 (len) + 960 = 972
-        assert_eq!(msg.wire_size(), 972);
     }
 }

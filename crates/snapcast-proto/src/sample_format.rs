@@ -82,21 +82,6 @@ impl SampleFormat {
         self.channels * self.sample_size()
     }
 
-    /// Sample rate in frames per millisecond.
-    pub fn ms_rate(&self) -> f64 {
-        f64::from(self.rate) / 1000.0
-    }
-
-    /// Convert a frame count to duration in milliseconds.
-    pub fn frames_to_ms(&self, frames: usize) -> f64 {
-        frames as f64 * 1000.0 / f64::from(self.rate)
-    }
-
-    /// Whether any field has been set (non-zero).
-    pub fn is_initialized(&self) -> bool {
-        self.rate != 0 || self.bits != 0 || self.channels != 0
-    }
-
     /// Check that this is a concrete PCM format that audio can actually be
     /// read, encoded or played in.
     ///
@@ -224,7 +209,6 @@ mod tests {
     fn parse_all_wildcards() {
         let sf: SampleFormat = "*:*:*".parse().unwrap();
         assert_eq!(sf, SampleFormat::default());
-        assert!(!sf.is_initialized());
     }
 
     #[test]
@@ -275,12 +259,6 @@ mod tests {
         // 2 channels * 4 bytes (padded) = 8 bytes per frame
         let sf = SampleFormat::new(48000, 24, 2);
         assert_eq!(sf.frame_size(), 8);
-    }
-
-    #[test]
-    fn ms_rate() {
-        let sf = SampleFormat::new(48000, 16, 2);
-        assert!((sf.ms_rate() - 48.0).abs() < f64::EPSILON);
     }
 
     #[test]
