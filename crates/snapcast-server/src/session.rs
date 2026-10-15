@@ -127,59 +127,65 @@ struct Registration {
     initial_settings: ClientSettingsUpdate,
     /// The client was in no group and got a new one.
     joins_new_group: bool,
+    /// Server state right after the registration, for `StateChanged`.
+    snapshot: crate::state::ServerState,
 }
 
 impl SessionContext {
-    /// Make a new session the owner of `hello.id`, cancelling any previous
+    /// Make a new session the owner of `client_id`, cancelling any previous
     /// session for that id, and register its client and channels.
     ///
     /// `sessions` is held throughout, so registrations of two sessions for
     /// the same id never interleave: otherwise a session replaced while
     /// registering could overwrite its successor's channels.
-    async fn register_session(&self, hello: &Hello, peer: SocketAddr) -> Registration {
-        let client_id = &hello.id;
+    async fn register_session(
+        &self,
+        client_id: &str,
+        hello: &Hello,
+        peer: SocketAddr,
+    ) -> Registration {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let (cancel, cancelled) = oneshot::channel();
         let mut sessions = self.sessions.lock().await;
-        let previous = sessions.insert(client_id.clone(), ActiveSession { generation, cancel });
+        let previous = sessions.insert(client_id.to_string(), ActiveSession { generation, cancel });
         if let Some(previous) = previous {
             tracing::info!(id = %client_id, "Client reconnected, replacing previous session");
             let _ = previous.cancel.send(());
         }
 
-        let (initial_settings, initial_routing, joins_new_group) = {
+        let (initial_settings, initial_routing, joins_new_group, snapshot) = {
             let mut s = self.shared_state.lock().await;
             let c = s.get_or_create_client(client_id, &hello.host_name, &hello.mac);
             c.update_from_hello(hello, &peer.ip().to_string());
             c.connected = true;
-            let initial_settings = ClientSettingsUpdate {
-                client_id: client_id.clone(),
-                buffer_ms: self.buffer_ms,
-                latency: c.config.latency,
-                volume: c.config.volume.percent,
-                muted: c.config.volume.muted,
-            };
-            let joins_new_group = !s.groups.iter().any(|g| g.clients.contains(client_id));
+            let joins_new_group = s.group_of(client_id).is_none();
             s.group_for_client(client_id, &self.default_stream);
+            let initial_settings = ClientSettingsUpdate::from_state(&s, client_id, self.buffer_ms)
+                .expect("client just registered");
             let initial_routing =
                 Self::build_routing(&s, client_id).unwrap_or_else(|| SessionRouting {
                     stream_id: self.default_stream.clone(),
                     client_muted: false,
                     group_muted: false,
                 });
-            (initial_settings, initial_routing, joins_new_group)
+            (
+                initial_settings,
+                initial_routing,
+                joins_new_group,
+                s.clone(),
+            )
         };
 
         let (routing_tx, routing_rx) = watch::channel(initial_routing);
         self.routing_senders
             .lock()
             .await
-            .insert(client_id.clone(), routing_tx);
+            .insert(client_id.to_string(), routing_tx);
         let (settings_tx, settings_rx) = watch::channel(initial_settings.clone());
         self.settings_senders
             .lock()
             .await
-            .insert(client_id.clone(), settings_tx);
+            .insert(client_id.to_string(), settings_tx);
         drop(sessions);
 
         Registration {
@@ -189,42 +195,46 @@ impl SessionContext {
             routing_rx,
             initial_settings,
             joins_new_group,
+            snapshot,
         }
     }
 
     /// Release a session's registrations. Only the session that still owns
     /// `client_id` touches the shared maps and state, so a replaced session
-    /// ending late cannot unregister its successor. Returns whether this
-    /// session was the owner (and so should report the disconnect).
-    async fn release_session(&self, client_id: &str, generation: u64) -> bool {
+    /// ending late cannot unregister its successor. Returns the server state
+    /// afterwards if this session was the owner (and so should report the
+    /// disconnect).
+    async fn release_session(
+        &self,
+        client_id: &str,
+        generation: u64,
+    ) -> Option<crate::state::ServerState> {
         // Held throughout so a successor cannot register in between.
         let mut sessions = self.sessions.lock().await;
         if sessions
             .get(client_id)
             .is_none_or(|s| s.generation != generation)
         {
-            return false;
+            return None;
         }
         sessions.remove(client_id);
-        {
+        let snapshot = {
             let mut s = self.shared_state.lock().await;
             if let Some(c) = s.clients.get_mut(client_id) {
                 c.connected = false;
                 c.touch();
             }
-        }
+            s.clone()
+        };
         self.routing_senders.lock().await.remove(client_id);
         self.settings_senders.lock().await.remove(client_id);
-        true
+        Some(snapshot)
     }
 
     /// Build routing for a single client from server state.
     /// State lock must be held by caller.
     fn build_routing(state: &crate::state::ServerState, client_id: &str) -> Option<SessionRouting> {
-        let group = state
-            .groups
-            .iter()
-            .find(|g| g.clients.contains(&client_id.to_string()))?;
+        let group = state.group_of(client_id)?;
         let client_muted = state
             .clients
             .get(client_id)
@@ -342,13 +352,25 @@ impl SessionServer {
         );
     }
 
+    /// Forget a removed stream's codec header.
+    pub async fn unregister_stream_codec(&self, stream_id: &str) {
+        self.ctx.codec_headers.lock().await.remove(stream_id);
+    }
+
     /// Push a settings update to a specific streaming client. Never waits
     /// for the client: a session that has not yet written an earlier update
-    /// writes only the latest one.
+    /// writes only the latest one. Settings equal to the client's current
+    /// ones are not sent again.
     pub async fn push_settings(&self, update: ClientSettingsUpdate) {
         let senders = self.ctx.settings_senders.lock().await;
         if let Some(tx) = senders.get(&update.client_id) {
-            tx.send_replace(update);
+            tx.send_if_modified(|current| {
+                let changed = *current != update;
+                if changed {
+                    *current = update;
+                }
+                changed
+            });
         }
     }
 
@@ -373,7 +395,7 @@ impl SessionServer {
         &self,
         listener: TcpListener,
         mut incoming: mpsc::Receiver<IncomingClient>,
-        chunk_rx: broadcast::Sender<WireChunkData>,
+        chunk_tx: broadcast::Sender<WireChunkData>,
         event_tx: mpsc::Sender<ServerEvent>,
     ) {
         tracing::info!(
@@ -394,7 +416,7 @@ impl SessionServer {
                         sock.set_tcp_keepalive(&ka).ok();
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         sock.set_tcp_notsent_lowat(NOTSENT_LOWAT).ok();
-                        self.spawn_client(&mut clients, stream, peer, "tcp", &chunk_rx, &event_tx);
+                        self.spawn_client(&mut clients, stream, peer, "tcp", &chunk_tx, &event_tx);
                     }
                     // Failures such as an aborted handshake or running out of
                     // file descriptors are transient: keep accepting.
@@ -405,7 +427,7 @@ impl SessionServer {
                 },
                 client = incoming.recv(), if incoming_open => match client {
                     Some(client) => {
-                        self.spawn_client(&mut clients, client.transport, client.peer, "external", &chunk_rx, &event_tx);
+                        self.spawn_client(&mut clients, client.transport, client.peer, "external", &chunk_tx, &event_tx);
                     }
                     None => incoming_open = false,
                 },
@@ -426,13 +448,13 @@ impl SessionServer {
         stream: S,
         peer: SocketAddr,
         transport: &'static str,
-        chunk_rx: &broadcast::Sender<WireChunkData>,
+        chunk_tx: &broadcast::Sender<WireChunkData>,
         event_tx: &mpsc::Sender<ServerEvent>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         tracing::info!(%peer, transport, "Client connecting");
-        let chunk_sub = chunk_rx.subscribe();
+        let chunk_sub = chunk_tx.subscribe();
         let ctx = Arc::clone(&self.ctx);
         let event_tx = event_tx.clone();
         clients.spawn(async move {
@@ -473,7 +495,7 @@ where
         _ => anyhow::bail!("expected Hello, got {:?}", hello_msg.base.msg_type),
     };
 
-    let client_id = hello.id.clone();
+    let client_id = unique_client_id(&hello);
     tracing::info!(id = %client_id, name = %hello.host_name, mac = %hello.mac, "Client hello");
 
     // Client filter — reject before auth if not accepted
@@ -502,8 +524,10 @@ where
         routing_rx,
         initial_settings,
         joins_new_group,
-    } = ctx.register_session(&hello, peer).await;
+        snapshot,
+    } = ctx.register_session(&client_id, &hello, peer).await;
     let initial_stream_id = routing_rx.borrow().stream_id.clone();
+    let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
 
     // A client outside any group changes the topology. C++ snapserver
     // announces that with Server.OnUpdate, and control clients such as
@@ -560,13 +584,30 @@ where
         }
     };
 
-    if ctx.release_session(&client_id, generation).await {
+    if let Some(snapshot) = ctx.release_session(&client_id, generation).await {
+        let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
         let _ = event_tx
             .send(ServerEvent::ClientDisconnected { id: client_id })
             .await;
     }
 
     result
+}
+
+/// The id a client is known by: its Hello `ID` (the MAC if empty), with
+/// `#<instance>` appended for instances other than 1 — C++ snapserver's
+/// `Hello::getUniqueId`, so several instances on one host stay apart.
+fn unique_client_id(hello: &Hello) -> String {
+    let id = if hello.id.is_empty() {
+        &hello.mac
+    } else {
+        &hello.id
+    };
+    if hello.instance == 1 {
+        id.clone()
+    } else {
+        format!("{id}#{}", hello.instance)
+    }
 }
 
 /// Run `fut`, failing if it takes longer than the idle timeout.
@@ -733,13 +774,15 @@ where
                             }
                         }
                         MessagePayload::ClientInfo(info) => {
-                            {
+                            let snapshot = {
                                 let mut s = ctx.shared_state.lock().await;
                                 if let Some(c) = s.clients.get_mut(&client_id) {
                                     c.config.volume.percent = info.volume;
                                     c.config.volume.muted = info.muted;
                                 }
-                            }
+                                s.clone()
+                            };
+                            let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
                             // The mute flag gates audio for this session.
                             ctx.push_routing(&client_id).await;
                             let _ = event_tx.send(ServerEvent::ClientVolumeChanged {
@@ -818,7 +861,7 @@ where
 #[derive(Debug, Default)]
 struct AudioCursor {
     /// Stream and timestamp of the last chunk sent.
-    last: Option<(String, i64)>,
+    last: Option<(Arc<str>, i64)>,
     /// Timestamp step between the last two chunks sent: the duration of a
     /// chunk.
     step_usec: i64,
@@ -847,7 +890,7 @@ impl AudioCursor {
             Some(_) => {}
             None => self.step_usec = 0,
         }
-        self.last = Some((chunk.stream_id.clone(), ts));
+        self.last = Some((Arc::clone(&chunk.stream_id), ts));
         report
     }
 }
@@ -859,7 +902,7 @@ fn should_send_chunk(
     routing: &SessionRouting,
     send_audio_to_muted: bool,
 ) -> bool {
-    if chunk.stream_id != routing.stream_id {
+    if *chunk.stream_id != *routing.stream_id {
         return false;
     }
     if !send_audio_to_muted && (routing.client_muted || routing.group_muted) {
@@ -895,6 +938,7 @@ fn serialize_wire_chunk(chunk: &WireChunkData) -> Result<Vec<u8>> {
     Timeval::from_usec(chunk.timestamp_usec)
         .write_to(&mut frame)
         .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    // Fits: `payload_size` (larger) passed the check above.
     frame.extend_from_slice(&(chunk.data.len() as u32).to_le_bytes());
     frame.extend_from_slice(&chunk.data);
     Ok(frame)
@@ -935,35 +979,38 @@ async fn validate_auth<S: AsyncWrite + Unpin>(
     stream: &mut S,
     client_id: &str,
 ) -> Result<()> {
+    use crate::auth::AuthError;
+
     let auth_result = match &hello.auth {
         Some(a) => validator.validate(&a.scheme, &a.param),
-        None => Err(crate::auth::AuthError::Unauthorized(
-            "Authentication required".into(),
-        )),
-    };
+        None => Err(AuthError::Unauthorized("Authentication required".into())),
+    }
+    .and_then(|result| {
+        if result
+            .permissions
+            .iter()
+            .any(|p| p == crate::auth::PERM_STREAMING)
+        {
+            Ok(result)
+        } else {
+            Err(AuthError::Forbidden(format!(
+                "Permission '{}' missing",
+                crate::auth::PERM_STREAMING
+            )))
+        }
+    });
     match auth_result {
         Ok(result) => {
-            if !result
-                .permissions
-                .iter()
-                .any(|p| p == crate::auth::PERM_STREAMING)
-            {
-                let err = snapcast_proto::message::error::Error {
-                    code: 403,
-                    message: "Forbidden".into(),
-                    error: "Permission 'Streaming' missing".into(),
-                };
-                send_msg(stream, MessageType::Error, &MessagePayload::Error(err)).await?;
-                anyhow::bail!("Client {client_id}: missing Streaming permission");
-            }
             tracing::info!(id = %client_id, user = %result.username, "Authenticated");
             Ok(())
         }
         Err(e) => {
+            // As C++ snapserver: the short name in `error`, the details in
+            // `message`.
             let err = snapcast_proto::message::error::Error {
                 code: e.code() as u32,
+                error: e.name().to_string(),
                 message: e.message().to_string(),
-                error: e.message().to_string(),
             };
             send_msg(stream, MessageType::Error, &MessagePayload::Error(err)).await?;
             anyhow::bail!("Client {client_id}: {e}");
@@ -1091,7 +1138,7 @@ mod tests {
 
     fn chunk(stream_id: &str) -> WireChunkData {
         WireChunkData {
-            stream_id: stream_id.to_string(),
+            stream_id: stream_id.into(),
             timestamp_usec: 0,
             data: vec![0u8; 64].into(),
         }
@@ -1123,6 +1170,58 @@ mod tests {
         };
         assert_eq!(wc.timestamp, Timeval::from_usec(data.timestamp_usec));
         assert_eq!(wc.payload, data.data);
+    }
+
+    // ── unique_client_id ──────────────────────────────────────
+
+    #[test]
+    fn unique_client_id_matches_cpp() {
+        let mut h = hello("host-id");
+        assert_eq!(unique_client_id(&h), "host-id");
+        h.instance = 2;
+        assert_eq!(unique_client_id(&h), "host-id#2");
+        h.id.clear();
+        assert_eq!(unique_client_id(&h), "00:11:22:33:44:55#2");
+    }
+
+    // ── validate_auth ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_errors_carry_the_short_name_in_error() {
+        use crate::auth::{Role, StaticAuthValidator, User};
+        let validator = StaticAuthValidator::new(
+            vec![User {
+                name: "u".into(),
+                password: "p".into(),
+                role: "control".into(),
+            }],
+            vec![Role {
+                name: "control".into(),
+                permissions: vec!["Control".into()],
+            }],
+        );
+        let reply = async |auth: Option<snapcast_proto::message::hello::Auth>| {
+            let mut h = hello("c1");
+            h.auth = auth;
+            let mut out = Vec::new();
+            assert!(validate_auth(&validator, &h, &mut out, "c1").await.is_err());
+            match factory::take_frame(&mut out).unwrap().unwrap().payload {
+                MessagePayload::Error(e) => e,
+                other => panic!("expected Error, got {other:?}"),
+            }
+        };
+        let e = reply(None).await;
+        assert_eq!((e.code, e.error.as_str()), (401, "Unauthorized"));
+        assert_eq!(e.message, "Authentication required");
+
+        use base64::Engine;
+        let e = reply(Some(snapcast_proto::message::hello::Auth {
+            scheme: "Basic".into(),
+            param: base64::engine::general_purpose::STANDARD.encode("u:p"),
+        }))
+        .await;
+        assert_eq!((e.code, e.error.as_str()), (403, "Forbidden"));
+        assert_eq!(e.message, "Permission 'Streaming' missing");
     }
 
     // ── AudioCursor ───────────────────────────────────────────
@@ -1475,6 +1574,38 @@ mod tests {
         })
         .await
         .expect("latest settings delivered");
+    }
+
+    #[tokio::test]
+    async fn unchanged_settings_are_not_resent() {
+        let server = test_server(crate::state::ServerState::default());
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel(16);
+        let (mut frames, _writer) =
+            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        let update = |volume| ClientSettingsUpdate {
+            client_id: "c1".into(),
+            buffer_ms: 1000,
+            latency: 0,
+            volume,
+            muted: false,
+        };
+        // The Hello was answered with volume 100: pushing it again is a no-op.
+        server.push_settings(update(100)).await;
+        // Time for the session to write anything the first push caused.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        server.push_settings(update(40)).await;
+        let next_settings = async {
+            loop {
+                if let MessagePayload::ServerSettings(ss) = frames.next().await.unwrap().payload {
+                    return ss.volume;
+                }
+            }
+        };
+        let volume = tokio::time::timeout(Duration::from_secs(2), next_settings)
+            .await
+            .unwrap();
+        assert_eq!(volume, 40);
     }
 
     #[tokio::test]

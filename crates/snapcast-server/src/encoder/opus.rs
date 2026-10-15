@@ -129,7 +129,7 @@ impl Encoder for OpusEncoder {
         &self.header
     }
 
-    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
+    fn encode(&mut self, input: AudioData) -> Result<Vec<EncodedPacket>> {
         let channels = self.format.channels() as usize;
         // Frames carried from earlier input start before this input does.
         let carried_frames = (self.pending.len() / channels) as i64;
@@ -138,7 +138,7 @@ impl Encoder for OpusEncoder {
             // libopus works in float: f32 input is encoded as is, and 16-bit
             // PCM is scaled exactly as opus_encode() does, so neither is
             // quantized here.
-            AudioData::F32(samples) => self.pending.extend_from_slice(samples),
+            AudioData::F32(samples) => self.pending.extend_from_slice(&samples),
             AudioData::Pcm(data) if self.format.bits() == 16 => self.pending.extend(
                 data.as_chunks::<2>()
                     .0
@@ -147,7 +147,7 @@ impl Encoder for OpusEncoder {
             ),
             AudioData::Pcm(data) => self
                 .pending
-                .extend(super::pcm_to_f32(data, self.format.bits())),
+                .extend(super::pcm_to_f32(&data, self.format.bits())),
         }
         // Whole inter-channel frames only, so interleaving never shifts.
         self.pending
@@ -249,8 +249,8 @@ mod tests {
         let fmt = SampleFormat::new(48000, 16, 2);
         let mut enc = OpusEncoder::new(fmt, "").unwrap();
         // 300 frames stay pending, then 3.5 Opus frames complete three more.
-        assert!(enc.encode(&AudioData::Pcm(tone(300))).unwrap().is_empty());
-        let packets = enc.encode(&AudioData::Pcm(tone(960 * 3 + 480))).unwrap();
+        assert!(enc.encode(AudioData::Pcm(tone(300))).unwrap().is_empty());
+        let packets = enc.encode(AudioData::Pcm(tone(960 * 3 + 480))).unwrap();
         assert_eq!(packets.len(), 3, "one packet per 20 ms frame");
         let offsets: Vec<i64> = packets.iter().map(|p| p.offset_frames).collect();
         assert_eq!(offsets, [-300, 960 - 300, 2 * 960 - 300]);
@@ -271,7 +271,7 @@ mod tests {
         let samples: Vec<f32> = (0..960 * 2 * 5)
             .map(|n| ((n / 2) as f32 * 0.05).sin() * 0.25)
             .collect();
-        let packets = enc.encode(&AudioData::F32(samples)).unwrap();
+        let packets = enc.encode(AudioData::F32(samples)).unwrap();
         assert_eq!(packets.len(), 5);
         assert!(enc.pending.is_empty());
 
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn reset_drops_partial_frame() {
         let mut enc = OpusEncoder::new(SampleFormat::new(48000, 16, 2), "").unwrap();
-        assert!(enc.encode(&AudioData::Pcm(tone(500))).unwrap().is_empty());
+        assert!(enc.encode(AudioData::Pcm(tone(500))).unwrap().is_empty());
         enc.reset();
         assert!(enc.pending.is_empty());
     }
@@ -300,7 +300,6 @@ mod tests {
         let enc = crate::encoder::create(&crate::encoder::EncoderConfig {
             codec: "opus:BITRATE:256000,COMPLEXITY:10".into(),
             format,
-            options: String::new(),
         })
         .unwrap();
         assert_eq!(enc.name(), "opus");

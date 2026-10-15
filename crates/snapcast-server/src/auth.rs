@@ -62,8 +62,7 @@ pub enum AuthError {
 impl std::fmt::Display for AuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
-            Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            Self::Unauthorized(msg) | Self::Forbidden(msg) => write!(f, "{}: {msg}", self.name()),
         }
     }
 }
@@ -76,6 +75,15 @@ impl AuthError {
         match self {
             Self::Unauthorized(_) => 401,
             Self::Forbidden(_) => 403,
+        }
+    }
+
+    /// Short error name ("Unauthorized" / "Forbidden"), as C++ snapserver
+    /// puts it in the `error` field of an Error message.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Unauthorized(_) => "Unauthorized",
+            Self::Forbidden(_) => "Forbidden",
         }
     }
 

@@ -36,12 +36,13 @@ pub(crate) trait Encoder: Send {
     /// Codec header bytes sent to clients before audio data.
     fn header(&self) -> &[u8];
 
-    /// Encode an audio chunk. Accepts F32 or Pcm input.
+    /// Encode an audio chunk. Accepts F32 or Pcm input, by value so that a
+    /// passthrough encoder can hand the buffer on without copying it.
     ///
     /// Returns every packet completed by this input, in order: none while
     /// the encoder is still buffering toward a full packet, several when the
     /// input spans more than one.
-    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>>;
+    fn encode(&mut self, input: AudioData) -> Result<Vec<EncodedPacket>>;
 
     /// Drop buffered input and codec state before encoding resumes after a
     /// gap, so the first output after the gap holds no audio from before it.
@@ -57,27 +58,17 @@ pub(crate) struct EncoderConfig {
     pub codec: String,
     /// Audio sample format.
     pub format: SampleFormat,
-    /// Codec-specific options (e.g. FLAC compression level).
-    pub options: String,
 }
 
 /// Create an encoder from config.
 pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
-    #[allow(unused_variables)]
-    let EncoderConfig {
-        codec,
-        format,
-        options,
-        ..
-    } = config;
+    let EncoderConfig { codec, format } = config;
     let format = *format;
     format
         .validate_concrete_pcm()
         .map_err(|e| anyhow::anyhow!("{codec} encoder: {e}"))?;
-    let (codec, options) = match codec.split_once(':') {
-        Some((name, inline)) if options.is_empty() => (name, inline),
-        _ => (codec.as_str(), options.as_str()),
-    };
+    #[allow(unused_variables)]
+    let (codec, options) = codec.split_once(':').unwrap_or((codec.as_str(), ""));
     match codec {
         snapcast_proto::CODEC_PCM => Ok(Box::new(pcm::PcmEncoder::new(format))),
         #[cfg(feature = "flac")]
@@ -88,35 +79,34 @@ pub(crate) fn create(config: &EncoderConfig) -> Result<Box<dyn Encoder>> {
     }
 }
 
-/// Convert f32 samples to PCM bytes at the given bit depth.
-/// Shared helper for encoders that need integer PCM input.
+/// Quantize one f32 sample (nominal range -1.0..=1.0, clamped) to an
+/// integer sample of `bits` bits (16, 24 or 32), as carried in PCM.
+#[inline]
+pub(crate) fn quantize(sample: f32, bits: u16) -> i32 {
+    let scale = match bits {
+        24 => snapcast_proto::PCM_24BIT_MAX,
+        32 => i32::MAX as f32,
+        _ => i16::MAX as f32,
+    };
+    // `as` saturates, so 1.0 at 32 bits (2^31 after rounding) stays in range.
+    (sample.clamp(-1.0, 1.0) * scale) as i32
+}
+
+/// Convert f32 samples to PCM bytes at the given bit depth (16 bits for an
+/// unsupported depth). Shared helper for encoders that need integer PCM input.
 pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Vec<u8> {
-    match bits {
-        16 => {
-            let mut buf = Vec::with_capacity(samples.len() * 2);
-            for &s in samples {
-                let i = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            buf
+    if bits == 24 || bits == 32 {
+        let mut buf = Vec::with_capacity(samples.len() * 4);
+        for &s in samples {
+            buf.extend_from_slice(&quantize(s, bits).to_le_bytes());
         }
-        24 => {
-            let mut buf = Vec::with_capacity(samples.len() * 4);
-            for &s in samples {
-                let i = (s.clamp(-1.0, 1.0) * snapcast_proto::PCM_24BIT_MAX) as i32;
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            buf
+        buf
+    } else {
+        let mut buf = Vec::with_capacity(samples.len() * 2);
+        for &s in samples {
+            buf.extend_from_slice(&(quantize(s, 16) as i16).to_le_bytes());
         }
-        32 => {
-            let mut buf = Vec::with_capacity(samples.len() * 4);
-            for &s in samples {
-                let i = (s.clamp(-1.0, 1.0) * i32::MAX as f32) as i32;
-                buf.extend_from_slice(&i.to_le_bytes());
-            }
-            buf
-        }
-        _ => f32_to_pcm(samples, 16),
+        buf
     }
 }
 
@@ -172,7 +162,6 @@ mod tests {
         let config = |codec: &str| EncoderConfig {
             codec: codec.into(),
             format,
-            options: String::new(),
         };
         assert_eq!(create(&config("pcm")).unwrap().name(), "pcm");
         #[cfg(feature = "flac")]
@@ -195,7 +184,6 @@ mod tests {
             let config = EncoderConfig {
                 codec: "pcm".into(),
                 format,
-                options: String::new(),
             };
             let err = create(&config).err().expect("rejected").to_string();
             assert!(err.contains("unsupported sample format"), "{err}");

@@ -175,13 +175,20 @@ impl ServerState {
         self.clients.get_mut(id).expect("just inserted")
     }
 
+    /// The group a client belongs to, if any.
+    pub fn group_of(&self, client_id: &str) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|g| g.clients.iter().any(|c| c == client_id))
+    }
+
     /// Find which group a client belongs to, or create a new group.
     pub fn group_for_client(&mut self, client_id: &str, default_stream: &str) -> &mut Group {
         // Check if client is already in a group
         let idx = self
             .groups
             .iter()
-            .position(|g| g.clients.contains(&client_id.to_string()));
+            .position(|g| g.clients.iter().any(|c| c == client_id));
 
         if let Some(idx) = idx {
             return &mut self.groups[idx];
@@ -240,14 +247,23 @@ impl ServerState {
     /// - Clients removed from the target group get their own new group (inheriting the stream).
     /// - Clients added are moved from their old groups (empty old groups are removed).
     /// - If the target group ends up empty, it is removed.
+    /// - Unknown client ids are ignored, and nothing changes for an unknown
+    ///   group (its clients would otherwise leave their groups for none).
     pub fn set_group_clients(&mut self, group_id: &str, client_ids: &[String]) {
         // Find the target group's stream for inheritance
-        let stream_id = self
+        let Some(stream_id) = self
             .groups
             .iter()
             .find(|g| g.id == group_id)
             .map(|g| g.stream_id.clone())
-            .unwrap_or_default();
+        else {
+            return;
+        };
+        let client_ids: Vec<String> = client_ids
+            .iter()
+            .filter(|c| self.clients.contains_key(*c))
+            .cloned()
+            .collect();
 
         // 1. Evict clients NOT in the new list → create new group for each
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
@@ -271,7 +287,7 @@ impl ServerState {
         }
 
         // 2. Add clients to the target group (move from old groups)
-        for cid in client_ids {
+        for cid in &client_ids {
             let already_in_target = self
                 .groups
                 .iter()
@@ -423,6 +439,22 @@ mod tests {
         let evicted_group = state.groups.iter().find(|g| g.id != g1).unwrap();
         assert_eq!(evicted_group.clients, vec!["c2"]);
         assert_eq!(evicted_group.stream_id, "s1");
+    }
+
+    #[test]
+    fn set_group_clients_ignores_unknown_group_and_clients() {
+        let mut state = ServerState::default();
+        state.get_or_create_client("c1", "h1", "m1");
+        let g1 = state.group_for_client("c1", "s1").id.clone();
+
+        // An unknown group must not pull c1 out of its group.
+        state.set_group_clients("nope", &["c1".into()]);
+        assert_eq!(state.group_of("c1").unwrap().id, g1);
+
+        // An unknown client id is not added.
+        state.set_group_clients(&g1, &["c1".into(), "ghost".into()]);
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].clients, vec!["c1"]);
     }
 
     #[test]

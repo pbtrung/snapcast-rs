@@ -34,9 +34,9 @@ impl Encoder for PcmEncoder {
         &self.header
     }
 
-    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
-        let data = match input {
-            AudioData::Pcm(pcm) => pcm.clone(),
+    fn encode(&mut self, input: AudioData) -> Result<Vec<EncodedPacket>> {
+        let mut data = match input {
+            AudioData::Pcm(pcm) => pcm,
             AudioData::F32(samples) => {
                 if !self.warned {
                     self.warned = true;
@@ -47,9 +47,13 @@ impl Encoder for PcmEncoder {
                         self.format.bits()
                     );
                 }
-                super::f32_to_pcm(samples, self.format.bits())
+                super::f32_to_pcm(&samples, self.format.bits())
             }
         };
+        // Whole frames only: clients play each chunk as is, so a partial
+        // frame would shift channel interleaving for the rest of the stream.
+        let frame_size = self.format.frame_size() as usize;
+        data.truncate(data.len() - data.len() % frame_size);
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -97,7 +101,7 @@ mod tests {
         assert_eq!(&enc.header()[0..4], b"RIFF");
 
         let pcm = vec![0u8; 960 * 4];
-        let result = enc.encode(&AudioData::Pcm(pcm.clone())).unwrap();
+        let result = enc.encode(AudioData::Pcm(pcm.clone())).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].data.len(), pcm.len());
         assert_eq!(result[0].offset_frames, 0);
@@ -108,8 +112,17 @@ mod tests {
         let fmt = SampleFormat::new(48000, 16, 2);
         let mut enc = PcmEncoder::new(fmt);
         let samples = vec![0.0f32; 960];
-        let result = enc.encode(&AudioData::F32(samples)).unwrap();
+        let result = enc.encode(AudioData::F32(samples)).unwrap();
         assert_eq!(result[0].data.len(), 960 * 2); // 16-bit = 2 bytes/sample
+    }
+
+    #[test]
+    fn partial_frame_is_dropped() {
+        let fmt = SampleFormat::new(48000, 16, 2);
+        let mut enc = PcmEncoder::new(fmt);
+        let result = enc.encode(AudioData::Pcm(vec![0u8; 4 * 10 + 2])).unwrap();
+        assert_eq!(result[0].data.len(), 4 * 10);
+        assert!(enc.encode(AudioData::Pcm(vec![0u8; 3])).unwrap().is_empty());
     }
 
     #[test]

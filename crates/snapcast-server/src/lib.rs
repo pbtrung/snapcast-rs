@@ -60,6 +60,8 @@ const EVENT_CHANNEL_SIZE: usize = 256;
 const COMMAND_CHANNEL_SIZE: usize = 64;
 const INCOMING_CLIENT_CHANNEL_SIZE: usize = 16;
 const AUDIO_CHANNEL_SIZE: usize = 256;
+/// Encoded chunks buffered per session before it lags.
+const CHUNK_CHANNEL_SIZE: usize = 256;
 
 /// Channel size for F32 embedded sources — backpressure from encoder pacing.
 const F32_CHANNEL_SIZE: usize = 1;
@@ -149,12 +151,16 @@ impl F32AudioSender {
 
     /// Flush remaining samples (< 20ms) as a final short chunk.
     /// Call at end-of-track to avoid losing the last few milliseconds.
+    ///
+    /// A trailing partial frame (input that was not a whole number of
+    /// frames) is dropped, so channel interleaving never shifts.
     pub async fn flush(&mut self) -> Result<(), mpsc::error::SendError<AudioFrame>> {
-        if self.buf.is_empty() {
+        let ch = self.channels.max(1) as usize;
+        let mut chunk: Vec<f32> = std::mem::take(&mut self.buf);
+        chunk.truncate(chunk.len() / ch * ch);
+        if chunk.is_empty() {
             return Ok(());
         }
-        let chunk: Vec<f32> = std::mem::take(&mut self.buf);
-        let ch = self.channels.max(1) as usize;
         let frames = (chunk.len() / ch) as u32;
         let ts = self
             .ts
@@ -172,8 +178,9 @@ impl F32AudioSender {
 /// An encoded audio chunk ready to be sent to clients.
 #[derive(Debug, Clone)]
 pub struct WireChunkData {
-    /// Stream ID this chunk belongs to.
-    pub stream_id: String,
+    /// Stream ID this chunk belongs to. Shared, so broadcasting the chunk to
+    /// every session clones no string.
+    pub stream_id: Arc<str>,
     /// Server timestamp in microseconds.
     pub timestamp_usec: i64,
     /// Encoded audio data, shared by every session the chunk is broadcast to.
@@ -190,7 +197,7 @@ pub mod status;
 pub mod time;
 
 /// Settings update pushed to a streaming client via binary protocol.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClientSettingsUpdate {
     /// Target client ID.
     pub client_id: String,
@@ -200,8 +207,29 @@ pub struct ClientSettingsUpdate {
     pub latency: i32,
     /// Volume (0–100).
     pub volume: u16,
-    /// Mute state.
+    /// Mute state: the client's own mute or its group's, as C++ snapserver
+    /// sends it.
     pub muted: bool,
+}
+
+impl ClientSettingsUpdate {
+    /// The settings `client_id` should have according to `state`, or `None`
+    /// for an unknown client.
+    pub(crate) fn from_state(
+        state: &state::ServerState,
+        client_id: &str,
+        buffer_ms: i32,
+    ) -> Option<Self> {
+        let client = state.clients.get(client_id)?;
+        let group_muted = state.group_of(client_id).is_some_and(|g| g.muted);
+        Some(Self {
+            client_id: client_id.to_string(),
+            buffer_ms,
+            latency: client.config.latency,
+            volume: client.config.volume.percent,
+            muted: client.config.volume.muted || group_muted,
+        })
+    }
 }
 
 /// Events emitted by the server to the consumer.
@@ -409,7 +437,8 @@ pub enum ServerCommand {
         /// Response: the stream ID assigned.
         response_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
     },
-    /// Remove a stream source.
+    /// Remove a stream source. Its encoder stops, so sends on the stream's
+    /// audio sender fail from then on.
     RemoveStream {
         /// Stream ID to remove.
         stream_id: String,
@@ -604,14 +633,20 @@ pub struct SnapServer {
 /// and broadcasts encoded `WireChunkData` to sessions. While no session is
 /// connected, frames are still received and paced but not encoded; the
 /// encoder is reset when the first session arrives.
+///
+/// The loop ends once the audio sender is dropped, or the returned handle is
+/// (stream removed, server stopped); the latter drops the receiver, so the
+/// embedder's next send fails.
+#[must_use = "dropping the handle stops the encoder"]
 fn spawn_stream_encoder(
-    stream_id: String,
+    stream_id: Arc<str>,
     mut rx: mpsc::Receiver<AudioFrame>,
     mut enc: Box<dyn encoder::Encoder>,
     chunk_tx: broadcast::Sender<WireChunkData>,
     sample_rate: u32,
     channels: u16,
-) {
+) -> tokio::sync::oneshot::Sender<()> {
+    let (stop_tx, mut stop) = tokio::sync::oneshot::channel::<()>();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -621,12 +656,22 @@ fn spawn_stream_encoder(
         rt.block_on(async {
             let mut next_tick: Option<tokio::time::Instant> = None;
             let mut idle = false;
-            while let Some(frame) = rx.recv().await {
+            loop {
+                let frame = tokio::select! {
+                    frame = rx.recv() => match frame {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                    _ = &mut stop => break,
+                };
                 // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
                 if let AudioData::F32(ref samples) = frame.data {
                     let num_frames = samples.len() / channels.max(1) as usize;
-                    let chunk_dur = std::time::Duration::from_micros(
-                        (num_frames as u64 * 1_000_000) / sample_rate as u64,
+                    // Nanoseconds: whole microseconds would truncate a little
+                    // off every chunk at rates such as 11025 Hz, and the pace
+                    // would creep ahead of the timestamps.
+                    let chunk_dur = std::time::Duration::from_nanos(
+                        (num_frames as u64 * 1_000_000_000) / sample_rate as u64,
                     );
                     let now = tokio::time::Instant::now();
                     let tick = next_tick.get_or_insert(now);
@@ -651,13 +696,13 @@ fn spawn_stream_encoder(
                     enc.reset();
                     tracing::debug!(stream = %stream_id, "Client connected, resuming encoding");
                 }
-                match enc.encode(&frame.data) {
+                match enc.encode(frame.data) {
                     // One WireChunk per packet: clients decode each chunk as a
                     // single codec packet. Empty while the encoder buffers.
                     Ok(packets) => {
                         for packet in packets {
                             let _ = chunk_tx.send(WireChunkData {
-                                stream_id: stream_id.clone(),
+                                stream_id: Arc::clone(&stream_id),
                                 timestamp_usec: frame.timestamp_usec
                                     + packet.offset_frames * 1_000_000 / i64::from(sample_rate),
                                 data: packet.data.into(),
@@ -671,6 +716,7 @@ fn spawn_stream_encoder(
             }
         });
     });
+    stop_tx
 }
 
 /// Parse a configured sample format and require it to be concrete PCM.
@@ -689,7 +735,7 @@ impl SnapServer {
     pub fn new(config: ServerConfig) -> (Self, mpsc::Receiver<ServerEvent>) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
-        let (chunk_tx, _) = broadcast::channel(256);
+        let (chunk_tx, _) = broadcast::channel(CHUNK_CHANNEL_SIZE);
         let (client_tx, client_rx) = mpsc::channel(INCOMING_CLIENT_CHANNEL_SIZE);
         let server = Self {
             config,
@@ -757,6 +803,13 @@ impl SnapServer {
     }
 
     /// Run the server. Blocks until stopped or a fatal error occurs.
+    ///
+    /// A stream whose codec or sample format is unusable is logged and
+    /// skipped. Stopping the server also stops every stream's encoder.
+    ///
+    /// # Errors
+    /// Fails if called twice, if the server's `sample_format` is invalid, or
+    /// if no stream is usable.
     pub async fn serve(&mut self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
         let mut command_rx = self
             .command_rx
@@ -777,18 +830,37 @@ impl SnapServer {
             "Snapserver starting"
         );
 
-        // Create default encoder — used for codec header and first default stream
-        let default_enc_config = encoder::EncoderConfig {
-            codec: self.config.codec.clone(),
-            format: sample_format,
-            options: String::new(),
-        };
-        let default_enc = encoder::create(&default_enc_config)?;
-
-        // Spawn per-stream encode loops — reuse default_enc for first default stream
-        let chunk_tx = self.chunk_tx.clone();
+        // Create every stream's encoder before starting anything. A stream
+        // whose codec or format is unusable is skipped (its audio sender
+        // fails from then on), so one bad source does not take down the
+        // others; with none usable, `serve` fails.
         let streams = std::mem::take(&mut self.streams);
-        let mut default_enc = Some(default_enc);
+        let mut encoders = Vec::with_capacity(streams.len());
+        let mut last_error = None;
+        for (name, stream_cfg, rx) in streams {
+            let codec = stream_cfg.codec.as_deref().unwrap_or(&self.config.codec);
+            let enc = stream_cfg
+                .sample_format
+                .as_deref()
+                .map_or(Ok(sample_format), parse_pcm_format)
+                .and_then(|format| {
+                    let enc = encoder::create(&encoder::EncoderConfig {
+                        codec: codec.to_string(),
+                        format,
+                    })?;
+                    Ok((enc, format))
+                });
+            match enc {
+                Ok((enc, format)) => encoders.push((name, stream_cfg.uri, rx, enc, format)),
+                Err(e) => {
+                    tracing::error!(stream = %name, error = %e, "Stream skipped");
+                    last_error = Some(anyhow::anyhow!("stream '{name}': {e}"));
+                }
+            }
+        }
+        if encoders.is_empty() {
+            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no usable stream")));
+        }
 
         // Shared state for command handlers — seeded from the embedder-supplied
         // snapshot (the library reads no files).
@@ -802,24 +874,25 @@ impl SnapServer {
 
         // Create the session server before stream registration; it only needs
         // the first stream's name, as the default for clients without a group.
-        let first_name = streams
+        let first_name = encoders
             .first()
-            .map(|(n, _, _)| n.clone())
+            .map(|(n, ..)| n.clone())
             .unwrap_or_default();
         let session_srv = Arc::new(session::SessionServer::new(session::SessionServerConfig {
             buffer_ms: self.config.buffer_ms as i32,
             auth: self.config.auth.clone(),
             client_filter: self.config.client_filter.clone(),
             shared_state: Arc::clone(&shared_state),
-            default_stream: first_name.clone(),
+            default_stream: first_name,
             send_audio_to_muted: self.config.send_audio_to_muted,
             idle_timeout: self.config.client_idle_timeout,
         }));
 
-        for (name, stream_cfg, rx) in streams {
+        let mut encoder_stops = std::collections::HashMap::with_capacity(encoders.len());
+        for (name, uri, rx, enc, format) in encoders {
             {
                 let mut s = shared_state.lock().await;
-                let uri = stream_cfg.uri.clone().unwrap_or_default();
+                let uri = uri.unwrap_or_default();
                 if let Some(existing) = s.streams.iter_mut().find(|st| st.id == name) {
                     if !uri.is_empty() {
                         existing.uri = uri;
@@ -833,40 +906,19 @@ impl SnapServer {
                     });
                 }
             }
-            let mut active_format = sample_format;
-            let enc = if stream_cfg.codec.is_none() && stream_cfg.sample_format.is_none() {
-                if let Some(enc) = default_enc.take() {
-                    enc
-                } else {
-                    encoder::create(&default_enc_config)?
-                }
-            } else {
-                let stream_codec = stream_cfg.codec.as_deref().unwrap_or(&self.config.codec);
-                let stream_format = match stream_cfg.sample_format.as_deref() {
-                    Some(s) => {
-                        parse_pcm_format(s).map_err(|e| anyhow::anyhow!("stream '{name}': {e}"))?
-                    }
-                    None => sample_format,
-                };
-                active_format = stream_format;
-                encoder::create(&encoder::EncoderConfig {
-                    codec: stream_codec.to_string(),
-                    format: stream_format,
-                    options: String::new(),
-                })?
-            };
-            tracing::info!(stream = %name, codec = enc.name(), format = %active_format, "Stream registered");
+            tracing::info!(stream = %name, codec = enc.name(), format = %format, "Stream registered");
             session_srv
                 .register_stream_codec(&name, enc.name(), enc.header())
                 .await;
-            spawn_stream_encoder(
-                name,
+            let stop = spawn_stream_encoder(
+                name.as_str().into(),
                 rx,
                 enc,
-                chunk_tx.clone(),
-                active_format.rate(),
-                active_format.channels(),
+                self.chunk_tx.clone(),
+                format.rate(),
+                format.channels(),
             );
+            encoder_stops.insert(name, stop);
         }
 
         let incoming_clients = self
@@ -893,6 +945,7 @@ impl SnapServer {
             session_srv: Arc::clone(&session_srv),
             event_tx: event_tx.clone(),
             buffer_ms: self.config.buffer_ms as i32,
+            encoder_stops: std::sync::Mutex::new(encoder_stops),
         };
 
         let remove_after = self.config.remove_disconnected_clients_after;
@@ -946,13 +999,13 @@ mod tests {
             &[]
         }
 
-        fn encode(&mut self, input: &AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
+        fn encode(&mut self, input: AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
             self.encodes.fetch_add(1, Ordering::SeqCst);
             let AudioData::Pcm(data) = input else {
                 anyhow::bail!("expected Pcm");
             };
             Ok(vec![encoder::EncodedPacket {
-                data: data.clone(),
+                data,
                 offset_frames: 0,
             }])
         }
@@ -991,7 +1044,7 @@ mod tests {
             &[]
         }
 
-        fn encode(&mut self, _input: &AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
+        fn encode(&mut self, _input: AudioData) -> anyhow::Result<Vec<encoder::EncodedPacket>> {
             Ok(vec![
                 encoder::EncodedPacket {
                     data: vec![1],
@@ -1009,7 +1062,7 @@ mod tests {
     async fn each_packet_is_its_own_chunk_with_offset_timestamp() {
         let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
         let (chunk_tx, mut chunks) = broadcast::channel(16);
-        spawn_stream_encoder(
+        let _stop = spawn_stream_encoder(
             "s".into(),
             rx,
             Box::new(SplittingEncoder),
@@ -1026,6 +1079,34 @@ mod tests {
         // 100 frames at 48 kHz = 2083 µs; 380 frames = 7916 µs.
         assert_eq!(first.timestamp_usec, 1_000_000 - 2083);
         assert_eq!(second.timestamp_usec, 1_000_000 + 7916);
+    }
+
+    #[tokio::test]
+    async fn serve_skips_a_stream_with_a_bad_codec() {
+        let (mut server, _events) = SnapServer::new(ServerConfig::default());
+        let good = server.add_stream("good");
+        let bad = server.add_stream_with_config(
+            "bad",
+            StreamConfig {
+                codec: Some("nope".into()),
+                ..Default::default()
+            },
+        );
+        server
+            .command_sender()
+            .send(ServerCommand::Stop)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        server
+            .serve(listener)
+            .await
+            .expect("the good stream serves");
+        assert!(bad.is_closed(), "the skipped stream's receiver is dropped");
+        // Stopping the server stops the encoders too.
+        tokio::time::timeout(std::time::Duration::from_secs(2), good.closed())
+            .await
+            .expect("encoder stopped with the server");
     }
 
     #[tokio::test]
@@ -1069,6 +1150,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn f32_flush_sends_whole_frames_only() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut sender = F32AudioSender::new(tx, 48000, 2);
+        // Three samples of stereo: one frame and a stray sample.
+        sender.send(&[0.1, 0.2, 0.3]).await.unwrap();
+        sender.flush().await.unwrap();
+        let AudioData::F32(chunk) = rx.recv().await.unwrap().data else {
+            panic!("expected F32");
+        };
+        assert_eq!(chunk, [0.1, 0.2]);
+        // Nothing but a stray sample: nothing to send.
+        sender.send(&[0.5]).await.unwrap();
+        sender.flush().await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn encoder_pauses_while_no_client_is_connected() {
         let encodes = Arc::new(AtomicUsize::new(0));
         let resets = Arc::new(AtomicUsize::new(0));
@@ -1078,7 +1176,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
         let (chunk_tx, _) = broadcast::channel(16);
-        spawn_stream_encoder("s".into(), rx, enc, chunk_tx.clone(), 48000, 2);
+        let _stop = spawn_stream_encoder("s".into(), rx, enc, chunk_tx.clone(), 48000, 2);
 
         for ts in 1..=3 {
             tx.send(pcm_frame(ts)).await.unwrap();

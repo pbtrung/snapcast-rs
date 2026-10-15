@@ -5,9 +5,10 @@
 //! terminate the loop and are handled by `serve()` itself; every other command
 //! lands here.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::session::SessionServer;
 use crate::state::ServerState;
@@ -23,6 +24,8 @@ pub(crate) struct Dispatcher {
     pub(crate) event_tx: mpsc::Sender<ServerEvent>,
     /// Playout buffer size in milliseconds (pushed to clients).
     pub(crate) buffer_ms: i32,
+    /// Per-stream encoder handles: dropping one stops that stream's encoder.
+    pub(crate) encoder_stops: std::sync::Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
 impl Dispatcher {
@@ -63,6 +66,27 @@ impl Dispatcher {
         self.session_srv.update_routing_all().await;
     }
 
+    /// Settings for `client_ids` as `state` has them, to push after the
+    /// state lock is released.
+    fn settings_for<'a>(
+        &self,
+        state: &ServerState,
+        client_ids: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<ClientSettingsUpdate> {
+        client_ids
+            .into_iter()
+            .filter_map(|id| ClientSettingsUpdate::from_state(state, id, self.buffer_ms))
+            .collect()
+    }
+
+    /// Push settings to the sessions of their clients (unchanged ones are
+    /// skipped by the session server).
+    async fn push_settings(&self, updates: Vec<ClientSettingsUpdate>) {
+        for update in updates {
+            self.session_srv.push_settings(update).await;
+        }
+    }
+
     /// Emit a change notification, wrapped in [`ServerEvent::FromControl`]
     /// when the command came from a control connection.
     fn notify(&self, origin: Option<u64>, event: ServerEvent) {
@@ -98,23 +122,11 @@ impl Dispatcher {
                     c.config.volume.percent = volume;
                     c.config.volume.muted = muted;
                 }
-                let latency = s
-                    .clients
-                    .get(&client_id)
-                    .map(|c| c.config.latency)
-                    .unwrap_or(0);
+                let settings = self.settings_for(&s, [&client_id]);
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                self.session_srv
-                    .push_settings(ClientSettingsUpdate {
-                        client_id: client_id.clone(),
-                        buffer_ms: self.buffer_ms,
-                        latency,
-                        volume,
-                        muted,
-                    })
-                    .await;
+                self.push_settings(settings).await;
                 self.notify(
                     origin,
                     ServerEvent::ClientVolumeChanged {
@@ -126,24 +138,15 @@ impl Dispatcher {
                 self.session_srv.update_routing_for_client(&client_id).await;
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
-                let mut settings_update = None;
                 let mut s = self.shared_state.lock().await;
                 if let Some(c) = s.clients.get_mut(&client_id) {
                     c.config.latency = latency;
-                    settings_update = Some(ClientSettingsUpdate {
-                        client_id: client_id.clone(),
-                        buffer_ms: self.buffer_ms,
-                        latency,
-                        volume: c.config.volume.percent,
-                        muted: c.config.volume.muted,
-                    });
                 }
+                let settings = self.settings_for(&s, [&client_id]);
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
-                if let Some(update) = settings_update {
-                    self.session_srv.push_settings(update).await;
-                }
+                self.push_settings(settings).await;
                 self.notify(
                     origin,
                     ServerEvent::ClientLatencyChanged { client_id, latency },
@@ -179,12 +182,18 @@ impl Dispatcher {
             }
             ServerCommand::SetGroupMute { group_id, muted } => {
                 let mut s = self.shared_state.lock().await;
+                let mut members = Vec::new();
                 if let Some(g) = s.groups.iter_mut().find(|g| g.id == group_id) {
                     g.muted = muted;
+                    members.clone_from(&g.clients);
                 }
+                // The mute clients are told is their own or their group's,
+                // as in C++ snapserver.
+                let settings = self.settings_for(&s, &members);
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.push_settings(settings).await;
                 self.notify(
                     origin,
                     ServerEvent::GroupMuteChanged {
@@ -207,9 +216,12 @@ impl Dispatcher {
             ServerCommand::SetGroupClients { group_id, clients } => {
                 let mut s = self.shared_state.lock().await;
                 s.set_group_clients(&group_id, &clients);
+                // Moved clients may now be in a group muted differently.
+                let settings = self.settings_for(&s, s.clients.keys());
                 let snapshot = s.clone();
                 drop(s);
                 let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.push_settings(settings).await;
                 // Structural change — mirrors Server.OnUpdate in C++ snapserver
                 self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
@@ -248,6 +260,11 @@ impl Dispatcher {
                 ));
             }
             ServerCommand::RemoveStream { stream_id } => {
+                // Stop its encoder; the embedder's sender fails from now on.
+                if let Ok(mut stops) = self.encoder_stops.lock() {
+                    stops.remove(&stream_id);
+                }
+                self.session_srv.unregister_stream_codec(&stream_id).await;
                 let mut s = self.shared_state.lock().await;
                 s.streams.retain(|st| st.id != stream_id);
                 // Clear stream_id on groups that referenced this stream
@@ -288,7 +305,6 @@ mod tests {
     use super::*;
     use crate::session::SessionServerConfig;
     use crate::state::{ServerState, StreamInfo};
-    use std::collections::HashMap;
 
     /// Build a dispatcher over `state`, returning it and its event receiver. The
     /// session server has no registered client senders, so `push_settings` /
@@ -312,6 +328,7 @@ mod tests {
                 session_srv,
                 event_tx,
                 buffer_ms: 1000,
+                encoder_stops: Default::default(),
             },
             event_rx,
         )
@@ -439,6 +456,23 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ServerEvent::ClientVolumeChanged { .. }))
         );
+    }
+
+    #[test]
+    fn settings_carry_the_group_mute() {
+        let (mut state, gid) = state_with_client();
+        let settings = |state: &ServerState| {
+            ClientSettingsUpdate::from_state(state, "c1", 1000)
+                .unwrap()
+                .muted
+        };
+        assert!(!settings(&state));
+        state.groups.iter_mut().find(|g| g.id == gid).unwrap().muted = true;
+        assert!(settings(&state), "group muted");
+        state.groups[0].muted = false;
+        state.clients.get_mut("c1").unwrap().config.volume.muted = true;
+        assert!(settings(&state), "client muted");
+        assert!(ClientSettingsUpdate::from_state(&state, "ghost", 1000).is_none());
     }
 
     #[tokio::test]
@@ -664,6 +698,8 @@ mod tests {
             properties: Default::default(),
         });
         let (d, mut rx) = dispatcher_with(state);
+        let (stop_tx, mut stopped) = oneshot::channel();
+        d.encoder_stops.lock().unwrap().insert("s1".into(), stop_tx);
         d.dispatch(
             None,
             ServerCommand::RemoveStream {
@@ -671,6 +707,12 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(
+            stopped.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed),
+            "encoder handle dropped"
+        );
+        assert!(d.encoder_stops.lock().unwrap().is_empty());
         {
             let s = d.shared_state.lock().await;
             assert!(s.streams.iter().all(|st| st.id != "s1"));

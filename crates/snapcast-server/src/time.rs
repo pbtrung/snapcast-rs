@@ -29,9 +29,14 @@ impl ChunkTimestamper {
 
     /// Get the timestamp for the next chunk of `frames` frames.
     pub fn next(&mut self, frames: u32) -> i64 {
-        let ts = self.start_usec + (self.samples_written as i64 * 1_000_000) / self.rate as i64;
+        let ts = self.next_usec();
         self.samples_written += frames as u64;
         ts
+    }
+
+    /// Timestamp of the next chunk, without advancing.
+    fn next_usec(&self) -> i64 {
+        self.start_usec + (self.samples_written as i64 * 1_000_000) / self.rate as i64
     }
 
     /// Re-anchor at the current time if the next timestamp is more than
@@ -44,8 +49,7 @@ impl ChunkTimestamper {
     /// chunk seconds in the past, and clients would discard them all as too
     /// late to play.
     pub fn resync_if_behind(&mut self, max_lag_usec: i64) -> Option<i64> {
-        let next = self.start_usec + (self.samples_written as i64 * 1_000_000) / self.rate as i64;
-        let lag = now_usec() - next;
+        let lag = now_usec() - self.next_usec();
         if lag > max_lag_usec {
             self.reset();
             Some(lag)

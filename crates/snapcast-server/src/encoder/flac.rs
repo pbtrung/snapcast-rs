@@ -44,6 +44,8 @@ pub struct FlacEncoder {
     header: Vec<u8>,
     /// Interleaved i32 samples accumulated but not yet emitted as a full frame.
     pending: Vec<i32>,
+    /// One block, deinterleaved for `flacenc`; reused for every frame.
+    framebuf: FrameBuf,
     /// Monotonic frame counter for fixed-block-size frame headers.
     frame_number: usize,
     /// Whether we've already warned about F32 → integer-PCM quantization.
@@ -130,6 +132,8 @@ impl FlacEncoder {
 
         let stream_info =
             StreamInfo::new(rate, channels, bits).map_err(|e| anyhow!("FLAC stream info: {e}"))?;
+        let framebuf =
+            FrameBuf::with_size(channels, BLOCK_SIZE).map_err(|e| anyhow!("FLAC framebuf: {e}"))?;
 
         tracing::info!(
             rate,
@@ -146,12 +150,14 @@ impl FlacEncoder {
             stream_info,
             header,
             pending: Vec::new(),
+            framebuf,
             frame_number: 0,
             warned: false,
         })
     }
 
-    /// Decode a chunk of interleaved little-endian PCM into i32 samples.
+    /// Append a chunk of interleaved little-endian PCM to `pending` as i32
+    /// samples.
     ///
     /// Only whole inter-channel frames are decoded; a trailing partial frame
     /// (possible only from a malformed/truncated chunk — production sources
@@ -160,26 +166,58 @@ impl FlacEncoder {
     /// alignment. This matches the prior libFLAC encoder, which computed
     /// `frames = samples / channels` per call and ignored any sub-frame
     /// remainder.
-    fn pcm_to_i32(&self, pcm: &[u8]) -> Result<Vec<i32>> {
+    fn push_pcm(&mut self, pcm: &[u8]) -> Result<()> {
         let sample_size = self.format.sample_size() as usize;
-        let frame_size = sample_size * self.format.channels() as usize;
-        let aligned = pcm.len() - pcm.len() % frame_size.max(1);
-        let pcm = &pcm[..aligned];
-        let mut out = Vec::with_capacity(pcm.len() / sample_size);
+        let frame_size = self.format.frame_size() as usize;
+        let pcm = &pcm[..pcm.len() - pcm.len() % frame_size];
+        self.pending.reserve(pcm.len() / sample_size);
         match sample_size {
-            2 => {
-                for c in pcm.as_chunks::<2>().0 {
-                    out.push(i16::from_le_bytes([c[0], c[1]]) as i32);
-                }
-            }
-            4 => {
-                for c in pcm.as_chunks::<4>().0 {
-                    out.push(i32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                }
-            }
+            2 => self.pending.extend(
+                pcm.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from(i16::from_le_bytes(*c))),
+            ),
+            4 => self.pending.extend(
+                pcm.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c)),
+            ),
             other => bail!("unsupported sample size: {other}"),
         }
-        Ok(out)
+        Ok(())
+    }
+
+    /// Encode `pending[range]` (one block) as the next FLAC frame.
+    fn encode_block(&mut self, range: std::ops::Range<usize>) -> Result<Vec<u8>> {
+        self.framebuf
+            .fill_interleaved(&self.pending[range])
+            .map_err(|e| anyhow!("FLAC fill: {e}"))?;
+        let frame = flacenc::encode_fixed_size_frame(
+            &self.config,
+            &self.framebuf,
+            self.frame_number,
+            &self.stream_info,
+        )
+        .map_err(|e| anyhow!("FLAC encode: {e}"))?;
+        self.frame_number += 1;
+
+        let mut sink = MemSink::<u8>::new();
+        frame
+            .write(&mut sink)
+            .map_err(|e| anyhow!("FLAC frame serialization: {e}"))?;
+        Ok(sink.into_inner())
+    }
+
+    /// Append interleaved f32 samples to `pending`, quantized to the stream's
+    /// bit depth. A trailing partial frame is dropped, as in [`Self::push_pcm`].
+    fn push_f32(&mut self, samples: &[f32]) {
+        let channels = self.format.channels() as usize;
+        let samples = &samples[..samples.len() - samples.len() % channels];
+        let bits = self.format.bits();
+        self.pending
+            .extend(samples.iter().map(|&s| super::quantize(s, bits)));
     }
 }
 
@@ -192,9 +230,12 @@ impl Encoder for FlacEncoder {
         &self.header
     }
 
-    fn encode(&mut self, input: &AudioData) -> Result<Vec<EncodedPacket>> {
-        let pcm = match input {
-            AudioData::Pcm(data) => std::borrow::Cow::Borrowed(data.as_slice()),
+    fn encode(&mut self, input: AudioData) -> Result<Vec<EncodedPacket>> {
+        let channels = self.format.channels() as usize;
+        // Frames carried from earlier input start before this input does.
+        let carried_frames = (self.pending.len() / channels) as i64;
+        match input {
+            AudioData::Pcm(data) => self.push_pcm(&data)?,
             AudioData::F32(samples) => {
                 if !self.warned {
                     self.warned = true;
@@ -204,47 +245,30 @@ impl Encoder for FlacEncoder {
                         "F32 input requires quantization — consider pcm for lossless path"
                     );
                 }
-                std::borrow::Cow::Owned(super::f32_to_pcm(samples, self.format.bits()))
+                self.push_f32(&samples);
             }
-        };
-
-        let channels = self.format.channels() as usize;
-        // Frames carried from earlier input start before this input does.
-        let carried_frames = (self.pending.len() / channels) as i64;
-        self.pending.extend(self.pcm_to_i32(&pcm)?);
+        }
 
         let block_samples = BLOCK_SIZE * channels;
         let mut out = Vec::new();
+        let mut consumed = 0;
 
-        while self.pending.len() >= block_samples {
-            let block: Vec<i32> = self.pending.drain(..block_samples).collect();
-
-            let mut framebuf = FrameBuf::with_size(channels, BLOCK_SIZE)
-                .map_err(|e| anyhow!("FLAC framebuf: {e}"))?;
-            framebuf
-                .fill_interleaved(&block)
-                .map_err(|e| anyhow!("FLAC fill: {e}"))?;
-
-            let frame_number = self.frame_number;
-            let frame = flacenc::encode_fixed_size_frame(
-                &self.config,
-                &framebuf,
-                frame_number,
-                &self.stream_info,
-            )
-            .map_err(|e| anyhow!("FLAC encode: {e}"))?;
-
-            let mut sink = MemSink::<u8>::new();
-            frame
-                .write(&mut sink)
-                .map_err(|e| anyhow!("FLAC frame serialization: {e}"))?;
-            out.push(EncodedPacket {
-                data: sink.into_inner(),
-                offset_frames: (out.len() * BLOCK_SIZE) as i64 - carried_frames,
-            });
-
-            self.frame_number += 1;
+        while self.pending.len() - consumed >= block_samples {
+            let block = self.encode_block(consumed..consumed + block_samples);
+            consumed += block_samples;
+            match block {
+                Ok(data) => out.push(EncodedPacket {
+                    data,
+                    offset_frames: (out.len() * BLOCK_SIZE) as i64 - carried_frames,
+                }),
+                Err(e) => {
+                    // The failed block is dropped too, not retried forever.
+                    self.pending.drain(..consumed);
+                    return Err(e);
+                }
+            }
         }
+        self.pending.drain(..consumed);
 
         Ok(out)
     }
@@ -299,7 +323,7 @@ mod tests {
         let mut enc = FlacEncoder::new(fmt, "").unwrap();
         // 100 whole frames + 2 stray bytes (one extra sample).
         let stray = vec![0u8; 4 * 100 + 2];
-        enc.encode(&AudioData::Pcm(stray)).unwrap();
+        enc.encode(AudioData::Pcm(stray)).unwrap();
         assert_eq!(
             enc.pending.len() % 2,
             0,
@@ -321,7 +345,7 @@ mod tests {
         for _ in 0..10 {
             // 960 frames per chunk; buffers to 1152-frame FLAC frames.
             let pcm = vec![0u8; 960 * 4];
-            for packet in enc.encode(&AudioData::Pcm(pcm)).unwrap() {
+            for packet in enc.encode(AudioData::Pcm(pcm)).unwrap() {
                 saw_frame = true;
                 // FLAC frame sync: 0xFF then 0xF8 (fixed) / 0xF9 (variable).
                 assert_eq!(packet.data[0], 0xFF);
@@ -340,7 +364,7 @@ mod tests {
         for i in 0..100 {
             // Non-constant data so frames aren't trivially all-constant subframes.
             let pcm: Vec<u8> = (0..960 * 4).map(|n| ((n + i) % 251) as u8).collect();
-            for packet in enc.encode(&AudioData::Pcm(pcm)).unwrap() {
+            for packet in enc.encode(AudioData::Pcm(pcm)).unwrap() {
                 assert_ne!(&packet.data[..4], b"fLaC", "header leaked into frame data");
             }
         }
@@ -361,7 +385,7 @@ mod tests {
                 let v: i32 = (((n as i64 + k as i64) * 4099) % 8_000_000 - 4_000_000) as i32;
                 pcm.extend_from_slice(&v.to_le_bytes());
             }
-            for packet in enc.encode(&AudioData::Pcm(pcm)).unwrap() {
+            for packet in enc.encode(AudioData::Pcm(pcm)).unwrap() {
                 produced = true;
                 assert_eq!(packet.data[0], 0xFF);
             }
@@ -370,11 +394,26 @@ mod tests {
     }
 
     #[test]
+    fn f32_input_encodes_like_the_equivalent_pcm() {
+        let fmt = SampleFormat::new(48000, 16, 2);
+        let samples: Vec<f32> = (0..BLOCK_SIZE * 2)
+            .map(|n| ((n / 2) as f32 * 0.01).sin() * 0.5)
+            .collect();
+        let pcm = crate::encoder::f32_to_pcm(&samples, 16);
+        let mut from_f32 = FlacEncoder::new(fmt, "").unwrap();
+        let mut from_pcm = FlacEncoder::new(fmt, "").unwrap();
+        let a = from_f32.encode(AudioData::F32(samples)).unwrap();
+        let b = from_pcm.encode(AudioData::Pcm(pcm)).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].data, b[0].data);
+    }
+
+    #[test]
     fn reset_drops_partial_block() {
         let fmt = SampleFormat::new(48000, 16, 2);
         let mut enc = FlacEncoder::new(fmt, "").unwrap();
         // 960 frames: less than one 1152-frame block, so it stays pending.
-        let out = enc.encode(&AudioData::Pcm(vec![7u8; 960 * 4])).unwrap();
+        let out = enc.encode(AudioData::Pcm(vec![7u8; 960 * 4])).unwrap();
         assert!(out.is_empty());
         assert!(!enc.pending.is_empty());
         enc.reset();
@@ -389,7 +428,7 @@ mod tests {
         let mut frames = 0;
         for _ in 0..4 {
             let pcm = vec![7u8; BLOCK_SIZE * 2 /*ch*/ * 2 /*bytes*/];
-            let out = enc.encode(&AudioData::Pcm(pcm)).unwrap();
+            let out = enc.encode(AudioData::Pcm(pcm)).unwrap();
             assert_eq!(out[0].offset_frames, 0, "no carried samples");
             frames += out.len();
         }
@@ -402,12 +441,12 @@ mod tests {
         let mut enc = FlacEncoder::new(fmt, "").unwrap();
         // 500 frames stay pending, then 3.5 blocks complete three more.
         assert!(
-            enc.encode(&AudioData::Pcm(vec![1u8; 500 * 4]))
+            enc.encode(AudioData::Pcm(vec![1u8; 500 * 4]))
                 .unwrap()
                 .is_empty()
         );
         let frames = BLOCK_SIZE * 3 + BLOCK_SIZE / 2;
-        let packets = enc.encode(&AudioData::Pcm(vec![1u8; frames * 4])).unwrap();
+        let packets = enc.encode(AudioData::Pcm(vec![1u8; frames * 4])).unwrap();
         assert_eq!(packets.len(), 3, "one packet per completed block");
         let offsets: Vec<i64> = packets.iter().map(|p| p.offset_frames).collect();
         let block = BLOCK_SIZE as i64;
