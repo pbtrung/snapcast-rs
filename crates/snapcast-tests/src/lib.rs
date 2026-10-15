@@ -3,8 +3,32 @@
 pub mod sync;
 
 use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
-use snapcast_server::{ServerConfig, ServerEvent, SnapServer};
+use snapcast_proto::message::hello::Hello;
+use snapcast_server::status::ServerStatus;
+use snapcast_server::{AudioData, AudioFrame, ServerConfig, ServerEvent, SnapServer};
 use tokio::sync::mpsc;
+
+/// Interleaved f32 samples per test frame: 10 ms of 48 kHz stereo.
+const FRAME_SAMPLES: usize = 960;
+
+/// One 10 ms frame of a non-silent ramp in [-1, 1) (48 kHz stereo f32).
+pub fn tone_frame(timestamp_usec: i64) -> AudioFrame {
+    let samples = (0..FRAME_SAMPLES)
+        .map(|i| (i as f32 / FRAME_SAMPLES as f32) * 2.0 - 1.0)
+        .collect();
+    AudioFrame {
+        data: AudioData::F32(samples),
+        timestamp_usec,
+    }
+}
+
+/// One 10 ms frame of the constant `level` (0.0 for silence).
+pub fn constant_frame(level: f32, timestamp_usec: i64) -> AudioFrame {
+    AudioFrame {
+        data: AudioData::F32(vec![level; FRAME_SAMPLES]),
+        timestamp_usec,
+    }
+}
 
 /// Bind an ephemeral 127.0.0.1 port, spawn `server.serve()` on it, and return
 /// the actual bound port. The library opens no port itself, so tests bind here;
@@ -96,12 +120,17 @@ pub async fn connect_client(port: u16) -> TestClient {
 /// distinct client id/group. Required for tests with more than one concurrent
 /// client.
 pub async fn connect_client_with_id(port: u16, host_id: &str) -> TestClient {
-    let config = ClientConfig {
+    connect_client_with(ClientConfig {
         host: "127.0.0.1".into(),
         port,
         host_id: host_id.to_string(),
         ..ClientConfig::default()
-    };
+    })
+    .await
+}
+
+/// Run a client with `config` in the background.
+pub async fn connect_client_with(config: ClientConfig) -> TestClient {
     let (mut client, events, audio_rx) = SnapClient::new(config);
     let cmd = client.command_sender();
     tokio::spawn(async move {
@@ -137,6 +166,22 @@ where
     }
 }
 
+/// A `Hello` from a bare test connection with client id `id`.
+pub(crate) fn test_hello(id: &str) -> Hello {
+    Hello {
+        mac: "00:00:00:00:00:00".into(),
+        host_name: format!("raw-{id}"),
+        version: "0.0.0".into(),
+        client_name: "RawClient".into(),
+        os: "test".into(),
+        arch: "test".into(),
+        instance: 1,
+        id: id.into(),
+        snap_stream_protocol_version: snapcast_proto::PROTOCOL_VERSION,
+        auth: None,
+    }
+}
+
 /// A bare binary-protocol connection, for tests that need control over what
 /// the client sends (or that it sends nothing) beyond what `SnapClient` does.
 pub struct RawClient {
@@ -148,7 +193,6 @@ impl RawClient {
     /// Connect and send a `Hello` with client id `id`.
     pub async fn connect(port: u16, id: &str) -> Self {
         use snapcast_proto::message::factory::MessagePayload;
-        use snapcast_proto::message::hello::Hello;
 
         let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
@@ -157,22 +201,10 @@ impl RawClient {
             stream,
             buf: Vec::new(),
         };
-        let hello = Hello {
-            mac: "00:00:00:00:00:00".into(),
-            host_name: format!("raw-{id}"),
-            version: "0.0.0".into(),
-            client_name: "RawClient".into(),
-            os: "test".into(),
-            arch: "test".into(),
-            instance: 1,
-            id: id.into(),
-            snap_stream_protocol_version: snapcast_proto::PROTOCOL_VERSION,
-            auth: None,
-        };
         client
             .send(
                 snapcast_proto::MessageType::Hello,
-                &MessagePayload::Hello(hello),
+                &MessagePayload::Hello(test_hello(id)),
             )
             .await;
         client
@@ -257,17 +289,22 @@ where
     }
 }
 
+/// Fetch the server status.
+pub async fn server_status(cmd: &mpsc::Sender<snapcast_server::ServerCommand>) -> ServerStatus {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd.send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
 /// Look up whether `client_id` is reported connected in the server status.
 pub async fn client_connected(
     cmd: &mpsc::Sender<snapcast_server::ServerCommand>,
     client_id: &str,
 ) -> Option<bool> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cmd.send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+    server_status(cmd)
         .await
-        .unwrap();
-    let status = rx.await.unwrap();
-    status
         .server
         .groups
         .iter()
@@ -282,12 +319,8 @@ pub async fn client_group(
     cmd: &mpsc::Sender<snapcast_server::ServerCommand>,
     client_id: &str,
 ) -> (String, String) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    cmd.send(snapcast_server::ServerCommand::GetStatus { response_tx: tx })
+    server_status(cmd)
         .await
-        .unwrap();
-    let status = rx.await.unwrap();
-    status
         .server
         .groups
         .iter()

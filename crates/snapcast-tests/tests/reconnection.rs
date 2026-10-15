@@ -30,7 +30,9 @@
 
 use snapcast_client::ClientEvent;
 use snapcast_server::ServerEvent;
-use snapcast_tests::{connect_client, expect_event, expect_server_event, start_server};
+use snapcast_tests::{
+    connect_client, constant_frame, expect_event, expect_server_event, start_server,
+};
 use tokio::sync::mpsc;
 
 /// Push `count` short silence frames with monotonically increasing timestamps,
@@ -40,11 +42,7 @@ use tokio::sync::mpsc;
 async fn pump_silence(audio_tx: &mpsc::Sender<snapcast_server::AudioFrame>, count: usize) {
     let mut ts: i64 = 2_000_000_000; // well away from 0
     for _ in 0..count {
-        let frame = snapcast_server::AudioFrame {
-            data: snapcast_server::AudioData::F32(vec![0.0; 960]),
-            timestamp_usec: ts,
-        };
-        if audio_tx.send(frame).await.is_err() {
+        if audio_tx.send(constant_frame(0.0, ts)).await.is_err() {
             break;
         }
         ts += 10_000; // 10 ms per frame
@@ -152,13 +150,11 @@ async fn client_stop_after_handshake_cleanly_ends_session() {
 /// A client pointed at an address with no server must emit `Disconnected`.
 #[tokio::test]
 async fn client_to_dead_address_emits_disconnected() {
-    // Bind and immediately drop a listener to obtain a port that is (almost
-    // certainly) free, so the connect attempt is refused rather than hanging.
-    let dead_port = {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-        // listener dropped here
-    };
+    // A socket bound but not listening holds the port, so no parallel test's
+    // server can take it, and refuses connections.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let dead_port = socket.local_addr().unwrap().port();
 
     let mut client = connect_client(dead_port).await;
 

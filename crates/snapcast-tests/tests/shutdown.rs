@@ -27,19 +27,12 @@
 //! `expect_server_event` on the server side), never fixed sleeps.
 
 use snapcast_client::ClientEvent;
-use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
-use snapcast_tests::{TestClient, connect_client, expect_event, expect_server_event, start_server};
+use snapcast_server::{AudioFrame, ServerCommand, ServerEvent};
+use snapcast_tests::{
+    TestClient, connect_client, connect_client_with_id, expect_event, expect_server_event,
+    start_server, tone_frame,
+};
 use tokio::sync::mpsc;
-
-/// One ~10ms chunk of interleaved stereo f32 audio at 48kHz/2ch (960 samples).
-/// Cheap to encode; keeps tests fast.
-fn tone_frame(timestamp_usec: i64) -> AudioFrame {
-    let samples: Vec<f32> = (0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect();
-    AudioFrame {
-        data: AudioData::F32(samples),
-        timestamp_usec,
-    }
-}
 
 /// Wait until the client has actually decoded audio, proving the stream is
 /// flowing before we tear anything down. Pushes frames while polling so the
@@ -125,8 +118,9 @@ async fn server_stop_disconnects_flowing_client() {
 async fn server_stop_disconnects_all_clients() {
     let server = start_server().await;
     let audio_tx = server.audio_tx;
-    let mut client_a = connect_client(server.port).await;
-    let mut client_b = connect_client(server.port).await;
+    // Distinct ids: with the same one, each connect replaces the other's session.
+    let mut client_a = connect_client_with_id(server.port, "shutdown-a").await;
+    let mut client_b = connect_client_with_id(server.port, "shutdown-b").await;
 
     // Prime both clients so audio is genuinely flowing to each.
     wait_for_audio_flowing(&mut client_a, &audio_tx).await;

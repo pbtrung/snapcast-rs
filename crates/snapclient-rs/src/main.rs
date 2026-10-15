@@ -59,21 +59,25 @@ fn main() -> anyhow::Result<()> {
         let player_tp = std::sync::Arc::clone(&client.time_provider);
         tokio::spawn(player::play_audio(player_stream, player_tp, volume_state));
 
-        // Log events + apply volume
+        // Apply volume, report status to systemd. The controller logs the
+        // connection, sync and codec events itself.
         tokio::spawn(async move {
+            // A ServerSettings update arrives as both ServerSettings and
+            // VolumeChanged, and often leaves the volume as it was.
+            let mut applied = None;
             while let Some(event) = events.recv().await {
                 match event {
-                    ClientEvent::Connected { host, port } => {
-                        tracing::info!(host, port, "Connected");
-                    }
+                    ClientEvent::Connected { .. } => applied = None,
                     ClientEvent::Disconnected { .. } => {}
-                    ClientEvent::ServerSettings { volume, muted, .. } => {
-                        tracing::info!(volume, muted, "Initial server settings received");
-                        mixer.set_volume(volume as u8, muted);
-                    }
-                    ClientEvent::VolumeChanged { volume, muted } => {
+                    ClientEvent::ServerSettings { volume, muted, .. }
+                    | ClientEvent::VolumeChanged { volume, muted } => {
+                        if applied == Some((volume, muted)) {
+                            continue;
+                        }
+                        applied = Some((volume, muted));
                         tracing::info!(volume, muted, "Volume changed");
-                        mixer.set_volume(volume as u8, muted);
+                        // Volume is 0-100; never wrap a bogus larger value.
+                        mixer.set_volume(volume.min(100) as u8, muted);
                         #[cfg(target_os = "linux")]
                         {
                             let status = format!(
@@ -84,13 +88,11 @@ fn main() -> anyhow::Result<()> {
                             let _ = sd_notify::notify(&[sd_notify::NotifyState::Status(&status)]);
                         }
                     }
-                    ClientEvent::TimeSyncComplete { diff_ms } => {
-                        tracing::info!(diff_ms, "Time sync complete");
+                    ClientEvent::TimeSyncComplete { .. } => {
                         #[cfg(target_os = "linux")]
                         let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
                     }
                     ClientEvent::StreamStarted { codec, format } => {
-                        tracing::info!(%codec, %format, "Stream started");
                         #[cfg(target_os = "linux")]
                         {
                             let status = format!(
@@ -102,15 +104,19 @@ fn main() -> anyhow::Result<()> {
                             );
                             let _ = sd_notify::notify(&[sd_notify::NotifyState::Status(&status)]);
                         }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = (codec, format);
                     }
                 }
             }
         });
 
-        // Ctrl-C
+        // SIGINT, and on Unix SIGTERM/SIGHUP too, as C++ snapclient
         tokio::spawn(async move {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("Received Ctrl-C, shutting down");
+            shutdown_signal().await;
+            tracing::info!("Received shutdown signal, shutting down");
+            #[cfg(target_os = "linux")]
+            let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
             cmd.send(ClientCommand::Stop).await.ok();
             // Watchdog: exit even if shutdown stalls.
             std::thread::spawn(|| {
@@ -127,6 +133,28 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("snapclient-rs terminated");
     Ok(())
+}
+
+/// Resolve on the first shutdown signal.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut hup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            tokio::signal::ctrl_c().await.ok();
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.ok();
 }
 
 /// Warn about upstream snapclient options that are accepted but not acted on.
@@ -165,7 +193,7 @@ fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result
     }
 
     if let Some(ref user) = daemon.user {
-        tracing::info!(user, "Would drop privileges to user (not yet implemented)");
+        tracing::warn!(user, "--user is not supported, ignoring");
     }
 
     unsafe {

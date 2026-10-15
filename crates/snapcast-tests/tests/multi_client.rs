@@ -16,20 +16,12 @@
 //! and mute state, so a filtered client receives literally zero frames.
 
 use snapcast_client::ClientEvent;
-use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
+use snapcast_server::{AudioFrame, ServerCommand, ServerEvent};
 use snapcast_tests::{
     TestClient, TwoStreamServer, client_group, connect_client_with_id, expect_event,
-    expect_server_event, start_two_stream_server,
+    expect_server_event, server_status, start_two_stream_server, tone_frame,
 };
 use tokio::sync::mpsc;
-
-/// One non-silent input frame (960 interleaved f32 = 480 stereo sample-frames).
-fn tone_frame(ts: i64) -> AudioFrame {
-    AudioFrame {
-        data: AudioData::F32((0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect()),
-        timestamp_usec: ts,
-    }
-}
 
 /// Push enough tone frames on a stream to force the FLAC encoder (block size
 /// 1152 stereo frames) past several full blocks so decoded audio is emitted.
@@ -192,13 +184,7 @@ async fn three_clients_all_reach_connected_and_server_settings() {
     assert_eq!(ids.len(), 3, "server saw three distinct client ids");
 
     // Each connected client landed in its own group by default.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    server
-        .cmd
-        .send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .unwrap();
-    let status = rx.await.unwrap();
+    let status = server_status(&server.cmd).await;
     let total_clients: usize = status.server.groups.iter().map(|g| g.clients.len()).sum();
     assert_eq!(total_clients, 3, "all three clients are tracked in groups");
 }

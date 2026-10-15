@@ -1,5 +1,6 @@
 //! Audio output — cpal callback reads from Stream directly.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use snapcast_client::connection::now_usec;
@@ -63,7 +64,9 @@ pub async fn play_audio(
 
 /// Pick the device config for `format`: the exact rate and channel count if
 /// supported, else the exact rate with another channel count (channels are
-/// remapped), else the device default. Returns whether the rate differs.
+/// remapped), else the device default. At the same rate and channels, an f32
+/// config (the output stream's sample type) wins. Returns whether the rate
+/// differs.
 fn select_config(
     device: &cpal::Device,
     format: SampleFormat,
@@ -71,14 +74,17 @@ fn select_config(
     use cpal::traits::DeviceTrait;
 
     let supported: Vec<_> = device.supported_output_configs()?.collect();
-    let has_rate = |f: &&cpal::SupportedStreamConfigRange| {
-        (f.min_sample_rate()..=f.max_sample_rate()).contains(&format.rate())
-    };
     let matching = supported
         .iter()
-        .filter(has_rate)
-        .find(|f| f.channels() == format.channels())
-        .or_else(|| supported.iter().find(has_rate));
+        .filter(|f| (f.min_sample_rate()..=f.max_sample_rate()).contains(&format.rate()))
+        // The first of the best: channels match, then f32.
+        .rev()
+        .max_by_key(|f| {
+            (
+                f.channels() == format.channels(),
+                f.sample_format() == cpal::SampleFormat::F32,
+            )
+        });
     if let Some(f) = matching {
         return Ok((f.with_sample_rate(format.rate()).into(), false));
     }
@@ -143,6 +149,9 @@ fn run_cpal(
 
     let stream_cb = Arc::clone(&stream);
     let tp_cb = Arc::clone(&time_provider);
+    // Set by the error callback when the stream can't play any more.
+    let lost = Arc::new(AtomicBool::new(false));
+    let lost_cb = Arc::clone(&lost);
     // Reused across callbacks and resized in place, so the realtime audio path
     // performs no heap allocation after warmup. Allocating inside a cpal
     // callback can stall the audio thread and cause xruns/glitches.
@@ -219,7 +228,17 @@ fn run_cpal(
                 }
             }
         },
-        |err| tracing::error!(error = %err, "Audio stream error"),
+        move |err| match err.kind() {
+            cpal::ErrorKind::Xrun => tracing::warn!(error = %err, "Audio underrun"),
+            // The stream is dead: rebuild it (e.g. once the device is back).
+            cpal::ErrorKind::DeviceNotAvailable
+            | cpal::ErrorKind::StreamInvalidated
+            | cpal::ErrorKind::HostUnavailable => {
+                tracing::error!(error = %err, "Audio stream lost");
+                lost_cb.store(true, Ordering::Relaxed);
+            }
+            _ => tracing::error!(error = %err, "Audio stream error"),
+        },
         None,
     )?;
 
@@ -228,6 +247,9 @@ fn run_cpal(
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if lost.load(Ordering::Relaxed) {
+            anyhow::bail!("audio stream lost");
+        }
         let s = stream.lock().unwrap_or_else(|e| e.into_inner());
         if s.format() != format || s.encoding() != encoding {
             return Ok(());

@@ -1,8 +1,8 @@
 //! Control-API behaviour that Snapweb (and other C++-snapserver control
 //! clients) rely on.
 
-use snapcast_server::{ServerCommand, ServerEvent};
-use snapcast_tests::{connect_client_with_id, start_server};
+use snapcast_server::ServerEvent;
+use snapcast_tests::{connect_client_with_id, server_status, start_server};
 use tokio::sync::mpsc;
 
 /// The next connect/topology event, skipping unrelated ones.
@@ -66,13 +66,7 @@ async fn status_reports_hello_details() {
         ServerEvent::ClientConnected { .. }
     ) {}
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    server
-        .cmd
-        .send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .unwrap();
-    let status = rx.await.unwrap();
+    let status = server_status(&server.cmd).await;
     assert_eq!(status.server.server.snapserver.name, "Snapserver");
     let client = status
         .server

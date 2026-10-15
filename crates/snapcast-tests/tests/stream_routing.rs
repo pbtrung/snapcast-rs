@@ -6,23 +6,18 @@
 //! `multi_client.rs` asserts on decoded audio per client.
 
 use snapcast_client::ClientEvent;
-use snapcast_server::{AudioData, AudioFrame, ServerCommand, ServerEvent};
+use snapcast_server::{AudioFrame, ServerCommand, ServerEvent};
 use snapcast_tests::{
-    client_group, connect_client, expect_event, expect_server_event, start_two_stream_server,
+    client_group, connect_client, constant_frame, expect_event, expect_server_event,
+    start_two_stream_server,
 };
 
 fn silence_frame() -> AudioFrame {
-    AudioFrame {
-        data: AudioData::F32(vec![0.0; 960]),
-        timestamp_usec: 0,
-    }
+    constant_frame(0.0, 0)
 }
 
 fn tone_frame() -> AudioFrame {
-    AudioFrame {
-        data: AudioData::F32((0..960).map(|i| (i as f32 / 960.0) * 2.0 - 1.0).collect()),
-        timestamp_usec: 0,
-    }
+    snapcast_tests::tone_frame(0)
 }
 
 /// Wait for the server's `ClientConnected` event and return the client id.

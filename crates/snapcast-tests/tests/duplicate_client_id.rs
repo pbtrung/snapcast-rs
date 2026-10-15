@@ -3,8 +3,10 @@
 //! unregister or mark disconnected the client's new session.
 
 use snapcast_proto::message::factory::MessagePayload;
-use snapcast_server::{AudioData, AudioFrame, ServerEvent};
-use snapcast_tests::{RawClient, client_connected, expect_server_event, start_server};
+use snapcast_server::ServerEvent;
+use snapcast_tests::{
+    RawClient, client_connected, constant_frame, expect_server_event, start_server,
+};
 
 const ID: &str = "dup-client";
 
@@ -47,14 +49,7 @@ async fn reconnect_with_same_id_replaces_previous_session() {
     let audio_tx = server.audio_tx.clone();
     tokio::spawn(async move {
         let mut ts = 1_000_000_000i64;
-        while audio_tx
-            .send(AudioFrame {
-                data: AudioData::F32(vec![0.25; 960]),
-                timestamp_usec: ts,
-            })
-            .await
-            .is_ok()
-        {
+        while audio_tx.send(constant_frame(0.25, ts)).await.is_ok() {
             ts += 10_000;
         }
     });

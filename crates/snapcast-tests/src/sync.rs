@@ -390,21 +390,20 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
     let drop_every = run.drop_every;
     let feeder = tokio::spawn(async move {
         for k in 0u32.. {
-            if drop_every > 0 && k > 0 && k % drop_every == 0 {
-                let next = Duration::from_micros(u64::from(k + 1) * 20_000);
-                tokio::time::sleep_until(start + next).await;
-                continue;
-            }
-            let mut pcm = Vec::with_capacity(CHUNK_FRAMES as usize * FRAME_SIZE);
-            for i in 0..CHUNK_FRAMES {
-                pcm.extend_from_slice(&counter_frame(k * CHUNK_FRAMES + i));
-            }
-            let frame = AudioFrame {
-                data: AudioData::Pcm(pcm),
-                timestamp_usec: start_usec + i64::from(k * CHUNK_FRAMES) * 1_000_000 / 48_000,
-            };
-            if audio_tx.send(frame).await.is_err() {
-                return;
+            let chunk_usec = i64::from(k) * i64::from(CHUNK_FRAMES) * 1_000_000 / i64::from(RATE);
+            let dropped = drop_every > 0 && k > 0 && k % drop_every == 0;
+            if !dropped {
+                let mut pcm = Vec::with_capacity(CHUNK_FRAMES as usize * FRAME_SIZE);
+                for i in 0..CHUNK_FRAMES {
+                    pcm.extend_from_slice(&counter_frame(k * CHUNK_FRAMES + i));
+                }
+                let frame = AudioFrame {
+                    data: AudioData::Pcm(pcm),
+                    timestamp_usec: start_usec + chunk_usec,
+                };
+                if audio_tx.send(frame).await.is_err() {
+                    return;
+                }
             }
             let next = Duration::from_micros(u64::from(k + 1) * 20_000);
             tokio::time::sleep_until(start + next).await;
@@ -492,7 +491,6 @@ pub async fn run_sync(run: SyncRun) -> SyncReport {
 /// returns, as the client does.
 async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
     use snapcast_proto::message::factory::{self, MessagePayload};
-    use snapcast_proto::message::hello::Hello;
     use snapcast_proto::message::time::Time;
     use snapcast_proto::{BaseMessage, MessageType, Timeval};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -513,18 +511,7 @@ async fn probe(port: u16, duration: Duration, warmup: Duration) -> ProbeReport {
         };
         factory::serialize(&mut base, payload).unwrap()
     };
-    let hello = Hello {
-        mac: "00:00:00:00:00:00".into(),
-        host_name: "probe".into(),
-        version: "0.0.0".into(),
-        client_name: "probe".into(),
-        os: "test".into(),
-        arch: "test".into(),
-        instance: 1,
-        id: "probe".into(),
-        snap_stream_protocol_version: snapcast_proto::PROTOCOL_VERSION,
-        auth: None,
-    };
+    let hello = crate::test_hello("probe");
     wr.write_all(&frame(MessageType::Hello, &MessagePayload::Hello(hello)))
         .await
         .unwrap();

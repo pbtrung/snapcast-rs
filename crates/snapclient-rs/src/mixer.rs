@@ -150,32 +150,63 @@ impl Mixer {
 
 #[cfg(target_os = "linux")]
 fn set_alsa_volume(control: &str, percent: u8, muted: bool) {
-    let vol = if muted { 0 } else { percent };
-    if let Err(e) = set_alsa_volume_inner(control, vol) {
+    if let Err(e) = set_alsa_volume_inner(control, percent, muted) {
         tracing::warn!(control, error = %e, "Failed to set ALSA volume");
     } else {
         tracing::debug!(control, percent, muted, "Hardware volume set");
     }
 }
 
+/// Set the control as C++ snapclient: the playback switch mutes (keeping the
+/// level), the level maps perceptually onto the dB range, or linearly onto
+/// the raw range when the control has no dB range.
 #[cfg(target_os = "linux")]
-fn set_alsa_volume_inner(control: &str, percent: u8) -> anyhow::Result<()> {
-    use alsa::mixer::{Mixer, SelemId};
+fn set_alsa_volume_inner(control: &str, percent: u8, muted: bool) -> anyhow::Result<()> {
+    use alsa::Round;
+    use alsa::mixer::{MilliBel, Mixer, SelemId};
     let mixer = Mixer::new("default", false)?;
     let selem_id = SelemId::new(control, 0);
     let selem = mixer
         .find_selem(&selem_id)
         .ok_or_else(|| anyhow::anyhow!("ALSA control '{control}' not found"))?;
-    let (min, max) = selem.get_playback_volume_range();
-    // Perceptual volume curve (cubic) — closer to perceived loudness than linear.
-    let normalized = f64::from(percent) / 100.0;
-    let curved = normalized * normalized * normalized;
-    let vol = min + ((max - min) as f64 * curved) as i64;
-    selem.set_playback_volume_all(vol)?;
-    if selem.has_playback_switch() {
-        selem.set_playback_switch_all(if percent == 0 { 0 } else { 1 })?;
+    let has_switch = selem.has_playback_switch();
+    if has_switch {
+        selem.set_playback_switch_all(i32::from(!muted))?;
+    }
+    // Without a switch, mute by turning the level down.
+    let volume = if muted && !has_switch {
+        0.0
+    } else {
+        f64::from(percent.min(100)) / 100.0
+    };
+    // (0, 0) when the control has no dB range
+    let (MilliBel(min_db), MilliBel(max_db)) = selem.get_playback_db_range();
+    if min_db < max_db {
+        let level = db_level(volume, min_db, max_db);
+        selem.set_playback_db_all(MilliBel(level), Round::Floor)?;
+    } else {
+        let (min, max) = selem.get_playback_volume_range();
+        selem.set_playback_volume_all(raw_level(volume, min, max))?;
     }
     Ok(())
+}
+
+/// dB level (0.01 dB) for `volume` (0–1) on a `[min, max]` dB control, with
+/// alsamixer's perceptual mapping, as C++ snapclient.
+#[cfg(any(target_os = "linux", test))]
+fn db_level(volume: f64, min: i64, max: i64) -> i64 {
+    let min_norm = 10f64.powf((min - max) as f64 / 6000.0);
+    let v = volume * (1.0 - min_norm) + min_norm;
+    // log10(0) = -inf when `min` is the mute level: saturate, then clamp.
+    ((6000.0 * v.log10()).round() as i64)
+        .saturating_add(max)
+        .clamp(min, max)
+}
+
+/// Raw level for `volume` (0–1) on a `[min, max]` control.
+#[cfg(any(target_os = "linux", test))]
+fn raw_level(volume: f64, min: i64, max: i64) -> i64 {
+    min + ((max - min) as f64 * volume).round() as i64
 }
 
 #[cfg(target_os = "linux")]
@@ -279,6 +310,33 @@ mod tests {
                 assert!(curve.gain(p) < curve.gain(p + 1), "{curve:?} at {p}");
             }
         }
+    }
+
+    // ---- ALSA level mapping ----
+
+    #[test]
+    fn db_level_spans_range_perceptually() {
+        // -60 dB .. 0 dB
+        assert_eq!(db_level(0.0, -6000, 0), -6000);
+        assert_eq!(db_level(1.0, -6000, 0), 0);
+        // As alsamixer: 50 % is about -15.6 dB, not half the range (-30 dB).
+        let half = db_level(0.5, -6000, 0);
+        assert!((-1600..=-1500).contains(&half), "{half}");
+        // A mute minimum (SND_CTL_TLV_DB_GAIN_MUTE) stays in range.
+        assert_eq!(db_level(0.0, -9_999_999, 0), -9_999_999);
+        assert_eq!(db_level(1.0, -9_999_999, 600), 600);
+        for p in 0..100 {
+            let v = f64::from(p) / 100.0;
+            assert!(db_level(v, -6000, 0) <= db_level(v + 0.01, -6000, 0));
+        }
+    }
+
+    #[test]
+    fn raw_level_is_linear() {
+        assert_eq!(raw_level(0.0, 0, 255), 0);
+        assert_eq!(raw_level(1.0, 0, 255), 255);
+        assert_eq!(raw_level(0.5, 0, 100), 50);
+        assert_eq!(raw_level(0.5, -100, 100), 0);
     }
 
     // ---- Mixer::new ----

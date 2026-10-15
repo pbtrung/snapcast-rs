@@ -10,6 +10,8 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
 #[command(
     version,
     about,
+    // `-v` as in C++ snapclient
+    disable_version_flag = true,
     after_help = "\
   With 'url' = tcp://<snapserver host or IP>[:port]\n\
   For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'"
@@ -17,6 +19,10 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
 pub struct Cli {
     /// Snapserver URL (required): `tcp://<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
     pub url: Option<String>,
+
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: (),
 
     /// Instance id when running multiple instances on the same host
     #[arg(short, long, default_value_t = 1)]
@@ -50,9 +56,10 @@ pub struct Cli {
     #[arg(long, default_value = "software")]
     pub mixer: String,
 
-    /// Daemonize, optional process priority [-20..19]
+    /// Daemonize, optional process priority [-20..19] (`-d=<prio>`, `--daemon=<prio>`)
+    // The value must be attached, so `-d <url>` doesn't take the URL for it.
     #[cfg(unix)]
-    #[arg(short, long)]
+    #[arg(short, long, require_equals = true)]
     pub daemon: Option<Option<i32>>,
 
     /// The `user[:group]` to run snapclient as when daemonized (not implemented yet)
@@ -340,6 +347,26 @@ mod tests {
         assert_eq!(s.player.sample_format.rate(), 48000);
         assert_eq!(s.player.sample_format.channels(), 0);
         assert_eq!(s.player.pcm_device.name, "hw:1");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_priority_must_be_attached() {
+        let cli = Cli::parse_from(["snapclient-rs", "-d", "tcp://host"]);
+        assert_eq!(cli.daemon, Some(None));
+        assert_eq!(cli.url.as_deref(), Some("tcp://host"));
+        let s = cli.into_settings().unwrap();
+        assert_eq!(s.daemon.unwrap().priority, Some(-3));
+        let cli = Cli::parse_from(["snapclient-rs", "--daemon=-10", "tcp://host"]);
+        assert_eq!(cli.daemon, Some(Some(-10)));
+        let cli = Cli::parse_from(["snapclient-rs", "-d=5", "tcp://host"]);
+        assert_eq!(cli.daemon, Some(Some(5)));
+    }
+
+    #[test]
+    fn version_short_flag_is_lowercase_v() {
+        let err = Cli::try_parse_from(["snapclient-rs", "-v"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
     }
 
     #[test]

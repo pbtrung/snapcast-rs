@@ -1,7 +1,7 @@
-use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
+use snapcast_client::{ClientConfig, ClientEvent};
+use snapcast_server::ServerConfig;
 use snapcast_server::auth::{Role, StaticAuthValidator, User};
-use snapcast_server::{ServerConfig, SnapServer};
-use snapcast_tests::spawn_serving;
+use snapcast_tests::{TestClient, TestServer, connect_client_with, start_server_with};
 use std::sync::Arc;
 
 fn auth_server_config() -> ServerConfig {
@@ -21,30 +21,31 @@ fn auth_server_config() -> ServerConfig {
     }
 }
 
-#[tokio::test]
-async fn auth_success() {
-    let (mut server, _events) = SnapServer::new(auth_server_config());
-    let _audio_tx = server.add_stream("default");
-    let port = spawn_serving(server).await;
-
+/// Start an auth-enabled server and connect a client logging in with
+/// `credentials` (`user:password`). The server handle keeps its stream open.
+async fn connect_with_credentials(credentials: &str) -> (TestServer, TestClient) {
     use base64::Engine;
-    let creds = base64::engine::general_purpose::STANDARD.encode("player:secret");
-
-    let config = ClientConfig {
+    let server = start_server_with(auth_server_config()).await;
+    let client = connect_client_with(ClientConfig {
         host: "127.0.0.1".into(),
-        port,
+        port: server.port,
         auth: Some(snapcast_client::config::Auth {
             scheme: "Basic".into(),
-            param: creds,
+            param: base64::engine::general_purpose::STANDARD.encode(credentials),
         }),
         ..ClientConfig::default()
-    };
-    let (mut client, mut events, _audio_rx) = SnapClient::new(config);
-    tokio::spawn(async move { client.run().await.ok() });
+    })
+    .await;
+    (server, client)
+}
+
+#[tokio::test]
+async fn auth_success() {
+    let (_server, mut client) = connect_with_credentials("player:secret").await;
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
+        match tokio::time::timeout_at(deadline, client.events.recv()).await {
             Ok(Some(ClientEvent::ServerSettings { .. })) => break, // success
             Ok(Some(_)) => continue,
             _ => panic!("Auth should have succeeded — timed out"),
@@ -54,29 +55,12 @@ async fn auth_success() {
 
 #[tokio::test]
 async fn auth_rejection() {
-    let (mut server, _events) = SnapServer::new(auth_server_config());
-    let _audio_tx = server.add_stream("default");
-    let port = spawn_serving(server).await;
-
-    use base64::Engine;
-    let creds = base64::engine::general_purpose::STANDARD.encode("player:wrong");
-
-    let config = ClientConfig {
-        host: "127.0.0.1".into(),
-        port,
-        auth: Some(snapcast_client::config::Auth {
-            scheme: "Basic".into(),
-            param: creds,
-        }),
-        ..ClientConfig::default()
-    };
-    let (mut client, mut events, _audio_rx) = SnapClient::new(config);
-    tokio::spawn(async move { client.run().await.ok() });
+    let (_server, mut client) = connect_with_credentials("player:wrong").await;
 
     // Client should get Disconnected (server sends Error and drops connection)
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
-        match tokio::time::timeout_at(deadline, events.recv()).await {
+        match tokio::time::timeout_at(deadline, client.events.recv()).await {
             Ok(Some(ClientEvent::Disconnected { reason })) => {
                 assert!(
                     reason.contains("401")
