@@ -5,7 +5,7 @@
 # - strips the clang-style --target=<rust triple> that the cc crate adds
 #   (zig gets its own -target from the wrapper name);
 # - disables zig's default UBSan instrumentation (it would pull in the zig
-#   ubsan runtime, which rustc does not link) and stack probes.
+#   ubsan runtime, which rustc does not link).
 set -eu
 name=$(basename "$0")
 zigtarget=${name%-*}            # e.g. aarch64-linux-musl

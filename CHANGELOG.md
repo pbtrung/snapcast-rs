@@ -1,5 +1,11 @@
 # Changelog
 
+Releases of this fork (0.999.x, from 0.999.1 on) are listed with their
+changes on [GitHub Releases](https://github.com/pbtrung/snapcast-rs/releases).
+The entries below are upstream
+[metaneutrons/snapcast-rs](https://github.com/metaneutrons/snapcast-rs)
+releases up to 0.18.0, which this fork is based on.
+
 ## [0.18.0](https://github.com/metaneutrons/snapcast-rs/compare/v0.17.2...v0.18.0) (2026-09-12)
 
 

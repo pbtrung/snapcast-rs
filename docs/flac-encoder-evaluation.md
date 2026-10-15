@@ -132,8 +132,11 @@ This directly disproves the failure mode that killed `flac-codec` — neither
 candidate leaks header bytes into the frame stream, confirmed by an
 independent decoder rather than internal self-consistency.
 
-Tool: [`tools/flac-encoder-spike`](../tools/flac-encoder-spike). Run it
-yourself with `cd tools/flac-encoder-spike && cargo run --release`.
+Tool: `tools/flac-encoder-spike`, a standalone crate that was removed after
+the migration. It is still in git history (added in commit `9c5836c`). To
+rerun it, restore it with `git checkout 9c5836c -- tools/flac-encoder-spike`,
+then run `cd tools/flac-encoder-spike && cargo run --release` (the `flac -t`
+check needs `flac` installed).
 
 **Not yet tested by the spike:** sustained throughput/CPU cost under real
 load, other sample formats the project supports (24-bit), and actual

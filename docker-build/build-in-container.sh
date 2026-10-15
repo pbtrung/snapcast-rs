@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
         --targets=*) TARGETS=${1#*=}; shift ;;
         --bins) BINS=$2; shift 2 ;;
         --bins=*) BINS=${1#*=}; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -99,6 +99,9 @@ test -x "$RUST_GCC_LD/ld.lld" || { echo "rust-lld wrapper not found in $RUST_GCC
 for t in "${TARGETS[@]}"; do
     test -d "$(rustc --print sysroot)/lib/rustlib/$t" || { echo "rust std for $t not installed" >&2; exit 1; }
 done
+# Reject unknown binaries up front: inside the `$(...)` below a failure of
+# cargo_args_for would be ignored and cargo would build the whole workspace.
+for b in "${BINS[@]}"; do cargo_args_for "$b" >/dev/null; done
 
 start=$(date +%s)
 cd "$SRC"
@@ -158,10 +161,13 @@ for t in "${TARGETS[@]}"; do
 done
 
 log "SHA256SUMS"
+# Only the binaries built by this run, not leftovers from earlier runs in $OUT.
 (
     cd "$OUT"
     files=()
-    for f in snapserver-rs-* snapclient-rs-*; do [ -f "$f" ] && files+=("$f"); done
+    for t in "${TARGETS[@]}"; do
+        for b in "${BINS[@]}"; do files+=("$b-$t"); done
+    done
     sha256sum "${files[@]}" > SHA256SUMS
     cat SHA256SUMS
 )
