@@ -2264,7 +2264,7 @@ checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "snapcast-client"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "snapcast-proto"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "byteorder",
  "libc",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "snapcast-server"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "snapcast-tests"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "base64 0.23.1",
  "snapcast-client",
@@ -2325,7 +2325,7 @@ dependencies = [
 
 [[package]]
 name = "snapclient-rs"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "alsa",
  "anyhow",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "snapserver-rs"
-version = "0.999.16"
+version = "0.99.17"
 dependencies = [
  "anyhow",
  "axum",

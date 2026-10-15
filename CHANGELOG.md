@@ -1,6 +1,6 @@
 # Changelog
 
-Releases of this fork (0.999.x, from 0.999.1 on) are listed with their
+Releases of this fork (0.99.x, from 0.99.1 on) are listed with their
 changes on [GitHub Releases](https://github.com/pbtrung/snapcast-rs/releases).
 The entries below are upstream
 [metaneutrons/snapcast-rs](https://github.com/metaneutrons/snapcast-rs)

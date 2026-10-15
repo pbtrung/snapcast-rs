@@ -1,7 +1,7 @@
 # Time sync audit
 
 Audit of the client/server time synchronization and playout path, with
-proposed fixes. Date: 2026-10-10 (at 0.999.15).
+proposed fixes. Date: 2026-10-10 (at 0.99.15).
 
 ## Summary
 
