@@ -14,6 +14,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use snapcast_proto::message::base::BaseMessage;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::auth::AuthConfig;
@@ -31,10 +32,6 @@ struct AppState {
 
 /// Configuration for the HTTP server.
 pub(crate) struct HttpConfig {
-    /// TCP bind address.
-    pub bind_address: String,
-    /// HTTP port.
-    pub port: u16,
     /// Snapweb document root (None = disabled).
     pub doc_root: Option<String>,
     /// Notification broadcast sender.
@@ -47,8 +44,9 @@ pub(crate) struct HttpConfig {
     pub client_acceptor: snapcast_server::ClientAcceptor,
 }
 
-/// Start the HTTP server with JSON-RPC + WebSocket + optional Snapweb.
-pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
+/// Run the HTTP server with JSON-RPC + WebSocket + optional Snapweb on
+/// `listener`.
+pub(crate) async fn serve(listener: tokio::net::TcpListener, cfg: HttpConfig) -> Result<()> {
     let app_state = AppState {
         notify_tx: cfg.notify_tx,
         auth_config: cfg.auth_config,
@@ -56,13 +54,6 @@ pub(crate) async fn run_http(cfg: HttpConfig) -> Result<()> {
         client_acceptor: cfg.client_acceptor,
     };
     let app = router(app_state, cfg.doc_root.as_deref());
-
-    let listener = tokio::net::TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
-    tracing::info!(
-        bind_address = %cfg.bind_address,
-        port = cfg.port,
-        "HTTP/WebSocket server listening"
-    );
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -99,12 +90,16 @@ async fn stream_ws_handler(
     State(app): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        let transport = crate::ws_transport::WsTransport::new(socket);
-        if let Err(e) = app.client_acceptor.accept(transport, peer).await {
-            tracing::warn!(%peer, error = %e, "Dropping WebSocket stream client");
-        }
-    })
+    // A client sends small messages (Hello, Time, ...); don't buffer
+    // anything bigger than the session would accept as one frame.
+    let max_frame = BaseMessage::HEADER_SIZE + snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE as usize;
+    ws.max_message_size(max_frame)
+        .on_upgrade(move |socket| async move {
+            let transport = crate::ws_transport::WsTransport::new(socket);
+            if let Err(e) = app.client_acceptor.accept(transport, peer).await {
+                tracing::warn!(%peer, error = %e, "Dropping WebSocket stream client");
+            }
+        })
 }
 
 /// HTTP POST /jsonrpc handler. Stateless: when auth is enabled every request
@@ -168,12 +163,12 @@ async fn handle_ws(mut socket: WebSocket, app: AppState) {
             }
             notification = notify_rx.recv() => {
                 match notification {
-                    // Notifications carry server state: only for
-                    // authenticated connections. Our own requests' were
-                    // answered by their responses.
-                    Ok(n) if !authenticated || n.origin == Some(connection_id) => {}
                     Ok(n) => {
-                        if socket.send(Message::Text(n.message.to_string().into())).await.is_err() { break }
+                        if n.is_for(connection_id, authenticated)
+                            && socket.send(Message::Text(n.message.to_string().into())).await.is_err()
+                        {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "WebSocket control client missed notifications");

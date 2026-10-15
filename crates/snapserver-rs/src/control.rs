@@ -14,10 +14,6 @@ use crate::notify::{self, Notification};
 
 /// Configuration for the control server.
 pub(crate) struct ControlConfig {
-    /// TCP bind address.
-    pub bind_address: String,
-    /// TCP port.
-    pub port: u16,
     /// Notification broadcast sender.
     pub notify_tx: broadcast::Sender<Notification>,
     /// Auth configuration.
@@ -26,21 +22,20 @@ pub(crate) struct ControlConfig {
     pub cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
 }
 
-/// Runs the JSON-RPC control server on a TCP port.
-pub(crate) async fn run_tcp(cfg: ControlConfig) -> Result<()> {
-    let listener = TcpListener::bind((cfg.bind_address.as_str(), cfg.port)).await?;
-    tracing::info!(
-        bind_address = %cfg.bind_address,
-        port = cfg.port,
-        "Control server (TCP) listening"
-    );
-    serve(listener, cfg).await
-}
-
-/// Accept control connections on `listener`, one task per connection.
-async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
+/// Run the JSON-RPC control server: accept control connections on
+/// `listener`, one task per connection.
+pub(crate) async fn serve(listener: TcpListener, cfg: ControlConfig) {
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                // E.g. out of file descriptors: keep serving once it passes,
+                // but don't spin on the error meanwhile.
+                tracing::error!(error = %e, "Control server accept failed");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
         tracing::debug!(%peer, "Control client connected");
 
         let mut notify_rx = cfg.notify_tx.subscribe();
@@ -75,12 +70,12 @@ async fn serve(listener: TcpListener, cfg: ControlConfig) -> Result<()> {
                     }
                     notification = notify_rx.recv() => {
                         match notification {
-                            // Notifications carry server state: only for
-                            // authenticated connections. Our own requests'
-                            // were answered by their responses.
-                            Ok(n) if !authenticated || n.origin == Some(connection_id) => {}
                             Ok(n) => {
-                                if send_json(&mut writer, &n.message).await.is_err() { break; }
+                                if n.is_for(connection_id, authenticated)
+                                    && send_json(&mut writer, &n.message).await.is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(broadcast::error::RecvError::Lagged(missed)) => {
                                 tracing::warn!(%peer, missed, "Control client missed notifications");
@@ -283,8 +278,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let cfg = ControlConfig {
-            bind_address: "127.0.0.1".into(),
-            port,
             notify_tx: notify_tx.clone(),
             auth_config: Arc::new(AuthConfig {
                 enabled: true,

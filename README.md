@@ -47,16 +47,16 @@ Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pu
 
 ## Stream Sources
 
-`--source` (repeatable) or `source = ...` under `[stream]` in `snapserver.conf` (default path `/etc/snapserver.conf`, set with `-c`). Each URI takes `?name=<id>` plus an optional `&sampleformat=<rate>:<bits>:<channels>`; all streams use the server-wide codec:
+`--source` (repeatable) or `source = ...` under `[stream]` in `snapserver.conf` (default path `/etc/snapserver.conf`, set with `-c`). Each URI takes `?name=<id>` (unique per stream) plus, as in C++ snapserver, optional `&sampleformat=<rate>:<bits>:<channels>`, `&codec=<codec>` and `&chunk_ms=<ms>` overriding the server-wide `sampleformat`, `codec` and `chunk_ms` of `[stream]`:
 
 - `pipe:///path/to/fifo`: named pipe (the default source is `pipe:///tmp/snapfifo?name=default`)
-- `file:///path/to/file.pcm`: raw PCM (or 44-byte-header WAV) file, played in real time and looped
-- `process:///path/to/binary?params=...`: a child process's stdout
-- `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953)
+- `file:///path/to/file.pcm`: raw PCM or WAV file, played in real time and looped
+- `process:///path/to/binary?params=...`: a child process's stdout, restarted when it exits (`"..."` groups an argument with spaces in `params`)
+- `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953); with `&mode=client`, connect to `<host>:<port>` instead
 
 Sources send signed little-endian integer PCM by default. Add `&encoding=float` to send 32-bit little-endian floats instead (ffmpeg `-f f32le`). The Opus encoder then works on the floats directly, so nothing is quantized to 16 bits before encoding. With `float`, the bit depth in `sampleformat` only sets what the PCM and FLAC codecs convert to.
 
-Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root`).
+Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root` or `doc_root` under `[http]`). `enabled = false` under `[tcp-control]` or `[http]` turns that server off. `send_to_muted = true` under `[stream]` keeps sending audio to muted clients.
 
 ## Inactive Clients
 

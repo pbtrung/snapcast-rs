@@ -13,15 +13,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PcmEncoding, PumpEnd, pump_pcm};
+use super::{PcmEncoding, PumpEnd, RETRY_DELAY, frames_duration, pump_pcm};
 
-/// Start reading PCM from a named pipe.
-pub fn start(
+/// Configure reading PCM from a named pipe; the returned closure starts it.
+pub fn reader(
     uri: StreamUri,
     format: SampleFormat,
     chunk_frames: usize,
-    tx: mpsc::Sender<AudioFrame>,
-) -> Result<JoinHandle<()>> {
+) -> Result<impl FnOnce(mpsc::Sender<AudioFrame>) -> JoinHandle<()>> {
     let path = uri.path.clone();
     let create = match uri.param("mode") {
         None | Some("create") => true,
@@ -30,65 +29,67 @@ pub fn start(
     };
     let encoding = PcmEncoding::from_uri(&uri)?;
     let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
-    let chunk_duration =
-        std::time::Duration::from_micros((chunk_frames as u64 * 1_000_000) / format.rate() as u64);
+    let chunk_duration = frames_duration(format, chunk_frames);
 
-    Ok(tokio::spawn(async move {
-        let mut warned_not_fifo = false;
-        loop {
-            let is_fifo = match prepare_fifo(&path, create) {
-                Ok(is_fifo) => is_fifo,
-                Err(e) => {
-                    tracing::warn!(path, error = %e, "Could not create FIFO");
-                    true
-                }
-            };
-            if !is_fifo && !warned_not_fifo && std::path::Path::new(&path).exists() {
-                warned_not_fifo = true;
-                tracing::warn!(
-                    path,
-                    "Pipe source path is a regular file, not a FIFO (created by a writer that \
+    Ok(move |tx: mpsc::Sender<AudioFrame>| {
+        tokio::spawn(async move {
+            let mut warned_not_fifo = false;
+            loop {
+                let is_fifo = match prepare_fifo(&path, create) {
+                    Ok(is_fifo) => is_fifo,
+                    Err(e) => {
+                        tracing::warn!(path, error = %e, "Could not create FIFO");
+                        true
+                    }
+                };
+                if !is_fifo && !warned_not_fifo && std::path::Path::new(&path).exists() {
+                    warned_not_fifo = true;
+                    tracing::warn!(
+                        path,
+                        "Pipe source path is a regular file, not a FIFO (created by a writer that \
                      started before snapserver?); following it like `tail -f`, but it grows \
                      without bound. Remove it and start snapserver first so it creates the FIFO"
-                );
-            }
-            // A regular file is followed, so EOF never replays it from the
-            // start. A FIFO that hits EOF (writer gone, non-Linux) is reopened.
-            let opened: std::io::Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = if is_fifo {
-                open_fifo(&path).map(|rx| Box::new(rx) as _)
-            } else {
-                tokio::fs::File::open(&path)
-                    .await
-                    .map(|file| Box::new(Follow::new(file, chunk_duration)) as _)
-            };
-            match opened {
-                Ok(mut reader) => {
-                    tracing::info!(path, "Pipe stream opened");
-                    let mut ts = ChunkTimestamper::new(format.rate());
-                    match pump_pcm(
-                        &mut reader,
-                        &mut ts,
-                        chunk_frames,
-                        chunk_bytes,
-                        encoding,
-                        &tx,
-                        Some(chunk_duration),
-                    )
-                    .await
-                    {
-                        PumpEnd::SourceEnded => {
-                            tracing::debug!(path, "Pipe read ended, reopening");
+                    );
+                }
+                // A regular file is followed, so EOF never replays it from the
+                // start. A FIFO that hits EOF (writer gone, non-Linux) is reopened.
+                let opened: std::io::Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>> =
+                    if is_fifo {
+                        open_fifo(&path).map(|rx| Box::new(rx) as _)
+                    } else {
+                        tokio::fs::File::open(&path)
+                            .await
+                            .map(|file| Box::new(Follow::new(file, chunk_duration)) as _)
+                    };
+                match opened {
+                    Ok(mut reader) => {
+                        tracing::info!(path, "Pipe stream opened");
+                        let mut ts = ChunkTimestamper::new(format.rate());
+                        match pump_pcm(
+                            &mut reader,
+                            &mut ts,
+                            chunk_frames,
+                            chunk_bytes,
+                            encoding,
+                            &tx,
+                            Some(chunk_duration),
+                        )
+                        .await
+                        {
+                            PumpEnd::SourceEnded => {
+                                tracing::debug!(path, "Pipe read ended, reopening");
+                            }
+                            PumpEnd::TxClosed => return,
                         }
-                        PumpEnd::TxClosed => return,
+                    }
+                    Err(e) => {
+                        tracing::debug!(path, error = %e, "Pipe not available, retrying");
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(path, error = %e, "Pipe not available, retrying");
-                }
+                tokio::time::sleep(RETRY_DELAY).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-    }))
+        })
+    })
 }
 
 /// Open a FIFO for reading without tying up a thread: the read end is
@@ -247,7 +248,7 @@ mod tests {
         std::fs::write(&path, vec![0u8; 48000 * 4 * 10]).unwrap();
         let uri = StreamUri::parse(&format!("pipe://{}?name=t", path.display())).unwrap();
         let (tx, mut rx) = mpsc::channel(1024);
-        let handle = start(uri, format, 960, tx).unwrap();
+        let handle = reader(uri, format, 960).unwrap()(tx);
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         handle.abort();
@@ -271,7 +272,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (tx, mut rx) = mpsc::channel(16);
         rt.block_on(async {
-            start(uri, SampleFormat::new(48000, 16, 2), 960, tx).unwrap();
+            reader(uri, SampleFormat::new(48000, 16, 2), 960).unwrap()(tx);
             // Let the reader create and open the FIFO with no writer.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -289,11 +290,6 @@ mod tests {
     #[test]
     fn rejects_unknown_mode() {
         let uri = StreamUri::parse("pipe:///tmp/x?name=t&mode=bogus").unwrap();
-        let (tx, _rx) = mpsc::channel(1);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let _guard = rt.enter();
-        assert!(start(uri, SampleFormat::new(48000, 16, 2), 960, tx).is_err());
+        assert!(reader(uri, SampleFormat::new(48000, 16, 2), 960).is_err());
     }
 }

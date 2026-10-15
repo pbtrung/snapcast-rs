@@ -22,6 +22,16 @@ pub(crate) struct Notification {
     pub message: Value,
 }
 
+impl Notification {
+    /// Whether control connection `connection_id` is sent this notification.
+    /// Notifications carry server state, so only authenticated connections
+    /// are; and not the connection whose request caused it, which was
+    /// answered by the response.
+    pub(crate) fn is_for(&self, connection_id: u64, authenticated: bool) -> bool {
+        authenticated && self.origin != Some(connection_id)
+    }
+}
+
 /// A new id for a TCP or WebSocket control connection, unique for the
 /// server's lifetime and across both transports.
 pub(crate) fn connection_id() -> u64 {

@@ -12,10 +12,15 @@ pub(crate) struct BinaryConfig {
     pub server: ServerConfig,
     /// Control-API authentication (disabled with no secret by default).
     pub auth: AuthConfig,
+    /// Whether the TCP JSON-RPC control server runs. Default: true.
+    pub control_enabled: bool,
     /// TCP bind address for JSON-RPC control. Default: 0.0.0.0.
     pub control_bind_address: String,
     /// TCP port for JSON-RPC control. Default: 1705.
     pub control_port: u16,
+    /// Whether the HTTP server (JSON-RPC, WebSocket streaming, Snapweb)
+    /// runs. Default: true.
+    pub http_enabled: bool,
     /// TCP bind address for HTTP JSON-RPC + Snapweb. Default: 0.0.0.0.
     pub http_bind_address: String,
     /// HTTP port for JSON-RPC + Snapweb. Default: 1780.
@@ -28,6 +33,10 @@ pub(crate) struct BinaryConfig {
     pub doc_root: Option<String>,
     /// Stream source URIs.
     pub sources: Vec<String>,
+    /// Source read chunk size in milliseconds (`[stream] chunk_ms`); a
+    /// source's own `chunk_ms` parameter overrides it. `None`: 20 ms, or one
+    /// FLAC block for FLAC streams.
+    pub chunk_ms: Option<u32>,
 }
 
 impl Default for BinaryConfig {
@@ -35,14 +44,17 @@ impl Default for BinaryConfig {
         Self {
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
+            control_enabled: true,
             control_bind_address: snapcast_proto::DEFAULT_BIND_ADDRESS.into(),
             control_port: snapcast_proto::DEFAULT_CONTROL_PORT,
+            http_enabled: true,
             http_bind_address: snapcast_proto::DEFAULT_BIND_ADDRESS.into(),
             http_port: snapcast_proto::DEFAULT_HTTP_PORT,
             stream_bind_address: snapcast_proto::DEFAULT_BIND_ADDRESS.into(),
             stream_port: snapcast_proto::DEFAULT_STREAM_PORT,
             doc_root: None,
             sources: default_sources(),
+            chunk_ms: None,
         }
     }
 }
@@ -82,12 +94,16 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     tracing::info!(path, "Loaded config file");
 
     if let Some(s) = ini.section(Some("http")) {
+        get_bool(s, "enabled", |v| config.http_enabled = v);
         get_parsed(s, "port", |v| config.http_port = v);
         get_bind_address(s, |v| config.http_bind_address = v.to_string());
-        get_str(s, "doc_root", |v| config.doc_root = Some(v.to_string()));
+        // Empty disables Snapweb, as in C++ snapserver (rather than serving
+        // the working directory).
+        get_str(s, "doc_root", |v| config.doc_root = non_empty(v));
     }
 
     if let Some(s) = ini.section(Some("tcp-control")) {
+        get_bool(s, "enabled", |v| config.control_enabled = v);
         get_parsed(s, "port", |v| config.control_port = v);
         get_bind_address(s, |v| config.control_bind_address = v.to_string());
     }
@@ -119,6 +135,10 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
             config.server.sample_format = v.to_string();
         });
         get_parsed(s, "buffer", |v| config.server.buffer_ms = v);
+        get_parsed(s, "chunk_ms", |v| config.chunk_ms = Some(v));
+        get_bool(s, "send_to_muted", |v| {
+            config.server.send_audio_to_muted = v
+        });
     }
 
     if let Some(s) = ini.section(Some("streaming_client")) {
@@ -157,6 +177,12 @@ fn get_duration<F: FnOnce(Option<std::time::Duration>)>(
             None => tracing::warn!(key, value = v, "Ignoring invalid duration"),
         }
     }
+}
+
+/// `value` trimmed, or `None` when that leaves nothing.
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
@@ -235,7 +261,7 @@ pub(crate) fn merge_cli(mut config: BinaryConfig, cli: CliOverrides) -> BinaryCo
         config.http_bind_address = v;
     }
     if let Some(v) = cli.doc_root {
-        config.doc_root = Some(v);
+        config.doc_root = non_empty(&v);
     }
     if let Some(v) = cli.buffer {
         config.server.buffer_ms = v;
@@ -789,6 +815,39 @@ mod tests {
             config.sources,
             vec![r"process:///usr/bin/tool?name=x&params=C:\music\new"]
         );
+    }
+
+    /// Regression: `doc_root =` (empty, which C++ snapserver documents as
+    /// disabled) served the working directory over HTTP.
+    #[test]
+    fn empty_doc_root_disables_snapweb() {
+        let config = config_from("[http]\ndoc_root =\n");
+        assert_eq!(config.doc_root, None);
+        let merged = merge_cli(
+            config_from("[http]\ndoc_root = /srv/web\n"),
+            CliOverrides {
+                doc_root: Some(" ".into()),
+                ..empty_cli()
+            },
+        );
+        assert_eq!(merged.doc_root, None);
+    }
+
+    #[test]
+    fn cpp_stream_and_listener_keys() {
+        let config = config_from(
+            "[http]\nenabled = false\n[tcp-control]\nenabled = false\n\
+             [stream]\nchunk_ms = 26\nsend_to_muted = true\n",
+        );
+        assert!(!config.http_enabled);
+        assert!(!config.control_enabled);
+        assert_eq!(config.chunk_ms, Some(26));
+        assert!(config.server.send_audio_to_muted);
+
+        let defaults = BinaryConfig::default();
+        assert!(defaults.http_enabled && defaults.control_enabled);
+        assert_eq!(defaults.chunk_ms, None);
+        assert!(!defaults.server.send_audio_to_muted);
     }
 
     #[test]

@@ -27,7 +27,6 @@ rust-ini = "0.21"
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
 base64 = { workspace = true }
 subtle = { workspace = true }
-tempfile = "3"
 libc = { workspace = true }
 axum = { version = "0.8.8", features = ["ws"] }
 tower-http = { version = "0.7.1", features = ["fs"] }
@@ -36,6 +35,7 @@ futures-util = { workspace = true }
 [dev-dependencies]
 snapcast-client = { workspace = true, features = ["websocket"] }
 tokio-tungstenite = { workspace = true }
+tempfile = "3"
 
 [features]
 default = ["snapcast-server/default"]

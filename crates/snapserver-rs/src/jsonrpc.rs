@@ -422,6 +422,9 @@ pub(crate) async fn handle_request(
         }
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
+            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
+                return response;
+            }
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -1111,6 +1114,21 @@ mod tests {
         assert_eq!(response["result"]["stream_id"], "default");
     }
 
+    /// Regression: removing an unknown stream answered success (and
+    /// announced a Server.OnUpdate for nothing).
+    #[tokio::test]
+    async fn stream_remove_unknown_stream_is_not_found() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 58,
+            "method": "Stream.RemoveStream", "params": {"id": "nope"}
+        });
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(response["error"]["message"], "Stream not found");
+        assert_eq!(response["id"], 58);
+    }
+
     // --- Auth ------------------------------------------------------------
 
     fn request(id: u64, method: &str, params: Value) -> Value {
@@ -1259,7 +1277,8 @@ mod tests {
         assert_eq!(response["result"], "ok");
     }
 
-    /// Record every command except `GetStatus`, which gets an empty status.
+    /// Record every command except `GetStatus`, which gets a status with
+    /// only stream `s`.
     fn recording_server() -> (
         tokio::sync::mpsc::Sender<ServerCommand>,
         std::sync::Arc<std::sync::Mutex<Vec<ServerCommand>>>,
@@ -1271,7 +1290,15 @@ mod tests {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     ServerCommand::GetStatus { response_tx } => {
-                        let _ = response_tx.send(status::ServerStatus::default());
+                        let _ = response_tx.send(status::ServerStatus {
+                            server: status::Server {
+                                streams: vec![status::Stream {
+                                    id: "s".into(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            },
+                        });
                     }
                     cmd => record.lock().unwrap().push(cmd),
                 }

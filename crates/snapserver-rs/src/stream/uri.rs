@@ -70,6 +70,9 @@ impl StreamUri {
     }
 }
 
+/// Port of a `tcp://` source that names none, as in C++ snapserver.
+const DEFAULT_TCP_PORT: u16 = 4953;
+
 fn parse_tcp_endpoint(path_part: &str) -> Result<(String, u16)> {
     let endpoint = path_part.trim_start_matches('/');
     if let Some(stripped) = endpoint.strip_prefix('[') {
@@ -78,7 +81,7 @@ fn parse_tcp_endpoint(path_part: &str) -> Result<(String, u16)> {
             .context("invalid TCP stream IPv6 endpoint, missing closing ']'")?;
         anyhow::ensure!(!host.is_empty(), "missing TCP stream host");
         let port = if tail.is_empty() {
-            4953
+            DEFAULT_TCP_PORT
         } else {
             let port_str = tail
                 .strip_prefix(':')
@@ -98,7 +101,7 @@ fn parse_tcp_endpoint(path_part: &str) -> Result<(String, u16)> {
 
     // No colons — plain hostname or IPv4
     if !endpoint.contains(':') {
-        return Ok((endpoint.to_string(), 4953));
+        return Ok((endpoint.to_string(), DEFAULT_TCP_PORT));
     }
 
     // Multiple colons without brackets — bare IPv6. Accept only if valid IPv6.
@@ -107,7 +110,7 @@ fn parse_tcp_endpoint(path_part: &str) -> Result<(String, u16)> {
         endpoint.parse::<std::net::Ipv6Addr>().is_ok(),
         "ambiguous IPv6 address with port — use bracket notation: tcp://[{endpoint}]:port"
     );
-    Ok((endpoint.to_string(), 4953))
+    Ok((endpoint.to_string(), DEFAULT_TCP_PORT))
 }
 
 fn parse_port(port_str: &str) -> Result<u16> {

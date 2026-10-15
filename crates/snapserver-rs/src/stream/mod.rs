@@ -3,15 +3,47 @@
 use std::time::Duration;
 
 use snapcast_server::time::ChunkTimestamper;
-use snapcast_server::{AudioData, AudioFrame};
+use snapcast_server::{AudioData, AudioFrame, SampleFormat};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 pub(crate) mod file;
 pub(crate) mod pipe;
 pub(crate) mod process;
 pub(crate) mod tcp;
 pub(crate) mod uri;
+
+/// A configured source reader, started by calling it with the stream's audio
+/// sender.
+pub(crate) type Reader = Box<dyn FnOnce(mpsc::Sender<AudioFrame>) -> JoinHandle<()>>;
+
+/// Configure the reader for `uri` without starting it. The scheme and the
+/// reader's parameters are checked here, so the caller registers the stream
+/// only for a source that can be read: a rejected one would otherwise show
+/// up in the status as a stream that never plays.
+pub(crate) fn reader(
+    uri: uri::StreamUri,
+    format: SampleFormat,
+    chunk_frames: usize,
+) -> anyhow::Result<Reader> {
+    Ok(match uri.scheme.as_str() {
+        "pipe" => Box::new(pipe::reader(uri, format, chunk_frames)?),
+        "file" => Box::new(file::reader(uri, format, chunk_frames)?),
+        "process" => Box::new(process::reader(uri, format, chunk_frames)?),
+        "tcp" => Box::new(tcp::reader(uri, format, chunk_frames)?),
+        other => anyhow::bail!("unsupported stream scheme {other:?}"),
+    })
+}
+
+/// Duration of `frames` frames at `format`'s rate.
+pub(crate) fn frames_duration(format: SampleFormat, frames: usize) -> Duration {
+    Duration::from_micros(frames as u64 * 1_000_000 / u64::from(format.rate()))
+}
+
+/// How long a reader waits before reopening, reconnecting or restarting its
+/// source.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// How far a source may fall behind realtime before its timestamps are
 /// re-anchored at the current time (see [`ChunkTimestamper::resync_if_behind`]).
@@ -42,7 +74,7 @@ impl PcmEncoding {
     }
 
     /// Bytes in `frames` frames of a source with this encoding.
-    pub(crate) fn chunk_bytes(self, format: snapcast_server::SampleFormat, frames: usize) -> usize {
+    pub(crate) fn chunk_bytes(self, format: SampleFormat, frames: usize) -> usize {
         match self {
             Self::Int => frames * format.frame_size() as usize,
             Self::Float => frames * format.channels() as usize * 4,
