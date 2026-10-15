@@ -14,7 +14,7 @@ authors = ["Trung Pham"]
 # Internal
 snapcast-proto = { path = "crates/snapcast-proto", version = "0.999.16" }
 snapcast-client = { path = "crates/snapcast-client", version = "0.999.16", default-features = false }
-snapcast-server = { path = "crates/snapcast-server", version = "0.999.16" }
+snapcast-server = { path = "crates/snapcast-server", version = "0.999.16", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

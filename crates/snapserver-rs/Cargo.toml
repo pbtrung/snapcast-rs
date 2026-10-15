@@ -38,6 +38,6 @@ tokio-tungstenite = { workspace = true }
 tempfile = "3"
 
 [features]
-default = ["snapcast-server/default"]
+default = ["flac"]
 flac = ["snapcast-server/flac"]
 opus = ["snapcast-server/opus"]

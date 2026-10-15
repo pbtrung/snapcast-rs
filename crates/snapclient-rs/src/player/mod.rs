@@ -337,22 +337,13 @@ impl ResampledOutput {
 
 /// Decode one sample of `samples` at sample index `idx` to f32.
 fn sample_at(samples: &[u8], idx: usize, format: SampleFormat, encoding: SampleEncoding) -> f32 {
-    let bytes = |n: usize| samples.get(idx * n..idx * n + n);
-    match (encoding, format.bits()) {
-        (SampleEncoding::Float32, _) => {
-            bytes(4).map_or(0.0, |b| f32::from_le_bytes(b.try_into().unwrap()))
-        }
-        (SampleEncoding::PcmInt, 16) => bytes(2).map_or(0.0, |b| {
-            i16::from_le_bytes(b.try_into().unwrap()) as f32 / i16::MAX as f32
-        }),
-        (SampleEncoding::PcmInt, 24) => bytes(4).map_or(0.0, |b| {
-            i32::from_le_bytes(b.try_into().unwrap()) as f32 / snapcast_proto::PCM_24BIT_MAX
-        }),
-        (SampleEncoding::PcmInt, 32) => bytes(4).map_or(0.0, |b| {
-            i32::from_le_bytes(b.try_into().unwrap()) as f32 / i32::MAX as f32
-        }),
-        _ => 0.0,
-    }
+    let n = match encoding {
+        SampleEncoding::Float32 => 4,
+        SampleEncoding::PcmInt => format.sample_size() as usize,
+    };
+    samples
+        .get(idx * n..idx * n + n)
+        .map_or(0.0, |b| encoding.sample_to_f32(b, format.bits()))
 }
 
 /// Convert interleaved stream samples to the device's f32 output, mapping the

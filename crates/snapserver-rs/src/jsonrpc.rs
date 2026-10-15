@@ -314,6 +314,9 @@ pub(crate) async fn handle_request(
         "Group.SetStream" => {
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
+            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
+                return response;
+            }
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -596,10 +599,23 @@ mod tests {
         let req = json!({
             "jsonrpc": "2.0", "id": 4,
             "method": "Group.SetStream",
+            "params": {"id": "g1", "stream_id": "default"}
+        });
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+        assert_eq!(response["result"]["stream_id"], "default");
+    }
+
+    #[tokio::test]
+    async fn group_set_stream_unknown_stream_is_an_error() {
+        let (auth_config, cmd_tx) = mock_server();
+        let req = json!({
+            "jsonrpc": "2.0", "id": 4,
+            "method": "Group.SetStream",
             "params": {"id": "g1", "stream_id": "music"}
         });
         let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
-        assert_eq!(response["result"]["stream_id"], "music");
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(response["error"]["message"], "Stream not found");
     }
 
     // === Wave-4 additions ===================================================

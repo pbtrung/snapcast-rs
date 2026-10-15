@@ -185,7 +185,12 @@ impl Controller {
                     self.init_audio_pipeline(&ch)?;
                 }
                 MessagePayload::Error(e) => {
-                    bail!("Server rejected Hello: {} (code {})", e.error, e.code)
+                    bail!(
+                        "Server rejected Hello: {}: {} (code {})",
+                        e.error,
+                        e.message,
+                        e.code
+                    )
                 }
                 _ => tracing::debug!(
                     "Ignoring message during handshake: {:?}",

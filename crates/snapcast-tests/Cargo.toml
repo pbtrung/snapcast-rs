@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 snapcast-proto = { workspace = true }
 snapcast-client = { workspace = true }
-snapcast-server = { workspace = true }
+snapcast-server = { workspace = true, features = ["flac"] }
 tokio = { workspace = true }
 base64 = { workspace = true }
 socket2 = { workspace = true }
