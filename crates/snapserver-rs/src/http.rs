@@ -446,34 +446,28 @@ mod tests {
             assert_eq!(ws_next(ws).await["id"], 1);
         }
 
-        ws_send(
-            &mut a,
+        let set_title = |id: u64, title: &str| {
             serde_json::json!({
-                "jsonrpc": "2.0", "id": 2, "method": "Client.SetVolume",
-                "params": {"id": "c1", "volume": {"percent": 30, "muted": false}}
-            }),
-        )
-        .await;
+                "jsonrpc": "2.0", "id": id, "method": "Stream.SetProperty",
+                "params": {"id": "default", "properties": {"metadata": {"title": title}}}
+            })
+        };
+        ws_send(&mut a, set_title(2, "One")).await;
         let reply = ws_next(&mut a).await;
         assert_eq!(reply["id"], 2);
-        assert_eq!(reply["result"]["volume"]["percent"], 30);
+        assert_eq!(reply["result"]["id"], "default");
         let n = ws_next(&mut b).await;
-        assert_eq!(n["method"], "Client.OnVolumeChanged");
-        assert_eq!(n["params"]["volume"]["percent"], 30);
+        assert_eq!(n["method"], "Stream.OnProperties");
+        assert_eq!(n["params"]["properties"]["metadata"]["title"], "One");
 
         // Notifications are delivered in order: had A been sent its own
-        // Client.OnVolumeChanged, it would come before this one.
-        let (status, _) = post(
-            port,
-            r#"{"jsonrpc":"2.0","id":3,"method":"Client.SetName","params":{"id":"c1","name":"Den"}}"#,
-            None,
-        )
-        .await;
+        // Stream.OnProperties, it would come before this one.
+        let (status, _) = post(port, &set_title(3, "Two").to_string(), None).await;
         assert_eq!(status, 200);
         for ws in [&mut a, &mut b] {
             let n = ws_next(ws).await;
-            assert_eq!(n["method"], "Client.OnNameChanged");
-            assert_eq!(n["params"]["name"], "Den");
+            assert_eq!(n["method"], "Stream.OnProperties");
+            assert_eq!(n["params"]["properties"]["metadata"]["title"], "Two");
         }
     }
 

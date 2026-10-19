@@ -117,7 +117,7 @@ async fn handle_entry(
 }
 
 /// Fetch server status via GetStatus command, serialized to JSON.
-async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
+pub(crate) async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(ServerCommand::GetStatus { response_tx: tx })
@@ -127,35 +127,82 @@ async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
     serde_json::to_value(status).ok()
 }
 
+/// The entries of array `key` in `value`, none if it is not an array.
+fn entries<'a>(value: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    value[key].as_array().into_iter().flatten()
+}
+
 /// Find a client in a serialized server status by ID.
 pub(crate) fn find_client<'a>(status: &'a Value, client_id: &str) -> Option<&'a Value> {
-    status["server"]["groups"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|g| g["clients"].as_array().into_iter().flatten())
+    entries(&status["server"], "groups")
+        .flat_map(|g| entries(g, "clients"))
         .find(|c| c["id"].as_str() == Some(client_id))
 }
 
-/// Check that stream `stream_id` exists, or return the error response.
-async fn require_stream(
+/// Find a group in a serialized server status by ID.
+fn find_group<'a>(status: &'a Value, group_id: &str) -> Option<&'a Value> {
+    entries(&status["server"], "groups").find(|g| g["id"].as_str() == Some(group_id))
+}
+
+/// Find a stream in a serialized server status by ID.
+pub(crate) fn find_stream<'a>(status: &'a Value, stream_id: &str) -> Option<&'a Value> {
+    entries(&status["server"], "streams").find(|s| s["id"].as_str() == Some(stream_id))
+}
+
+/// What a request names by id.
+#[derive(Clone, Copy)]
+enum Target {
+    Client,
+    Group,
+    Stream,
+}
+
+impl Target {
+    fn find(self, status: &Value, target_id: &str) -> Option<Value> {
+        match self {
+            Self::Client => find_client(status, target_id),
+            Self::Group => find_group(status, target_id),
+            Self::Stream => find_stream(status, target_id),
+        }
+        .cloned()
+    }
+
+    /// The error message when it does not exist (as C++ snapserver's).
+    fn not_found(self) -> &'static str {
+        match self {
+            Self::Client => "Client not found",
+            Self::Group => "Group not found",
+            Self::Stream => "Stream not found",
+        }
+    }
+}
+
+/// The current status entry of `target` `target_id`, or the error response
+/// when it does not exist: like C++ snapserver, a request for an unknown
+/// client, group or stream is an error rather than a silent no-op.
+async fn require(
     id: &Value,
-    stream_id: &str,
+    target: Target,
+    target_id: &str,
     cmd_tx: &mpsc::Sender<ServerCommand>,
-) -> Result<(), Value> {
+) -> Result<Value, Value> {
     let Some(status) = get_status(cmd_tx).await else {
         return Err(err(id, INTERNAL_ERROR, "status unavailable"));
     };
-    let found = status["server"]["streams"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|s| s["id"].as_str() == Some(stream_id));
-    if found {
-        Ok(())
-    } else {
-        Err(err(id, INTERNAL_ERROR, "Stream not found"))
-    }
+    target
+        .find(&status, target_id)
+        .ok_or_else(|| err(id, INTERNAL_ERROR, target.not_found()))
+}
+
+/// Bind the status entry of an existing client, group or stream (see
+/// [`require`]), or return the error response.
+macro_rules! require {
+    ($target:ident, $target_id:expr, $id:expr, $cmd_tx:expr) => {
+        match require($id, Target::$target, $target_id, $cmd_tx).await {
+            Ok(entry) => entry,
+            Err(response) => return response,
+        }
+    };
 }
 
 /// Tag a mutating command with the requesting connection (see
@@ -191,6 +238,7 @@ pub(crate) async fn handle_request(
         },
         "Server.DeleteClient" => {
             let client_id = require_str!(params, "id", id);
+            require!(Client, client_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -209,30 +257,25 @@ pub(crate) async fn handle_request(
         // --- Client ---
         "Client.GetStatus" => {
             let client_id = require_str!(params, "id", id);
-            let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INTERNAL_ERROR, "status unavailable");
-            };
-            match find_client(&status, client_id) {
-                Some(c) => ok(id, json!({"client": c})),
-                None => err(id, INTERNAL_ERROR, "client not found"),
-            }
+            let client = require!(Client, client_id, id, cmd_tx);
+            ok(id, json!({"client": client}))
         }
         "Client.SetVolume" => {
             let client_id = require_str!(params, "id", id);
+            let client = require!(Client, client_id, id, cmd_tx);
             let requested = &params["volume"];
-            let mut percent = requested["percent"].as_u64().map(|p| p.min(100) as u16);
-            let mut muted = requested["muted"].as_bool();
             // Like C++ snapserver, a field left out keeps its current value,
             // so `{"muted": true}` mutes without touching the level.
-            if (percent.is_none() || muted.is_none())
-                && let Some(status) = get_status(cmd_tx).await
-                && let Some(client) = find_client(&status, client_id)
-            {
-                let current = &client["config"]["volume"];
-                percent = percent.or(current["percent"].as_u64().map(|p| p as u16));
-                muted = muted.or(current["muted"].as_bool());
-            }
-            let (volume, muted) = (percent.unwrap_or(100), muted.unwrap_or(false));
+            let current = &client["config"]["volume"];
+            let volume = requested["percent"]
+                .as_u64()
+                .map(|p| p.min(100))
+                .or(current["percent"].as_u64())
+                .unwrap_or(100) as u16;
+            let muted = requested["muted"]
+                .as_bool()
+                .or(current["muted"].as_bool())
+                .unwrap_or(false);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -253,6 +296,7 @@ pub(crate) async fn handle_request(
             else {
                 return err(id, INVALID_PARAMS, "missing or invalid 'latency'");
             };
+            require!(Client, client_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -267,6 +311,7 @@ pub(crate) async fn handle_request(
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
             let name = require_str!(params, "name", id);
+            require!(Client, client_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -282,24 +327,15 @@ pub(crate) async fn handle_request(
         // --- Group ---
         "Group.GetStatus" => {
             let group_id = require_str!(params, "id", id);
-            let Some(status) = get_status(cmd_tx).await else {
-                return err(id, INTERNAL_ERROR, "status unavailable");
-            };
-            let group = status["server"]["groups"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|g| g["id"].as_str() == Some(group_id));
-            match group {
-                Some(g) => ok(id, json!({"group": g})),
-                None => err(id, INTERNAL_ERROR, "group not found"),
-            }
+            let group = require!(Group, group_id, id, cmd_tx);
+            ok(id, json!({"group": group}))
         }
         "Group.SetMute" => {
             let group_id = require_str!(params, "id", id);
             let Some(muted) = params["mute"].as_bool() else {
                 return err(id, INVALID_PARAMS, "missing 'mute'");
             };
+            require!(Group, group_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -314,9 +350,8 @@ pub(crate) async fn handle_request(
         "Group.SetStream" => {
             let group_id = require_str!(params, "id", id);
             let stream_id = require_str!(params, "stream_id", id);
-            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
-                return response;
-            }
+            require!(Group, group_id, id, cmd_tx);
+            require!(Stream, stream_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -337,6 +372,7 @@ pub(crate) async fn handle_request(
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
+            require!(Group, group_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -354,6 +390,7 @@ pub(crate) async fn handle_request(
         "Group.SetName" => {
             let group_id = require_str!(params, "id", id);
             let name = require_str!(params, "name", id);
+            require!(Group, group_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -376,9 +413,7 @@ pub(crate) async fn handle_request(
             if properties.is_none() {
                 require_str!(params, "property", id);
             }
-            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
-                return response;
-            }
+            require!(Stream, stream_id, id, cmd_tx);
             let Some(properties) = properties else {
                 return err(id, CAN_NOT_CONTROL, "Stream can not be controlled");
             };
@@ -402,9 +437,7 @@ pub(crate) async fn handle_request(
         "Stream.Control" => {
             let stream_id = require_str!(params, "id", id);
             require_str!(params, "command", id);
-            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
-                return response;
-            }
+            require!(Stream, stream_id, id, cmd_tx);
             // No stream source of ours takes play/pause/next/... commands.
             err(id, CAN_NOT_CONTROL, "Stream can not be controlled")
         }
@@ -425,9 +458,7 @@ pub(crate) async fn handle_request(
         }
         "Stream.RemoveStream" => {
             let stream_id = require_str!(params, "id", id);
-            if let Err(response) = require_stream(id, stream_id, cmd_tx).await {
-                return response;
-            }
+            require!(Stream, stream_id, id, cmd_tx);
             let _ = cmd_tx
                 .send(tagged(
                     origin,
@@ -744,7 +775,7 @@ mod tests {
         });
         let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["error"]["code"], INTERNAL_ERROR);
-        assert_eq!(response["error"]["message"], "client not found");
+        assert_eq!(response["error"]["message"], "Client not found");
     }
 
     #[tokio::test]
@@ -814,17 +845,64 @@ mod tests {
             response["result"]["volume"],
             json!({"percent": 40, "muted": true})
         );
+    }
 
-        // An unknown client falls back to 100 % unmuted.
-        let req = json!({
-            "jsonrpc": "2.0", "id": 27,
-            "method": "Client.SetVolume", "params": {"id": "ghost"}
-        });
-        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
-        assert_eq!(
-            response["result"]["volume"],
-            json!({"percent": 100, "muted": false})
-        );
+    /// Regression: a change to an unknown client or group answered success
+    /// (echoing made-up values) while nothing changed; C++ snapserver
+    /// answers "Client not found" / "Group not found".
+    #[tokio::test]
+    async fn changing_an_unknown_client_or_group_is_an_error() {
+        let (auth_config, cmd_tx) = mock_server();
+        for (method, params, message) in [
+            (
+                "Client.SetVolume",
+                json!({"id": "ghost", "volume": {"percent": 5}}),
+                "Client not found",
+            ),
+            (
+                "Client.SetLatency",
+                json!({"id": "ghost", "latency": 5}),
+                "Client not found",
+            ),
+            (
+                "Client.SetName",
+                json!({"id": "ghost", "name": "n"}),
+                "Client not found",
+            ),
+            (
+                "Server.DeleteClient",
+                json!({"id": "ghost"}),
+                "Client not found",
+            ),
+            (
+                "Group.SetMute",
+                json!({"id": "ghost", "mute": true}),
+                "Group not found",
+            ),
+            (
+                "Group.SetStream",
+                json!({"id": "ghost", "stream_id": "default"}),
+                "Group not found",
+            ),
+            (
+                "Group.SetClients",
+                json!({"id": "ghost", "clients": ["c1"]}),
+                "Group not found",
+            ),
+            (
+                "Group.SetName",
+                json!({"id": "ghost", "name": "n"}),
+                "Group not found",
+            ),
+        ] {
+            let req = json!({"jsonrpc": "2.0", "id": 27, "method": method, "params": params});
+            let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+            assert_eq!(
+                response["error"],
+                json!({"code": INTERNAL_ERROR, "message": message}),
+                "{method}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -917,7 +995,7 @@ mod tests {
             "method": "Group.GetStatus", "params": {"id": "ghost"}
         });
         let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
-        assert_eq!(response["error"]["message"], "group not found");
+        assert_eq!(response["error"]["message"], "Group not found");
     }
 
     #[tokio::test]
@@ -1294,7 +1372,7 @@ mod tests {
     }
 
     /// Record every command except `GetStatus`, which gets a status with
-    /// only stream `s`.
+    /// group `g1` holding client `c1`, and stream `s`.
     fn recording_server() -> (
         tokio::sync::mpsc::Sender<ServerCommand>,
         std::sync::Arc<std::sync::Mutex<Vec<ServerCommand>>>,
@@ -1308,6 +1386,14 @@ mod tests {
                     ServerCommand::GetStatus { response_tx } => {
                         let _ = response_tx.send(status::ServerStatus {
                             server: status::Server {
+                                groups: vec![status::Group {
+                                    id: "g1".into(),
+                                    clients: vec![status::Client {
+                                        id: "c1".into(),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }],
                                 streams: vec![status::Stream {
                                     id: "s".into(),
                                     ..Default::default()

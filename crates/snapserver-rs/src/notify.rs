@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use snapcast_server::{ServerCommand, ServerEvent};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::jsonrpc::{find_client, find_stream};
+
 /// A notification broadcast to the control connections.
 #[derive(Debug, Clone)]
 pub(crate) struct Notification {
@@ -121,35 +123,15 @@ async fn notification_for(
     }
 }
 
-/// Fetch full server status as JSON via GetStatus command.
+/// The current server status as JSON, `null` if it is unavailable.
 async fn get_full_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Value {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if cmd_tx
-        .send(ServerCommand::GetStatus { response_tx: tx })
-        .await
-        .is_ok()
-        && let Ok(status) = rx.await
-    {
-        return serde_json::to_value(status).unwrap_or_default();
-    }
-    Value::Null
-}
-
-/// Find a stream in a serialized server status by ID.
-fn find_stream<'a>(status: &'a Value, stream_id: &str) -> Option<&'a Value> {
-    status["server"]["streams"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|s| s["id"].as_str() == Some(stream_id))
+    crate::jsonrpc::get_status(cmd_tx).await.unwrap_or_default()
 }
 
 /// Find a client in the current status by ID.
 async fn get_client_from_status(cmd_tx: &mpsc::Sender<ServerCommand>, client_id: &str) -> Value {
     let status = get_full_status(cmd_tx).await;
-    crate::jsonrpc::find_client(&status, client_id)
-        .cloned()
-        .unwrap_or_default()
+    find_client(&status, client_id).cloned().unwrap_or_default()
 }
 
 fn notification(method: &str, params: Value) -> Value {
