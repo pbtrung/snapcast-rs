@@ -31,6 +31,8 @@ resampler = ["dep:rubato"]
 
 [dev-dependencies]
 proptest = "1"
+# Encodes the FLAC frames the decoder tests feed in.
+flacenc = { version = "0.5", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = false

@@ -2267,6 +2267,7 @@ name = "snapcast-client"
 version = "0.99.17"
 dependencies = [
  "anyhow",
+ "flacenc",
  "futures-util",
  "hostname",
  "mac_address",

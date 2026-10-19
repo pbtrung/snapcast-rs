@@ -57,6 +57,56 @@ fn parse_streaminfo(payload: &[u8]) -> Result<(SampleFormat, AudioCodecParameter
     Ok((sf, params))
 }
 
+/// CRC-16 of FLAC frames (polynomial 0x8005, initial value 0).
+const CRC16_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x8005
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Smallest FLAC frame: a 6-byte header, a 1-byte subframe and the CRC-16.
+const MIN_FRAME_LEN: usize = 9;
+
+/// Length of the FLAC frame at the start of `data`.
+///
+/// A chunk can carry several frames: the C++ server sends whatever its
+/// encoder emitted for one chunk of input, more than one frame once a chunk
+/// is longer than a block. Symphonia decodes only the first frame of a
+/// packet, so the frames are split here: a frame ends where its CRC-16
+/// footer matches and the next frame's sync code follows (a frame's size is
+/// not in its header). Without such a boundary the frame runs to the end.
+fn frame_len(data: &[u8]) -> usize {
+    let mut crc = 0u16;
+    for (i, &byte) in data.iter().enumerate() {
+        // `crc` covers `data[..i]`; a footer at `i` ends the frame at `i + 2`.
+        let end = i + 2;
+        if end >= MIN_FRAME_LEN
+            && data.len() > end + 1
+            && data[end] == 0xFF
+            && data[end + 1] & 0xFE == 0xF8
+            && crc == u16::from_be_bytes([byte, data[i + 1]])
+        {
+            return end;
+        }
+        crc = (crc << 8) ^ CRC16_TABLE[usize::from((crc >> 8) as u8 ^ byte)];
+    }
+    data.len()
+}
+
 /// FLAC audio decoder using symphonia.
 pub struct FlacDecoder {
     decoder: Box<dyn AudioDecoder>,
@@ -105,23 +155,27 @@ impl Decoder for FlacDecoder {
             "decode"
         );
 
-        let packet = PacketRef::new(0, (self.packet_id as i64).into(), 0u64.into(), data);
-        self.packet_id += 1;
-
-        let decoded = match self.decoder.decode_ref(&packet) {
-            Ok(buf) => buf,
-            Err(e) => {
-                tracing::warn!(codec = "flac", error = %e, "decode failed");
-                return Ok(false);
-            }
-        };
-
-        decoded.copy_to_vec_interleaved(&mut self.samples);
-
         // A new buffer: the chunk takes it over, so the input's (much
         // smaller) one would only be reallocated.
-        let mut out = Vec::with_capacity(self.samples.len() * 4);
-        out.extend(self.samples.iter().flat_map(|s| s.to_le_bytes()));
+        let mut out = Vec::new();
+        let mut rest = data.as_slice();
+        while !rest.is_empty() {
+            let (frame, next) = rest.split_at(frame_len(rest));
+            rest = next;
+            let packet = PacketRef::new(0, (self.packet_id as i64).into(), 0u64.into(), frame);
+            self.packet_id += 1;
+
+            let decoded = match self.decoder.decode_ref(&packet) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    tracing::warn!(codec = "flac", error = %e, "decode failed");
+                    return Ok(false);
+                }
+            };
+            decoded.copy_to_vec_interleaved(&mut self.samples);
+            out.reserve(self.samples.len() * 4);
+            out.extend(self.samples.iter().flat_map(|s| s.to_le_bytes()));
+        }
         *data = out;
         Ok(true)
     }
@@ -221,6 +275,85 @@ mod tests {
         let mut h = vec![0u8; 42];
         h[0..4].copy_from_slice(b"NOPE");
         assert!(parse_streaminfo(&h).is_err());
+    }
+
+    const BLOCK: usize = 1152;
+
+    /// A FLAC header and `blocks` frames of a 16-bit stereo ramp, as the
+    /// server's encoder writes them.
+    fn encoded_ramp(blocks: usize) -> (CodecHeader, Vec<Vec<u8>>) {
+        use flacenc::bitsink::MemSink;
+        use flacenc::component::{BitRepr, Stream, StreamInfo};
+        use flacenc::error::Verify;
+        use flacenc::source::{Fill, FrameBuf};
+
+        let mut stream = Stream::new(48_000, 2, 16).unwrap();
+        stream
+            .stream_info_mut()
+            .set_block_sizes(BLOCK, BLOCK)
+            .unwrap();
+        let mut sink = MemSink::<u8>::new();
+        stream.write(&mut sink).unwrap();
+        let header = CodecHeader {
+            codec: "flac".into(),
+            payload: sink.into_inner(),
+        };
+
+        let config = flacenc::config::Encoder::default()
+            .into_verified()
+            .unwrap();
+        let info = StreamInfo::new(48_000, 2, 16).unwrap();
+        let mut framebuf = FrameBuf::with_size(2, BLOCK).unwrap();
+        let frames = (0..blocks)
+            .map(|n| {
+                let samples: Vec<i32> = (0..BLOCK * 2)
+                    .map(|i| ((n * BLOCK * 2 + i) % 2000) as i32 * 10 - 10_000)
+                    .collect();
+                framebuf.fill_interleaved(&samples).unwrap();
+                let frame =
+                    flacenc::encode_fixed_size_frame(&config, &framebuf, n, &info).unwrap();
+                let mut sink = MemSink::<u8>::new();
+                frame.write(&mut sink).unwrap();
+                sink.into_inner()
+            })
+            .collect();
+        (header, frames)
+    }
+
+    fn decoded_samples(data: &[u8]) -> Vec<f32> {
+        data.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+
+    #[test]
+    fn decodes_every_frame_of_a_chunk() {
+        let (header, frames) = encoded_ramp(3);
+        let mut dec = create(&header).unwrap();
+        let mut separate = Vec::new();
+        for frame in &frames {
+            let mut data = frame.clone();
+            assert!(dec.decode(&mut data).unwrap());
+            separate.extend(decoded_samples(&data));
+        }
+        assert_eq!(separate.len(), 3 * BLOCK * 2);
+
+        let mut data = frames.concat();
+        assert!(dec.decode(&mut data).unwrap());
+        let combined = decoded_samples(&data);
+        assert_eq!(combined.len(), separate.len(), "every frame decoded");
+        assert_eq!(combined, separate);
+    }
+
+    #[test]
+    fn frame_len_finds_frame_boundaries() {
+        let (_, frames) = encoded_ramp(2);
+        let both = frames.concat();
+        assert_eq!(frame_len(&both), frames[0].len());
+        assert_eq!(frame_len(&frames[1]), frames[1].len());
+        assert_eq!(frame_len(&[0xFF, 0xF8]), 2, "garbage runs to the end");
     }
 
     #[test]
