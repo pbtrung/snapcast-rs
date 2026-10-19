@@ -35,8 +35,6 @@
 
 use std::collections::VecDeque;
 
-use snapcast_proto::Timeval;
-
 #[cfg(test)]
 mod sim;
 
@@ -177,26 +175,15 @@ impl TimeProvider {
         self.probation == 0 && self.samples.len() >= SYNCED_SAMPLES
     }
 
-    /// Set the time diff from a c2s/s2c latency pair (as received in Time messages).
-    ///
-    /// The diff is computed as `(c2s - s2c) / 2` which cancels out the symmetric
-    /// network latency, leaving only the clock difference.
-    pub fn set_diff(&mut self, c2s: &Timeval, s2c: &Timeval) {
-        self.add_sample_at(
-            snapcast_proto::time::now_usec(),
-            c2s.to_usec(),
-            s2c.to_usec(),
-        );
-    }
-
     /// Add one time exchange measured at local time `local_usec`.
     ///
     /// `c2s_usec` is the server receive time minus the client send time and
     /// `s2c_usec` the client receive time minus the server send time, each
-    /// mixing one-way latency with the clock difference. [`set_diff`]
-    /// calls this with the current time; tests and simulations pass their own.
+    /// mixing one-way latency with the clock difference. `local_usec` is
+    /// on the [`now_usec`] clock: when the reply arrived, not when it is
+    /// handled.
     ///
-    /// [`set_diff`]: Self::set_diff
+    /// [`now_usec`]: snapcast_proto::time::now_usec
     pub fn add_sample_at(&mut self, local_usec: i64, c2s_usec: i64, s2c_usec: i64) {
         let sample = Sample {
             local_usec,
@@ -323,14 +310,6 @@ impl TimeProvider {
         }
     }
 
-    /// Add an exchange, at the current time, that measured a clock
-    /// difference of `ms` milliseconds over a zero round trip.
-    pub fn set_diff_ms(&mut self, ms: f64) {
-        let usec = (ms * 1000.0) as i64;
-        // A zero round trip: c2s - s2c = 2 * diff, c2s + s2c = 0.
-        self.add_sample_at(snapcast_proto::time::now_usec(), usec, -usec);
-    }
-
     /// Get the current diff to server in microseconds.
     pub fn diff_to_server_usec(&self) -> i64 {
         self.diff_to_server_usec_at(snapcast_proto::time::now_usec())
@@ -454,6 +433,26 @@ fn median(values: &mut [f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snapcast_proto::Timeval;
+
+    impl TimeProvider {
+        /// Add an exchange of a c2s/s2c latency pair at the current time.
+        fn set_diff(&mut self, c2s: &Timeval, s2c: &Timeval) {
+            self.add_sample_at(
+                snapcast_proto::time::now_usec(),
+                c2s.to_usec(),
+                s2c.to_usec(),
+            );
+        }
+
+        /// Add an exchange, at the current time, that measured a clock
+        /// difference of `ms` milliseconds over a zero round trip.
+        fn set_diff_ms(&mut self, ms: f64) {
+            let usec = (ms * 1000.0) as i64;
+            // A zero round trip: c2s - s2c = 2 * diff, c2s + s2c = 0.
+            self.add_sample_at(snapcast_proto::time::now_usec(), usec, -usec);
+        }
+    }
 
     #[test]
     fn initial_diff_is_zero() {
