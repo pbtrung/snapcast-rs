@@ -17,7 +17,7 @@ use snapcast_client::config::{self, Auth, ClientSettings, MixerMode, ServerSetti
   For example: 'tcp://192.168.1.1:1704', or 'tcp://[::1]:1704'"
 )]
 pub struct Cli {
-    /// Snapserver URL (required): `tcp://<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
+    /// Snapserver URL (required): `tcp://[<user>[:<password>]@]<host>[:<port>]` (default port 1704) or `ws://<host>[:<port>]` (default port 1780)
     pub url: Option<String>,
 
     /// Print version
@@ -29,7 +29,7 @@ pub struct Cli {
     pub instance: u32,
 
     /// Unique host id (default: MAC address)
-    #[arg(long = "hostID", default_value = "")]
+    #[arg(long = "hostID", default_value = "", hide_default_value = true)]
     pub host_id: String,
 
     /// List PCM devices (macOS only)
@@ -49,7 +49,7 @@ pub struct Cli {
     pub sampleformat: Option<String>,
 
     /// Audio player backend and optional parameters: `<name>[:<params>]` (accepted for compatibility; output always uses cpal)
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", hide_default_value = true)]
     pub player: String,
 
     /// Mixer: `software[:poly|exp[:<param>]]`, `hardware[:<control>]`, `script` (falls back to software) or `none`
@@ -162,11 +162,14 @@ fn parse_url(url: &str) -> Result<ServerSettings> {
     };
     settings.scheme = scheme.to_string();
 
-    // Extract optional user:password@
+    // Only the authority is used: drop a path, query or fragment
+    // (`tcp://host:1704/`).
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or_default();
+
+    // Extract optional user[:password]@
     let rest = if let Some((userinfo, host_part)) = rest.rsplit_once('@') {
-        let (user, password) = userinfo
-            .split_once(':')
-            .context("invalid credentials, expected user:password@host")?;
+        // As C++ snapclient, the password may be left out.
+        let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
         settings.auth = Some(Auth {
             scheme: "Basic".into(),
             param: base64_encode_credentials(user, password),
@@ -278,6 +281,25 @@ mod tests {
         let auth = s.auth.unwrap();
         assert_eq!(auth.scheme, "Basic");
         assert_eq!(auth.param, "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn parse_url_with_user_only() {
+        let s = parse_url("tcp://user@myhost").unwrap();
+        assert_eq!(s.host, "myhost");
+        // base64("user:")
+        assert_eq!(s.auth.unwrap().param, "dXNlcjo=");
+    }
+
+    #[test]
+    fn parse_url_ignores_path_and_query() {
+        let s = parse_url("tcp://myhost:1705/").unwrap();
+        assert_eq!((s.host.as_str(), s.port), ("myhost", 1705));
+        let s = parse_url("ws://[::1]/stream?x=1").unwrap();
+        assert_eq!((s.host.as_str(), s.port), ("::1", 1780));
+        let s = parse_url("tcp://u:p@h#frag").unwrap();
+        assert_eq!(s.host, "h");
+        assert!(parse_url("tcp:///path").is_err());
     }
 
     #[test]

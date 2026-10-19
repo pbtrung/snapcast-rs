@@ -186,10 +186,13 @@ fn list_devices(player: &str) {
 fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result<()> {
     if let Some(priority) = daemon.priority {
         let priority = priority.clamp(-20, 19);
-        unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, priority);
+        // Raising the priority (below the current nice value) needs privileges.
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, priority) } == 0 {
+            tracing::info!(priority, "Process priority set");
+        } else {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(priority, %error, "Failed to set process priority");
         }
-        tracing::info!(priority, "Process priority set");
     }
 
     if let Some(ref user) = daemon.user {
@@ -199,7 +202,7 @@ fn daemonize(daemon: &snapcast_client::config::DaemonSettings) -> anyhow::Result
     unsafe {
         let pid = libc::fork();
         if pid < 0 {
-            anyhow::bail!("fork failed");
+            anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
         }
         if pid > 0 {
             std::process::exit(0);

@@ -64,19 +64,20 @@ pub async fn play_audio(
 
 /// Pick the device config for `format`: the exact rate and channel count if
 /// supported, else the exact rate with another channel count (channels are
-/// remapped), else the device default. At the same rate and channels, an f32
-/// config (the output stream's sample type) wins. Returns whether the rate
-/// differs.
+/// remapped), else the device default. DSD configs are skipped, and at the
+/// same rate and channels an f32 config (the format the player renders in)
+/// wins. Returns whether the rate differs.
 fn select_config(
     device: &cpal::Device,
     format: SampleFormat,
-) -> anyhow::Result<(cpal::StreamConfig, bool)> {
+) -> anyhow::Result<(cpal::SupportedStreamConfig, bool)> {
     use cpal::traits::DeviceTrait;
 
     let supported: Vec<_> = device.supported_output_configs()?.collect();
     let matching = supported
         .iter()
         .filter(|f| (f.min_sample_rate()..=f.max_sample_rate()).contains(&format.rate()))
+        .filter(|f| !f.sample_format().is_dsd())
         // The first of the best: channels match, then f32.
         .rev()
         .max_by_key(|f| {
@@ -86,11 +87,75 @@ fn select_config(
             )
         });
     if let Some(f) = matching {
-        return Ok((f.with_sample_rate(format.rate()).into(), false));
+        return Ok((f.with_sample_rate(format.rate()), false));
     }
-    let config: cpal::StreamConfig = device.default_output_config()?.into();
-    let resample = config.sample_rate != format.rate();
+    let config = device.default_output_config()?;
+    let resample = config.sample_rate() != format.rate();
     Ok((config, resample))
+}
+
+/// Build an output stream in the device's `sample_format`. `render` fills
+/// f32 samples; for other formats they are converted from a reused buffer.
+fn build_output_stream<R, E>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    render: R,
+    on_error: E,
+) -> anyhow::Result<cpal::Stream>
+where
+    R: FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static,
+    E: FnMut(cpal::Error) + Send + 'static,
+{
+    use cpal::SampleFormat as F;
+    use cpal::traits::DeviceTrait;
+
+    let stream = match sample_format {
+        F::F32 => device.build_output_stream(config, render, on_error, None)?,
+        F::F64 => build_converted::<f64, _, _>(device, config, render, on_error)?,
+        F::I8 => build_converted::<i8, _, _>(device, config, render, on_error)?,
+        F::I16 => build_converted::<i16, _, _>(device, config, render, on_error)?,
+        F::I24 => build_converted::<cpal::I24, _, _>(device, config, render, on_error)?,
+        F::I32 => build_converted::<i32, _, _>(device, config, render, on_error)?,
+        F::I64 => build_converted::<i64, _, _>(device, config, render, on_error)?,
+        F::U8 => build_converted::<u8, _, _>(device, config, render, on_error)?,
+        F::U16 => build_converted::<u16, _, _>(device, config, render, on_error)?,
+        F::U24 => build_converted::<cpal::U24, _, _>(device, config, render, on_error)?,
+        F::U32 => build_converted::<u32, _, _>(device, config, render, on_error)?,
+        F::U64 => build_converted::<u64, _, _>(device, config, render, on_error)?,
+        other => anyhow::bail!("unsupported device sample format: {other}"),
+    };
+    Ok(stream)
+}
+
+/// Build a stream of `T` samples, converted from the f32 `render` output.
+fn build_converted<T, R, E>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    mut render: R,
+    on_error: E,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+    R: FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static,
+    E: FnMut(cpal::Error) + Send + 'static,
+{
+    use cpal::traits::DeviceTrait;
+
+    // Resized in place: no allocation in the callback after warmup.
+    let mut buf: Vec<f32> = Vec::new();
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            buf.resize(data.len(), 0.0);
+            render(&mut buf, info);
+            for (out, &sample) in data.iter_mut().zip(&buf) {
+                *out = T::from_sample(sample);
+            }
+        },
+        on_error,
+        None,
+    )
 }
 
 fn run_cpal(
@@ -109,7 +174,9 @@ fn run_cpal(
 
     tracing::info!(device = %device.description().map(|d| d.name().to_string()).unwrap_or_default(), "Using audio device");
 
-    let (config, needs_resampling) = select_config(&device, format)?;
+    let (supported, needs_resampling) = select_config(&device, format)?;
+    let sample_format = supported.sample_format();
+    let config = supported.config();
     let device_rate = config.sample_rate;
     let device_channels = config.channels as usize;
     if device_channels != format.channels() as usize {
@@ -156,8 +223,10 @@ fn run_cpal(
     // performs no heap allocation after warmup. Allocating inside a cpal
     // callback can stall the audio thread and cause xruns/glitches.
     let mut pcm_buf: Vec<u8> = Vec::new();
-    let cpal_stream = device.build_output_stream(
+    let cpal_stream = build_output_stream(
+        &device,
         config,
+        sample_format,
         move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let num_frames = data.len() / device_channels;
 
@@ -239,7 +308,6 @@ fn run_cpal(
             }
             _ => tracing::error!(error = %err, "Audio stream error"),
         },
-        None,
     )?;
 
     cpal_stream.play()?;
@@ -335,12 +403,17 @@ impl ResampledOutput {
     }
 }
 
-/// Decode one sample of `samples` at sample index `idx` to f32.
-fn sample_at(samples: &[u8], idx: usize, format: SampleFormat, encoding: SampleEncoding) -> f32 {
-    let n = match encoding {
+/// Bytes per sample of `encoding` in `format`.
+fn sample_bytes(format: SampleFormat, encoding: SampleEncoding) -> usize {
+    match encoding {
         SampleEncoding::Float32 => 4,
         SampleEncoding::PcmInt => format.sample_size() as usize,
-    };
+    }
+}
+
+/// Decode one sample of `samples` at sample index `idx` to f32.
+fn sample_at(samples: &[u8], idx: usize, format: SampleFormat, encoding: SampleEncoding) -> f32 {
+    let n = sample_bytes(format, encoding);
     samples
         .get(idx * n..idx * n + n)
         .map_or(0.0, |b| encoding.sample_to_f32(b, format.bits()))
@@ -359,6 +432,15 @@ fn write_samples_to_output(
     let channels = format.channels() as usize;
     if channels == 0 || output_channels == 0 {
         output.fill(0.0);
+        return;
+    }
+    if channels == output_channels {
+        // Same layout (the usual case): convert sample by sample.
+        let bits = format.bits();
+        let mut src = samples.chunks_exact(sample_bytes(format, encoding));
+        for sample in output.iter_mut() {
+            *sample = src.next().map_or(0.0, |b| encoding.sample_to_f32(b, bits));
+        }
         return;
     }
     for (frame, out) in output.chunks_exact_mut(output_channels).enumerate() {
@@ -414,6 +496,18 @@ mod tests {
         let mut out = [9.0f32; 2];
         write_samples_to_output(&mut out, 1, &samples, f, SampleEncoding::Float32);
         assert_eq!(out, [0.1, 0.3]);
+    }
+
+    #[test]
+    fn padded_24bit_samples_are_read_whole() {
+        let f = SampleFormat::new(48000, 24, 2);
+        let samples: Vec<u8> = [8_388_607i32, -8_388_607]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        let mut out = [9.0f32; 2];
+        write_samples_to_output(&mut out, 2, &samples, f, SampleEncoding::PcmInt);
+        assert_eq!(out, [1.0, -1.0]);
     }
 
     #[test]
