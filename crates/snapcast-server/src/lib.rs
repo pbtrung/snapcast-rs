@@ -69,7 +69,7 @@ const F32_CHANNEL_SIZE: usize = 1;
 /// Audio data pushed by the consumer — either f32 or raw PCM.
 #[derive(Debug, Clone)]
 pub enum AudioData {
-    /// Interleaved f32 samples (from DSP, EQ, AirPlay receivers).
+    /// Interleaved f32 samples (from DSP, EQ or `encoding=float` sources).
     /// Range: -1.0 to 1.0.
     F32(Vec<f32>),
     /// Raw interleaved PCM bytes at the stream's configured sample format

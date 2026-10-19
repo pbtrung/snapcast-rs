@@ -246,7 +246,7 @@ impl Encoder for FlacEncoder {
                     tracing::warn!(
                         codec = "flac",
                         bits = self.format.bits(),
-                        "F32 input requires quantization — consider pcm for lossless path"
+                        "F32 input is quantized to integer PCM — FLAC stores integers only"
                     );
                 }
                 self.push_f32(&samples);

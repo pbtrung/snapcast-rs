@@ -1,4 +1,4 @@
-//! Opus encoder using the `opus` crate (system libopus).
+//! Opus encoder using the `opus` crate (libopus, bundled and built from source).
 
 use anyhow::{Result, bail};
 use opus::{Application, Bitrate, Channels, Encoder as OpusEnc};
