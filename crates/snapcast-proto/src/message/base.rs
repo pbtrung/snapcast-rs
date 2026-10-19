@@ -32,7 +32,8 @@ pub enum ProtoError {
     PayloadTooLarge {
         /// The declared length from the wire.
         len: usize,
-        /// The maximum accepted length ([`crate::DEFAULT_MAX_PAYLOAD_SIZE`]).
+        /// The maximum accepted length: [`crate::DEFAULT_MAX_PAYLOAD_SIZE`]
+        /// for incoming data, `u32::MAX` for an outgoing field.
         max: usize,
     },
 }

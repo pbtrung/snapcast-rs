@@ -117,28 +117,24 @@ impl FromStr for SampleFormat {
 
     /// Parse from `"rate:bits:channels"` string. `*` means 0 (unspecified).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 3 {
+        let mut parts = s.split(':');
+        let (Some(rate), Some(bits), Some(channels), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             return Err(SampleFormatError::InvalidFormat(s.to_string()));
-        }
-        let parse_u32 = |p: &str| -> Result<u32, SampleFormatError> {
-            if p == "*" { Ok(0) } else { Ok(p.parse()?) }
         };
-        // Reject out-of-range bits/channels rather than silently wrapping via
-        // `as u16` (e.g. "65536" previously became 0).
-        let parse_u16 = |p: &str| -> Result<u16, SampleFormatError> {
+        // Parsing straight into the field type rejects out-of-range values
+        // (e.g. 65536 bits) with an overflow error instead of wrapping them.
+        fn field<T: FromStr<Err = std::num::ParseIntError> + Default>(
+            p: &str,
+        ) -> Result<T, SampleFormatError> {
             if p == "*" {
-                Ok(0)
+                Ok(T::default())
             } else {
-                p.parse::<u32>()?
-                    .try_into()
-                    .map_err(|_| SampleFormatError::InvalidFormat(s.to_string()))
+                Ok(p.parse()?)
             }
-        };
-        let rate = parse_u32(parts[0])?;
-        let bits = parse_u16(parts[1])?;
-        let channels = parse_u16(parts[2])?;
-        Ok(Self::new(rate, bits, channels))
+        }
+        Ok(Self::new(field(rate)?, field(bits)?, field(channels)?))
     }
 }
 
@@ -223,6 +219,11 @@ mod tests {
         // bits/channels above u16::MAX must error, not silently wrap via `as u16`.
         assert!("48000:65536:2".parse::<SampleFormat>().is_err());
         assert!("48000:16:70000".parse::<SampleFormat>().is_err());
+        // ...and is reported as a bad number, not as a malformed layout.
+        assert!(matches!(
+            "48000:65536:2".parse::<SampleFormat>(),
+            Err(SampleFormatError::InvalidNumber(_))
+        ));
         // Realistic values still parse.
         assert!("48000:16:2".parse::<SampleFormat>().is_ok());
         assert_eq!("48000:24:2".parse::<SampleFormat>().unwrap().bits(), 24);

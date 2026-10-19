@@ -82,13 +82,7 @@ pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<TypedMessage>, ProtoError>
         return Ok(None);
     }
     let base = BaseMessage::read_from(&mut &buf[..BaseMessage::HEADER_SIZE])?;
-    if base.size > crate::DEFAULT_MAX_PAYLOAD_SIZE {
-        return Err(ProtoError::PayloadTooLarge {
-            len: base.size as usize,
-            max: crate::DEFAULT_MAX_PAYLOAD_SIZE as usize,
-        });
-    }
-    let frame_len = BaseMessage::HEADER_SIZE + base.size as usize;
+    let frame_len = BaseMessage::HEADER_SIZE + wire::check_incoming_len(base.size)?;
     if buf.len() < frame_len {
         return Ok(None);
     }

@@ -239,10 +239,10 @@ pub struct StreamUri {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamProperties {
-    /// Playback status (Playing, Paused, Stopped).
+    /// Playback status (`"playing"`, `"paused"` or `"stopped"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playback_status: Option<String>,
-    /// Loop status (None, Track, Playlist).
+    /// Loop status (`"none"`, `"track"` or `"playlist"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_status: Option<String>,
     /// Shuffle mode.

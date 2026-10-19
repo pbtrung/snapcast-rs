@@ -16,7 +16,7 @@ pub struct Timeval {
 }
 
 impl Timeval {
-    /// Create from microseconds since epoch.
+    /// Create from a microsecond count (e.g. [`crate::time::now_usec`]).
     ///
     /// Normalized like the arithmetic below: `usec` is in `0..1_000_000`, so a
     /// negative time has a negative `sec` and a positive `usec`, as C++ `tv`
@@ -25,7 +25,7 @@ impl Timeval {
         Self::normalized(0, usec)
     }
 
-    /// Convert to microseconds since epoch.
+    /// Convert to a microsecond count.
     pub fn to_usec(self) -> i64 {
         self.sec as i64 * 1_000_000 + self.usec as i64
     }

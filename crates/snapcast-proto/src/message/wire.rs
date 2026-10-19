@@ -9,13 +9,12 @@ use serde::de::DeserializeOwned;
 use crate::DEFAULT_MAX_PAYLOAD_SIZE;
 use crate::message::base::ProtoError;
 
-/// Read a u32 LE length prefix and validate it against [`DEFAULT_MAX_PAYLOAD_SIZE`].
+/// Validate an untrusted incoming length against [`DEFAULT_MAX_PAYLOAD_SIZE`].
 ///
 /// A malicious or corrupt frame can claim a multi-gigabyte length; allocating
-/// `vec![0u8; len]` from that untrusted value before reading the bytes is an
-/// unbounded-allocation DoS. Reject oversized fields up front instead.
-fn read_checked_len<R: Read>(r: &mut R) -> Result<usize, ProtoError> {
-    let len = r.read_u32::<LittleEndian>()?;
+/// or buffering that much on the strength of an untrusted value is an
+/// unbounded-allocation DoS. Reject oversized lengths up front instead.
+pub(crate) fn check_incoming_len(len: u32) -> Result<usize, ProtoError> {
     if len > DEFAULT_MAX_PAYLOAD_SIZE {
         return Err(ProtoError::PayloadTooLarge {
             len: len as usize,
@@ -23,6 +22,11 @@ fn read_checked_len<R: Read>(r: &mut R) -> Result<usize, ProtoError> {
         });
     }
     Ok(len as usize)
+}
+
+/// Read a u32 LE length prefix, checked by [`check_incoming_len`].
+fn read_checked_len<R: Read>(r: &mut R) -> Result<usize, ProtoError> {
+    check_incoming_len(r.read_u32::<LittleEndian>()?)
 }
 
 /// Read a length-prefixed string (u32 LE length + UTF-8 bytes).
@@ -72,9 +76,12 @@ pub(crate) fn checked_u32_len(len: usize) -> Result<u32, ProtoError> {
 /// Shared by the JSON-bodied messages (Hello, ServerSettings, ClientInfo) so
 /// the read/parse path lives in one place. A serde failure surfaces as
 /// [`ProtoError::Json`], not mislabeled as an I/O error.
+///
+/// The bytes are parsed directly (no separate UTF-8 pass or lossy copy), so
+/// invalid UTF-8 is a JSON error, as it is for C++ `json::parse`.
 pub fn read_json<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, ProtoError> {
-    let json = read_string(r)?;
-    Ok(serde_json::from_str(&json)?)
+    let json = read_bytes(r)?;
+    Ok(serde_json::from_slice(&json)?)
 }
 
 /// Write a value as a length-prefixed JSON payload (u32 LE length + UTF-8 JSON).
@@ -152,6 +159,16 @@ mod tests {
             read_bytes(&mut cursor),
             Err(ProtoError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn invalid_utf8_json_is_a_json_error() {
+        // nlohmann::json::parse rejects invalid UTF-8; so must we, rather than
+        // silently substituting U+FFFD into e.g. a client's host name.
+        let mut buf = Vec::new();
+        write_bytes(&mut buf, b"{\"k\":\"\xFF\"}").unwrap();
+        let res: Result<serde_json::Value, _> = read_json(&mut std::io::Cursor::new(&buf));
+        assert!(matches!(res, Err(ProtoError::Json(_))), "{res:?}");
     }
 
     #[test]
