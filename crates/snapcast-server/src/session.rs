@@ -260,25 +260,19 @@ impl SessionContext {
 
     /// Send routing updates to all clients in a group.
     async fn push_routing_for_group(&self, group_id: &str) {
-        let s = self.shared_state.lock().await;
-        let senders = self.routing_senders.lock().await;
-        let Some(group) = s.groups.iter().find(|g| g.id == group_id) else {
-            return;
-        };
-        for client_id in &group.clients {
-            if let Some(routing) = Self::build_routing(&s, client_id)
-                && let Some(tx) = senders.get(client_id)
-            {
-                let _ = tx.send(routing);
-            }
-        }
+        self.push_routing_for_groups(|g| g.id == group_id).await;
     }
 
     /// Send routing updates to all connected sessions.
     async fn push_routing_all(&self) {
+        self.push_routing_for_groups(|_| true).await;
+    }
+
+    /// Send routing updates to the clients of every group `filter` selects.
+    async fn push_routing_for_groups(&self, filter: impl Fn(&crate::state::Group) -> bool) {
         let s = self.shared_state.lock().await;
         let senders = self.routing_senders.lock().await;
-        for group in &s.groups {
+        for group in s.groups.iter().filter(|g| filter(g)) {
             for client_id in &group.clients {
                 if let Some(routing) = Self::build_routing(&s, client_id)
                     && let Some(tx) = senders.get(client_id)
@@ -286,6 +280,23 @@ impl SessionContext {
                     let _ = tx.send(routing);
                 }
             }
+        }
+    }
+
+    /// Make `update` the current settings of its client's session. With
+    /// `notify`, the session writes them to the client; without, they only
+    /// become what later pushes are compared against (for settings the
+    /// client already has).
+    async fn set_settings(&self, update: ClientSettingsUpdate, notify: bool) {
+        let senders = self.settings_senders.lock().await;
+        if let Some(tx) = senders.get(&update.client_id) {
+            tx.send_if_modified(|current| {
+                let changed = *current != update;
+                if changed {
+                    *current = update;
+                }
+                changed && notify
+            });
         }
     }
 
@@ -362,16 +373,7 @@ impl SessionServer {
     /// writes only the latest one. Settings equal to the client's current
     /// ones are not sent again.
     pub async fn push_settings(&self, update: ClientSettingsUpdate) {
-        let senders = self.ctx.settings_senders.lock().await;
-        if let Some(tx) = senders.get(&update.client_id) {
-            tx.send_if_modified(|current| {
-                let changed = *current != update;
-                if changed {
-                    *current = update;
-                }
-                changed
-            });
-        }
+        self.ctx.set_settings(update, true).await;
     }
 
     /// Update routing for a single client.
@@ -454,11 +456,11 @@ impl SessionServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         tracing::info!(%peer, transport, "Client connecting");
-        let chunk_sub = chunk_tx.subscribe();
         let ctx = Arc::clone(&self.ctx);
+        let chunk_tx = chunk_tx.clone();
         let event_tx = event_tx.clone();
         clients.spawn(async move {
-            let result = handle_client(stream, peer, chunk_sub, &ctx, event_tx).await;
+            let result = handle_client(stream, peer, chunk_tx, &ctx, event_tx).await;
             if let Err(e) = result {
                 tracing::debug!(%peer, error = %e, "Client session ended");
             }
@@ -477,7 +479,7 @@ pub(crate) struct IncomingClient {
 async fn handle_client<S>(
     stream: S,
     peer: SocketAddr,
-    chunk_rx: broadcast::Receiver<WireChunkData>,
+    chunk_tx: broadcast::Sender<WireChunkData>,
     ctx: &SessionContext,
     event_tx: mpsc::Sender<ServerEvent>,
 ) -> Result<()>
@@ -526,7 +528,14 @@ where
         joins_new_group,
         snapshot,
     } = ctx.register_session(&client_id, &hello, peer).await;
-    let initial_stream_id = routing_rx.borrow().stream_id.clone();
+    // Subscribed only now, so a connection that never completes its Hello
+    // neither keeps the encoders running nor collects a backlog of audio.
+    let chunk_rx = chunk_tx.subscribe();
+    drop(chunk_tx);
+    // What the client is set up for. Routing updates from here on are
+    // compared against it, so a stream switch before the session loop
+    // starts still sends the new stream's codec header.
+    let initial_routing = routing_rx.borrow().clone();
     let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
 
     // A client outside any group changes the topology. C++ snapserver
@@ -538,7 +547,7 @@ where
     let _ = event_tx
         .send(ServerEvent::ClientConnected {
             id: client_id.clone(),
-            hello: hello.clone(),
+            hello,
         })
         .await;
 
@@ -553,7 +562,7 @@ where
             ctx,
             &initial_settings,
             hello_id,
-            &initial_stream_id,
+            &initial_routing.stream_id,
             &client_id,
         )
         .await
@@ -564,6 +573,7 @@ where
                     writer,
                     chunk_rx,
                     settings_rx,
+                    routing: initial_routing,
                     routing_rx,
                     event_tx: event_tx.clone(),
                     client_id: client_id.clone(),
@@ -672,28 +682,11 @@ async fn send_initial_messages<W: AsyncWrite + Unpin>(
     client_id: &str,
 ) -> Result<()> {
     // ServerSettings (refers_to must match Hello id for client's pending request)
-    let ss_frame = serialize_msg(
-        MessageType::ServerSettings,
-        &MessagePayload::ServerSettings(server_settings(settings)),
-        hello_id,
-    )?;
-    write_frame(writer, &ss_frame)
-        .await
-        .context("write server settings")?;
+    write_settings(writer, settings, hello_id).await?;
 
     // CodecHeader for client's stream
     match ctx.codec_header_for(initial_stream_id).await {
-        Some(info) => {
-            send_msg(
-                writer,
-                MessageType::CodecHeader,
-                &MessagePayload::CodecHeader(CodecHeader {
-                    codec: info.codec,
-                    payload: info.header,
-                }),
-            )
-            .await?;
-        }
+        Some(info) => write_codec_header(writer, info).await?,
         None => {
             tracing::warn!(stream = %initial_stream_id, client = %client_id, "No codec header registered for stream");
         }
@@ -709,6 +702,8 @@ struct SessionLoop<'a, S> {
     writer: WriteHalf<S>,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     settings_rx: watch::Receiver<ClientSettingsUpdate>,
+    /// The routing the client is set up for (its stream's codec header sent).
+    routing: SessionRouting,
     routing_rx: watch::Receiver<SessionRouting>,
     event_tx: mpsc::Sender<ServerEvent>,
     client_id: String,
@@ -728,6 +723,7 @@ where
         mut writer,
         mut chunk_rx,
         mut settings_rx,
+        mut routing,
         mut routing_rx,
         event_tx,
         client_id,
@@ -735,7 +731,6 @@ where
         activity,
         ctx,
     } = args;
-    let mut routing = routing_rx.borrow().clone();
     let mut audio = AudioCursor::default();
 
     // Reading runs beside writing, so a request is read (and stamped) when
@@ -774,14 +769,22 @@ where
                             }
                         }
                         MessagePayload::ClientInfo(info) => {
-                            let snapshot = {
+                            let (snapshot, settings) = {
                                 let mut s = ctx.shared_state.lock().await;
                                 if let Some(c) = s.clients.get_mut(&client_id) {
                                     c.config.volume.percent = info.volume;
                                     c.config.volume.muted = info.muted;
                                 }
-                                s.clone()
+                                let settings = ClientSettingsUpdate::from_state(&s, &client_id, ctx.buffer_ms);
+                                (s.clone(), settings)
                             };
+                            // The client has these settings already: record
+                            // them without writing them back, or a later push
+                            // of its previous settings would be skipped as
+                            // unchanged.
+                            if let Some(settings) = settings {
+                                ctx.set_settings(settings, false).await;
+                            }
                             let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
                             // The mute flag gates audio for this session.
                             ctx.push_routing(&client_id).await;
@@ -796,22 +799,19 @@ where
                 }
                 Ok(()) = settings_rx.changed() => {
                     let update = settings_rx.borrow_and_update().clone();
-                    write_settings(&mut writer, &update).await?;
+                    write_settings(&mut writer, &update, 0).await?;
+                    tracing::debug!(
+                        volume = update.volume,
+                        latency = update.latency,
+                        "Pushed settings"
+                    );
                 }
                 Ok(()) = routing_rx.changed() => {
                     let new = routing_rx.borrow().clone();
                     if new.stream_id != routing.stream_id {
                         tracing::debug!(old = %routing.stream_id, new = %new.stream_id, "Stream switch");
                         if let Some(info) = ctx.codec_header_for(&new.stream_id).await {
-                            let frame = serialize_msg(
-                                MessageType::CodecHeader,
-                                &MessagePayload::CodecHeader(CodecHeader {
-                                    codec: info.codec,
-                                    payload: info.header,
-                                }),
-                                0,
-                            )?;
-                            write_frame(&mut writer, &frame).await.context("write codec header")?;
+                            write_codec_header(&mut writer, info).await?;
                         }
                     }
                     routing = new;
@@ -944,33 +944,43 @@ fn serialize_wire_chunk(chunk: &WireChunkData) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn server_settings(update: &ClientSettingsUpdate) -> ServerSettings {
-    ServerSettings {
+/// Write `update` as a `ServerSettings` message answering message
+/// `refers_to` (0 for an unsolicited push).
+async fn write_settings<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    update: &ClientSettingsUpdate,
+    refers_to: u16,
+) -> Result<()> {
+    let settings = ServerSettings {
         buffer_ms: update.buffer_ms,
         latency: update.latency,
         volume: update.volume,
         muted: update.muted,
-    }
-}
-
-async fn write_settings<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    update: &ClientSettingsUpdate,
-) -> Result<()> {
+    };
     let frame = serialize_msg(
         MessageType::ServerSettings,
-        &MessagePayload::ServerSettings(server_settings(update)),
+        &MessagePayload::ServerSettings(settings),
+        refers_to,
+    )?;
+    write_frame(writer, &frame).await.context("write settings")
+}
+
+async fn write_codec_header<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    info: StreamCodecInfo,
+) -> Result<()> {
+    let header = CodecHeader {
+        codec: info.codec,
+        payload: info.header,
+    };
+    let frame = serialize_msg(
+        MessageType::CodecHeader,
+        &MessagePayload::CodecHeader(header),
         0,
     )?;
     write_frame(writer, &frame)
         .await
-        .context("write settings")?;
-    tracing::debug!(
-        volume = update.volume,
-        latency = update.latency,
-        "Pushed settings"
-    );
-    Ok(())
+        .context("write codec header")
 }
 
 async fn validate_auth<S: AsyncWrite + Unpin>(
@@ -1574,6 +1584,127 @@ mod tests {
         })
         .await
         .expect("latest settings delivered");
+    }
+
+    #[tokio::test]
+    async fn push_after_the_client_changed_its_own_volume_is_sent() {
+        let server = test_server(crate::state::ServerState::default());
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel(16);
+        let (mut frames, mut writer) =
+            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        // The Hello was answered with volume 100; the client turns itself down.
+        send_msg(
+            &mut writer,
+            MessageType::ClientInfo,
+            &MessagePayload::ClientInfo(snapcast_proto::message::client_info::ClientInfo {
+                volume: 50,
+                muted: false,
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.ctx.shared_state.lock().await.clients["c1"]
+                .config
+                .volume
+                .percent
+                != 50
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("ClientInfo recorded");
+
+        // Setting it back to 100 must reach the client.
+        server
+            .push_settings(ClientSettingsUpdate {
+                client_id: "c1".into(),
+                buffer_ms: 1000,
+                latency: 0,
+                volume: 100,
+                muted: false,
+            })
+            .await;
+        let next_settings = async {
+            loop {
+                if let MessagePayload::ServerSettings(ss) = frames.next().await.unwrap().payload {
+                    return ss.volume;
+                }
+            }
+        };
+        let volume = tokio::time::timeout(Duration::from_secs(2), next_settings)
+            .await
+            .expect("settings pushed");
+        assert_eq!(volume, 100);
+    }
+
+    #[tokio::test]
+    async fn stream_switch_during_handshake_sends_the_new_codec_header() {
+        let server = test_server(crate::state::ServerState::default());
+        server.register_stream_codec("default", "pcm", &[1]).await;
+        server.register_stream_codec("other", "flac", &[2]).await;
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel(16);
+        // Too small for the ServerSettings frame: the handshake stalls until
+        // the client reads.
+        let (client, served) = tokio::io::duplex(16);
+        let (event_tx, _events) = mpsc::channel(16);
+        let peer = "127.0.0.1:1".parse().unwrap();
+        server.spawn_client(&mut clients, served, peer, "test", &chunk_tx, &event_tx);
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut frames = FrameReader::new(reader);
+        send_msg(
+            &mut writer,
+            MessageType::Hello,
+            &MessagePayload::Hello(hello("c1")),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !server.ctx.routing_senders.lock().await.contains_key("c1") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("client registered");
+
+        // Switch the client's group while its handshake is still pending.
+        {
+            let mut s = server.ctx.shared_state.lock().await;
+            let gid = s.group_of("c1").unwrap().id.clone();
+            s.set_group_stream(&gid, "other");
+        }
+        server.update_routing_all().await;
+
+        let mut codecs = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while codecs.len() < 2 {
+                if let MessagePayload::CodecHeader(h) = frames.next().await.unwrap().payload {
+                    codecs.push(h.codec);
+                }
+            }
+        })
+        .await
+        .expect("both codec headers sent");
+        assert_eq!(codecs, ["pcm", "flac"]);
+    }
+
+    #[tokio::test]
+    async fn sessions_subscribe_to_audio_only_after_hello() {
+        let server = test_server(crate::state::ServerState::default());
+        let mut clients = JoinSet::new();
+        let (chunk_tx, _) = broadcast::channel::<WireChunkData>(16);
+        let (_client, served) = tokio::io::duplex(4096);
+        let (event_tx, _events) = mpsc::channel(16);
+        let peer = "127.0.0.1:1".parse().unwrap();
+        server.spawn_client(&mut clients, served, peer, "test", &chunk_tx, &event_tx);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(chunk_tx.receiver_count(), 0, "no Hello yet");
+
+        let (_frames, _writer) = connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        assert_eq!(chunk_tx.receiver_count(), 1);
     }
 
     #[tokio::test]

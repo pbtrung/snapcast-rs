@@ -719,6 +719,15 @@ fn spawn_stream_encoder(
     stop_tx
 }
 
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Parse a configured sample format and require it to be concrete PCM.
 fn parse_pcm_format(value: &str) -> anyhow::Result<SampleFormat> {
     let format: SampleFormat = value
@@ -928,8 +937,9 @@ impl SnapServer {
         let session_for_run = Arc::clone(&session_srv);
         let session_event_tx = event_tx.clone();
         let session_chunk_tx = self.chunk_tx.clone();
-        // Aborting this task on stop also ends every client session.
-        let session_handle = tokio::spawn(async move {
+        // Aborting this task on stop also ends every client session; the
+        // guard aborts it too if this future is dropped instead.
+        let _session_task = AbortOnDrop(tokio::spawn(async move {
             session_for_run
                 .run(
                     listener,
@@ -938,7 +948,7 @@ impl SnapServer {
                     session_event_tx,
                 )
                 .await;
-        });
+        }));
 
         let dispatcher = command::Dispatcher {
             shared_state: Arc::clone(&shared_state),
@@ -967,7 +977,6 @@ impl SnapServer {
                     match cmd.map(ServerCommand::split_origin) {
                         Some((_, ServerCommand::Stop)) | None => {
                             tracing::info!("Server stopped");
-                            session_handle.abort();
                             return Ok(());
                         }
                         Some((origin, cmd)) => dispatcher.dispatch(origin, cmd).await,
@@ -1107,6 +1116,28 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), good.closed())
             .await
             .expect("encoder stopped with the server");
+    }
+
+    #[tokio::test]
+    async fn dropping_serve_stops_accepting_clients() {
+        let (mut server, _events) = SnapServer::new(ServerConfig::default());
+        let audio = server.add_stream("s");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move { server.serve(listener).await });
+        tokio::net::TcpStream::connect(addr).await.expect("serving");
+        serve.abort();
+        let _ = serve.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), audio.closed())
+            .await
+            .expect("encoder stopped");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tokio::net::TcpStream::connect(addr).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("listener closed with the dropped server");
     }
 
     #[tokio::test]
