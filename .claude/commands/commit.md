@@ -21,7 +21,7 @@ description: Commit staged/modified changes with a detailed message and push, no
    (include `Cargo.lock` when dependencies changed).
 4. Write a **detailed** commit message:
    - Subject line: Conventional Commits style used in this repo
-     (`feat:`, `fix:`, `refactor:`, `docs:`, `ci:`, `chore:`), imperative mood.
+     (`feat:`, `fix:`, `perf:`, `refactor:`, `test:`, `docs:`, `build:`, `ci:`, `chore:`), imperative mood.
    - Body: explain _what_ changed and _why_, as bullet points if there are multiple distinct changes.
    - Base the message only on the actual diff — do not include conversational back-and-forth, dead ends, or trial-and-error from the session.
 5. Create the commit using a HEREDOC so formatting is preserved, e.g.:

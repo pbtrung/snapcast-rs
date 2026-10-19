@@ -7,6 +7,11 @@ gone, and `snapcast-server` is now free of `unsafe` entirely. This document
 records why FLAC encoding *was* C, what changed on crates.io to make a
 pure-Rust move viable, and why `flacenc` was chosen.
 
+Still current as of 0.99.17: `flacenc` 0.5 is the encoder, behind the `flac`
+feature, which `snapcast-server` and `snapserver-rs` enable by default.
+`snapserver-rs --no-default-features` builds without it (PCM becomes the
+default codec).
+
 ## TL;DR
 
 **Migrated to [`flacenc`](https://crates.io/crates/flacenc).** Both `flacenc`
@@ -102,7 +107,7 @@ shape as FFmpeg's `avcodec_send_frame`/`avcodec_receive_packet`. The header
 (STREAMINFO) is exposed separately via `encoder.output_params().extradata`,
 populated immediately at construction with placeholder stats for the
 fields a live stream can't know yet (total samples, min/max frame size,
-MD5) — matching exactly how our current `libflac-sys` header already works.
+MD5) — matching exactly how the `libflac-sys` header of the time worked.
 `receive_packet()` only ever yields raw frame-data packets. Frame numbering
 persists on the encoder's own internal state across the whole session — one
 less invariant for an integration to track than `flacenc` requires.
@@ -210,8 +215,9 @@ adoption).
   feature now pulls only `flacenc` (no system library, no C toolchain).
 - The FLAC write-callback was the last `unsafe` in `snapcast-server`, so the
   crate is now entirely `unsafe`-free under its `#![deny(unsafe_code)]`.
-- Validated three independent ways: the existing end-to-end round trip
-  (server encode → `symphonia` client decode) in `snapcast-tests/tests/audio.rs`,
+- Validated three independent ways: the end-to-end round trip
+  (server encode → `symphonia` client decode, now checked bit-exact in
+  `snapcast-tests/tests/audio_correctness.rs`),
   unit tests for 16-bit, 24-bit, buffering cadence, and header/frame
   separation, and a manual `flac -t` (C reference) pass over the production
   buffering output.

@@ -38,6 +38,8 @@ Server (`snapserver-rs`; `flac` and `opus` also on the `snapcast-server` library
 | `flac`   | ✅      | none      | FLAC encoding (pure Rust, flacenc) |
 | `opus`   | —       | none (bundled libopus, needs cmake) | Opus encoding |
 
+Without `flac` (`--no-default-features`) the server's default codec is PCM.
+
 Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pure Rust):
 
 | Feature     | Default | C dep | Description |
@@ -147,7 +149,7 @@ covered by this login.
 |--------|---------|-------|-----------|---------|
 | PCM    | ✅ always | none | 16/24/32-bit | zero |
 | FLAC   | ✅ default | none | 16/24-bit (decoded to f32) | 24ms (block size) |
-| Opus   | optional | bundled libopus | 16-bit | 20ms |
+| Opus   | optional | bundled libopus | lossy (16-bit or f32 input) | 20ms |
 
 FLAC supports up to 24-bit, 96 kHz and 8 channels; use PCM for anything beyond that.
 
@@ -174,6 +176,7 @@ cd snapcast-rs
 cargo build --release                              # default: flac
 cargo build --release -p snapserver-rs --features opus  # + Opus
 cargo build --release -p snapclient-rs --features resampler  # + client resampling
+cargo build --release -p snapserver-rs --no-default-features  # PCM only, no FLAC
 ```
 
 The binaries land in `target/release/snapserver-rs` and `target/release/snapclient-rs`.

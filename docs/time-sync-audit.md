@@ -16,6 +16,10 @@ proposed fixes. Date: 2026-10-10 (at 0.99.15).
 
 ## Implementation status (2026-10-14)
 
+Everything below this section ("Components reviewed" to "Suggested order")
+is the audit as written, against the 0.99.15 code; line references and the
+"Simulator baseline" describe that code, not the current one.
+
 | Item | Status |
 |---|---|
 | #1 Reconnect to another server clock | Done: 5-sample probation on each new connection, plus restart after 3 consecutive impossible exchanges (`TimeProvider::new_connection`, `RESTART_SAMPLES`) |
@@ -204,6 +208,7 @@ These need no protocol change either, but are more work:
 
 - **Burst syncs:** send 3–4 requests back to back each second and keep the
   one with the fastest round trip. Client only; works with C++ servers.
+  (Tried and dropped, see the status table.)
 - **Kernel receive timestamps** (`SO_TIMESTAMPING`, Linux) on both ends.
   They arrive in `CLOCK_REALTIME` and need converting to the monotonic
   clock.
@@ -254,6 +259,9 @@ card runs on its own crystal, which PTP doesn't discipline, so a resampler
 still has to follow it.
 
 ## Suggested order
+
+Steps 1–4 are done (the output delay without the loopback measurement),
+step 5 was tried and dropped, step 6 is open.
 
 1. Reconnect/suspend detection (#1, #2).
 2. Measure, then fix the output delay (#3).
