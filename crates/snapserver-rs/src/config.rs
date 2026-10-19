@@ -102,7 +102,10 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
         get_str(s, "doc_root", |v| config.doc_root = non_empty(v));
     }
 
-    if let Some(s) = ini.section(Some("tcp-control")) {
+    // Before C++ snapserver 0.31, [tcp-control] was [tcp], and the
+    // [tcp-streaming] keys were in [stream]; configs written for those
+    // versions still work there.
+    if let Some(s) = section_or_legacy(&ini, "tcp-control", "tcp") {
         get_bool(s, "enabled", |v| config.control_enabled = v);
         get_parsed(s, "port", |v| config.control_port = v);
         get_bind_address(s, |v| config.control_bind_address = v.to_string());
@@ -120,7 +123,7 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
         }
     }
 
-    if let Some(s) = ini.section(Some("tcp-streaming")) {
+    if let Some(s) = section_or_legacy(&ini, "tcp-streaming", "stream") {
         get_parsed(s, "port", |v| config.stream_port = v);
         get_bind_address(s, |v| config.stream_bind_address = v.to_string());
     }
@@ -149,6 +152,25 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
     }
 
     config
+}
+
+/// Section `[name]`, or when there is none, the keys `[legacy]` held before
+/// they moved to `[name]`.
+fn section_or_legacy<'a>(ini: &'a Ini, name: &str, legacy: &str) -> Option<&'a ini::Properties> {
+    if let Some(section) = ini.section(Some(name)) {
+        return Some(section);
+    }
+    let section = ini.section(Some(legacy))?;
+    if ["port", "bind_to_address", "bind_address", "enabled"]
+        .iter()
+        .any(|key| section.contains_key(key))
+    {
+        tracing::warn!(
+            "Reading [{name}] settings from [{legacy}], as C++ snapserver before 0.31 did; \
+             move them to [{name}]"
+        );
+    }
+    Some(section)
 }
 
 /// Parse a duration such as `10`, `10s`, `5m`, `12h` or `2d` (bare numbers
@@ -848,6 +870,32 @@ mod tests {
         assert!(defaults.http_enabled && defaults.control_enabled);
         assert_eq!(defaults.chunk_ms, None);
         assert!(!defaults.server.send_audio_to_muted);
+    }
+
+    /// Regression: a config for C++ snapserver before 0.31 ([tcp] for the
+    /// control server, the stream server's keys in [stream]) silently got
+    /// the default ports and addresses.
+    #[test]
+    fn pre_0_31_sections_are_read() {
+        let config = config_from(
+            "[tcp]\nenabled = false\nport = 2705\nbind_to_address = 127.0.0.1\n\
+             [stream]\nport = 2704\nbind_to_address = ::1\nsource = pipe:///tmp/x?name=x\n",
+        );
+        assert!(!config.control_enabled);
+        assert_eq!(config.control_port, 2705);
+        assert_eq!(config.control_bind_address, "127.0.0.1");
+        assert_eq!(config.stream_port, 2704);
+        assert_eq!(config.stream_bind_address, "::1");
+        assert_eq!(config.sources, ["pipe:///tmp/x?name=x"]);
+
+        // The current sections win; the old ones are then ignored.
+        let config = config_from(
+            "[tcp]\nport = 2705\n[tcp-control]\nbind_to_address = 127.0.0.1\n\
+             [stream]\nport = 2704\n[tcp-streaming]\nbind_to_address = ::1\n",
+        );
+        assert_eq!(config.control_port, 1705);
+        assert_eq!(config.stream_port, 1704);
+        assert_eq!(config.stream_bind_address, "::1");
     }
 
     #[test]
