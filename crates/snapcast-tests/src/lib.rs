@@ -2,6 +2,9 @@
 
 pub mod sync;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
+
 use snapcast_client::{ClientConfig, ClientEvent, SnapClient};
 use snapcast_proto::message::hello::Hello;
 use snapcast_server::status::ServerStatus;
@@ -10,6 +13,10 @@ use tokio::sync::mpsc;
 
 /// Interleaved f32 samples per test frame: 10 ms of 48 kHz stereo.
 const FRAME_SAMPLES: usize = 960;
+
+/// FLAC block size of the server's encoder, in frames (its `BLOCK_SIZE` is
+/// private). Each block reaches the client as one decoded audio frame.
+pub const FLAC_BLOCK_FRAMES: usize = 1152;
 
 /// One 10 ms frame of a non-silent ramp in [-1, 1) (48 kHz stereo f32).
 pub fn tone_frame(timestamp_usec: i64) -> AudioFrame {
@@ -163,6 +170,132 @@ where
             Ok(None) => panic!("Event channel closed"),
             _ => panic!("Timed out waiting for expected event"),
         }
+    }
+}
+
+/// Wait until the server reports any client connected; returns its id.
+pub async fn expect_client_connected(events: &mut mpsc::Receiver<ServerEvent>) -> String {
+    expect_server_event(events, 3000, |e| match e {
+        ServerEvent::ClientConnected { id, .. } => Some(id),
+        _ => None,
+    })
+    .await
+}
+
+/// Wait until the server reports client `id` connected.
+pub async fn expect_client_id_connected(events: &mut mpsc::Receiver<ServerEvent>, id: &str) {
+    expect_server_event(events, 3000, |e| {
+        matches!(e, ServerEvent::ClientConnected { id: ref got, .. } if got == id).then_some(())
+    })
+    .await
+}
+
+/// Wait until the server reports client `id` disconnected.
+pub async fn expect_client_disconnected(events: &mut mpsc::Receiver<ServerEvent>, id: &str) {
+    expect_server_event(events, 3000, |e| {
+        matches!(e, ServerEvent::ClientDisconnected { id: ref got } if got == id).then_some(())
+    })
+    .await
+}
+
+/// Assert that no server event matching `f` arrives within `window_ms`.
+/// Proving an absence needs a fixed window; keep it as short as the
+/// property allows.
+pub async fn expect_no_server_event<F>(
+    events: &mut mpsc::Receiver<ServerEvent>,
+    window_ms: u64,
+    what: &str,
+    mut f: F,
+) where
+    F: FnMut(&ServerEvent) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(window_ms);
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(event)) if f(&event) => panic!("{what}: {event:?}"),
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
+/// After a `ClientCommand::Stop`: the client's event channel closes (its run
+/// loop returned) without a `Disconnected`, which would mean the reconnect
+/// loop ran instead of a clean shutdown.
+pub async fn expect_clean_stop(events: &mut mpsc::Receiver<ClientEvent>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(None) => return,
+            Ok(Some(ClientEvent::Disconnected { reason })) => {
+                panic!("clean client Stop emitted Disconnected: {reason}")
+            }
+            Ok(Some(_)) => {}
+            Err(_) => panic!("client did not shut down after Stop"),
+        }
+    }
+}
+
+/// Receive decoded audio until at least `min_samples` interleaved samples
+/// arrived, failing after `timeout_ms`. Returns the frames in order.
+pub async fn collect_audio(
+    audio_rx: &mut mpsc::Receiver<snapcast_client::AudioFrame>,
+    min_samples: usize,
+    timeout_ms: u64,
+) -> Vec<snapcast_client::AudioFrame> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut frames = Vec::new();
+    let mut total = 0;
+    while total < min_samples {
+        let frame = tokio::time::timeout_at(deadline, audio_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out with {total} of {min_samples} samples"))
+            .expect("audio channel closed");
+        total += frame.samples.len();
+        frames.push(frame);
+    }
+    frames
+}
+
+/// A TCP relay on a port of its own that forwards each new connection to the
+/// current upstream port. Clients keep one address while the server behind
+/// it is replaced, without rebinding a freed port that a parallel test may
+/// have taken meanwhile.
+pub struct Relay {
+    /// Port clients connect to.
+    pub port: u16,
+    upstream: Arc<AtomicU16>,
+}
+
+impl Relay {
+    /// Start relaying to `127.0.0.1:upstream`.
+    pub async fn start(upstream: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = Arc::new(AtomicU16::new(upstream));
+        let target = Arc::clone(&upstream);
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let port = target.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // No upstream: dropping `client` closes it, as a dead
+                    // server would.
+                    let Ok(mut server) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+                    else {
+                        return;
+                    };
+                    tokio::io::copy_bidirectional(&mut client, &mut server)
+                        .await
+                        .ok();
+                });
+            }
+        });
+        Self { port, upstream }
+    }
+
+    /// Forward connections accepted from now on to `127.0.0.1:upstream`.
+    pub fn set_upstream(&self, upstream: u16) {
+        self.upstream.store(upstream, Ordering::SeqCst);
     }
 }
 

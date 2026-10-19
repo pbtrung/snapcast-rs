@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use snapcast_server::{ServerConfig, ServerEvent};
 use snapcast_tests::{
-    RawClient, client_connected, connect_client_with_id, expect_server_event, start_server_with,
+    RawClient, client_connected, connect_client_with_id, expect_client_connected,
+    expect_client_disconnected, expect_client_id_connected, expect_no_server_event,
+    expect_server_event, start_server_with,
 };
 
 fn config(idle: Option<Duration>, remove_after: Option<Duration>) -> ServerConfig {
@@ -26,15 +28,8 @@ async fn silent_session_is_closed_after_idle_timeout() {
     let started = tokio::time::Instant::now();
     // Sends its Hello, then nothing — like a peer that lost power.
     let mut silent = RawClient::connect(server.port, "silent").await;
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientConnected { ref id, .. } if id == "silent").then_some(())
-    })
-    .await;
-
-    expect_server_event(&mut server.events, 3000, |e| {
-        matches!(e, ServerEvent::ClientDisconnected { ref id } if id == "silent").then_some(())
-    })
-    .await;
+    expect_client_id_connected(&mut server.events, "silent").await;
+    expect_client_disconnected(&mut server.events, "silent").await;
     assert!(
         started.elapsed() >= Duration::from_millis(400),
         "not closed before the timeout"
@@ -63,22 +58,19 @@ async fn connection_without_hello_is_closed_after_idle_timeout() {
 
 #[tokio::test]
 async fn syncing_client_stays_connected() {
-    // Snapclient sends a time sync request every second.
-    let mut server = start_server_with(config(Some(Duration::from_millis(1500)), None)).await;
+    // Snapclient sends a time sync request about every second (75-125 %
+    // jittered) once its 50 quick syncs (100 ms apart) are done. The window
+    // covers the switch to the slow schedule and two idle timeouts after it.
+    let mut server = start_server_with(config(Some(Duration::from_secs(2)), None)).await;
     let _client = connect_client_with_id(server.port, "alive").await;
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientConnected { ref id, .. } if id == "alive").then_some(())
-    })
+    expect_client_id_connected(&mut server.events, "alive").await;
+    expect_no_server_event(
+        &mut server.events,
+        9_000,
+        "active client must not be dropped",
+        |e| matches!(e, ServerEvent::ClientDisconnected { .. }),
+    )
     .await;
-    let disconnected = tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            if let Some(ServerEvent::ClientDisconnected { .. }) = server.events.recv().await {
-                return;
-            }
-        }
-    })
-    .await;
-    assert!(disconnected.is_err(), "active client must not be dropped");
     assert_eq!(client_connected(&server.cmd, "alive").await, Some(true));
 }
 
@@ -90,16 +82,10 @@ async fn long_disconnected_client_is_removed_from_state() {
     let keep = RawClient::connect(server.port, "keep").await;
     let gone = RawClient::connect(server.port, "gone").await;
     for _ in 0..2 {
-        expect_server_event(&mut server.events, 2000, |e| {
-            matches!(e, ServerEvent::ClientConnected { .. }).then_some(())
-        })
-        .await;
+        expect_client_connected(&mut server.events).await;
     }
     drop(gone);
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientDisconnected { ref id } if id == "gone").then_some(())
-    })
-    .await;
+    expect_client_disconnected(&mut server.events, "gone").await;
     assert_eq!(client_connected(&server.cmd, "gone").await, Some(false));
 
     expect_server_event(&mut server.events, 3000, |e| match e {

@@ -3,10 +3,9 @@
 //! first one in a combined payload.
 
 use snapcast_client::ClientEvent;
-use snapcast_tests::{connect_client, expect_event, start_server};
-
-/// FLAC block size in frames (mirrors the server encoder's private constant).
-const FLAC_BLOCK_FRAMES: usize = 1152;
+use snapcast_tests::{
+    FLAC_BLOCK_FRAMES, collect_audio, connect_client, expect_event, start_server,
+};
 const CHANNELS: usize = 2;
 
 #[tokio::test]
@@ -31,19 +30,21 @@ async fn flac_frame_spanning_several_blocks_decodes_completely() {
         .await
         .unwrap();
 
-    let mut timestamps = Vec::new();
-    let mut decoded = 0;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while decoded < FLAC_BLOCK_FRAMES * BLOCKS * CHANNELS {
-        let frame = tokio::time::timeout_at(deadline, client.audio_rx.recv())
-            .await
-            .expect("timed out: not every FLAC block was decoded")
-            .expect("audio channel closed");
+    let frames = collect_audio(
+        &mut client.audio_rx,
+        FLAC_BLOCK_FRAMES * BLOCKS * CHANNELS,
+        5000,
+    )
+    .await;
+    assert_eq!(frames.len(), BLOCKS, "one decoded frame per FLAC block");
+    for frame in &frames {
         assert_eq!(frame.samples.len(), FLAC_BLOCK_FRAMES * CHANNELS);
-        decoded += frame.samples.len();
-        timestamps.push(frame.timestamp_usec);
     }
-    assert_eq!(timestamps.len(), BLOCKS);
+    let timestamps: Vec<i64> = frames.iter().map(|f| f.timestamp_usec).collect();
+    assert_eq!(
+        timestamps[0], 1_000_000_000,
+        "first block keeps the input timestamp"
+    );
     // 1152 frames at 48 kHz = 24 ms between consecutive blocks.
     for pair in timestamps.windows(2) {
         assert_eq!(

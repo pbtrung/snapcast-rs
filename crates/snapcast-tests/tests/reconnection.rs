@@ -1,153 +1,82 @@
-//! Wave-2 integration tests: client reconnection & resync.
+//! Client reconnection.
 //!
-//! Coverage:
-//!   * `client_stop_after_handshake_cleanly_ends_session` — a client-initiated
-//!     `Stop` right after the handshake (before any audio) cleanly ends the
-//!     session: the server observes `ClientDisconnected`, and the client does
-//!     *not* surface a spurious `Disconnected` failure event. (`shutdown.rs`
-//!     covers the same with audio flowing.)
-//!   * `client_to_dead_address_emits_disconnected` — a client pointed at an
-//!     address with no server emits `Disconnected`.
-//!   * `fresh_server_completes_full_handshake_and_sync` — after an old
-//!     server/client pair is torn down, a *fresh* server brought up on a new
-//!     port and a *new* client complete the full handshake/sync sequence
-//!     (Connected -> ServerSettings -> StreamStarted -> TimeSyncComplete),
-//!     proving recovery of the whole pipeline.
+//! - A client whose server goes away reports `Disconnected` and, once a
+//!   server answers on its address again, reconnects by itself and completes
+//!   the whole handshake and time sync again (with the same client id).
+//! - A client pointed at an address with no server reports `Disconnected`.
+//! - A client-initiated `Stop` right after the handshake ends the session
+//!   without a spurious `Disconnected` (`shutdown.rs` covers the same with
+//!   audio flowing).
 //!
-//! On why we don't drop a live server and watch an *existing* client
-//! reconnect: the server spawns each accepted client onto a **detached**
-//! `tokio::spawn` task (see `session.rs::run`), and those per-client tasks are
-//! not reachable from any server handle. Dropping every `TestServer` handle (or
-//! sending `ServerCommand::Stop`) stops the accept loop and frees the port, but
-//! within a single test runtime the orphaned per-client task keeps the socket
-//! open, so an already-connected client does not promptly observe the drop.
-//! The harness therefore cannot restart a server *under a live client* in
-//! process, and we take the documented fallback: assert clean client Stop,
-//! dead-address Disconnected, and a full fresh-server + fresh-client resync.
-//!
-//! All synchronization is event-driven (channel `recv` under a deadline); there
-//! are no fixed "settle" sleeps.
+//! The client connects through a [`Relay`], so the server behind its address
+//! can be replaced without rebinding the freed port, which a parallel test
+//! may have taken in the meantime.
 
-use snapcast_client::ClientEvent;
-use snapcast_server::ServerEvent;
+use snapcast_client::{ClientCommand, ClientConfig, ClientEvent};
+use snapcast_server::ServerCommand;
 use snapcast_tests::{
-    connect_client, constant_frame, expect_event, expect_server_event, start_server,
+    FLAC_BLOCK_FRAMES, Relay, collect_audio, connect_client, connect_client_with,
+    expect_clean_stop, expect_client_disconnected, expect_client_id_connected, expect_event,
+    start_server, tone_frame,
 };
-use tokio::sync::mpsc;
 
-/// Push `count` short silence frames with monotonically increasing timestamps,
-/// so the client's audio/sync pipeline has chunks to time-align against. This
-/// keeps `TimeSyncComplete` prompt and deterministic. Best-effort: stops early
-/// if the receiver is gone.
-async fn pump_silence(audio_tx: &mpsc::Sender<snapcast_server::AudioFrame>, count: usize) {
-    let mut ts: i64 = 2_000_000_000; // well away from 0
-    for _ in 0..count {
-        if audio_tx.send(constant_frame(0.0, ts)).await.is_err() {
-            break;
-        }
-        ts += 10_000; // 10 ms per frame
-    }
-}
-
-/// Drive a freshly connected client through the full connect/sync sequence:
-/// Connected -> ServerSettings -> StreamStarted -> TimeSyncComplete.
-async fn expect_full_sync(
-    events: &mut mpsc::Receiver<ClientEvent>,
-    audio_tx: &mpsc::Sender<snapcast_server::AudioFrame>,
-) {
-    // Prime the pipeline with audio before waiting on the handshake events.
-    pump_silence(audio_tx, 40).await;
-
-    expect_event(events, 2000, |e| {
-        matches!(e, ClientEvent::Connected { .. }).then_some(())
-    })
-    .await;
-
-    let (buffer_ms, volume) = expect_event(events, 2000, |e| match e {
-        ClientEvent::ServerSettings {
-            buffer_ms, volume, ..
-        } => Some((buffer_ms, volume)),
-        _ => None,
-    })
-    .await;
-    assert!(buffer_ms > 0, "expected a positive buffer_ms");
-    assert!(volume > 0, "expected a positive volume");
-
-    expect_event(events, 2000, |e| match e {
-        ClientEvent::StreamStarted { codec, format } => {
-            assert!(!codec.is_empty(), "codec name must be non-empty");
-            assert!(format.rate() > 0, "sample rate must be positive");
-            Some(())
-        }
-        _ => None,
-    })
-    .await;
-
-    // Time sync can take a few real-time seconds; keep audio trickling in.
-    pump_silence(audio_tx, 40).await;
-    expect_event(events, 10_000, |e| match e {
-        ClientEvent::TimeSyncComplete { .. } => Some(()),
-        _ => None,
-    })
-    .await;
-}
-
-/// Client-initiated `Stop` right after the handshake must cleanly end the
-/// session: the server observes a `ClientDisconnected`, and the client's own
-/// run loop returns `Ok` *without* surfacing a spurious `Disconnected` failure
-/// event.
 #[tokio::test]
-async fn client_stop_after_handshake_cleanly_ends_session() {
-    let mut server = start_server().await;
-    let mut client = connect_client(server.port).await;
-
-    // Get to a known-good state and learn our server-side id.
-    expect_event(&mut client.events, 2000, |e| match e {
-        ClientEvent::ServerSettings { .. } => Some(()),
-        _ => None,
+async fn client_reconnects_after_the_server_restarts() {
+    const ID: &str = "reconnecting";
+    let mut server1 = start_server().await;
+    let relay = Relay::start(server1.port).await;
+    let mut client = connect_client_with(ClientConfig {
+        host: "127.0.0.1".into(),
+        port: relay.port,
+        host_id: ID.into(),
+        ..ClientConfig::default()
     })
     .await;
 
-    let client_id = expect_server_event(&mut server.events, 2000, |e| match e {
-        ServerEvent::ClientConnected { id, .. } => Some(id),
+    expect_event(&mut client.events, 2000, |e| {
+        matches!(e, ClientEvent::ServerSettings { .. }).then_some(())
+    })
+    .await;
+    expect_client_id_connected(&mut server1.events, ID).await;
+
+    // Stopping the server ends every session; the client notices at once.
+    server1.cmd.send(ServerCommand::Stop).await.unwrap();
+    let reason = expect_event(&mut client.events, 3000, |e| match e {
+        ClientEvent::Disconnected { reason } => Some(reason),
         _ => None,
     })
     .await;
-    assert!(!client_id.is_empty());
+    assert!(!reason.is_empty(), "Disconnected carries a reason");
 
-    // Client asks to stop.
-    client
-        .cmd
-        .send(snapcast_client::ClientCommand::Stop)
-        .await
-        .ok();
-
-    // Server must observe the disconnect for exactly this client.
-    expect_server_event(&mut server.events, 3000, |e| match e {
-        ServerEvent::ClientDisconnected { id } if id == client_id => Some(()),
-        _ => None,
+    // A new server behind the same address: the client's retry loop finds it.
+    let mut server2 = start_server().await;
+    relay.set_upstream(server2.port);
+    expect_event(&mut client.events, 5000, |e| {
+        matches!(e, ClientEvent::ServerSettings { .. }).then_some(())
+    })
+    .await;
+    expect_client_id_connected(&mut server2.events, ID).await;
+    expect_event(&mut client.events, 2000, |e| {
+        matches!(e, ClientEvent::StreamStarted { .. }).then_some(())
     })
     .await;
 
-    // The client's event stream should now close (run() returned Ok, so the
-    // event sender was dropped) WITHOUT ever emitting a Disconnected failure.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
-    loop {
-        match tokio::time::timeout_at(deadline, client.events.recv()).await {
-            // Channel closed: the run loop exited cleanly. Expected terminal.
-            Ok(None) => break,
-            // A late benign event is fine to ignore, but a Disconnected here
-            // would mean the clean stop was mis-reported as a failure.
-            Ok(Some(ClientEvent::Disconnected { reason })) => {
-                panic!("clean client Stop emitted a Disconnected failure: {reason}");
-            }
-            Ok(Some(_)) => continue,
-            Err(_) => panic!("client event stream neither closed nor produced a terminal event"),
-        }
+    // Audio flows again, and the time sync of the new connection completes.
+    let mut ts = 1_000_000_000i64;
+    for _ in 0..20 {
+        server2.audio_tx.send(tone_frame(ts)).await.unwrap();
+        ts += 10_000;
     }
+    collect_audio(&mut client.audio_rx, 2 * FLAC_BLOCK_FRAMES * 2, 5000).await;
+    expect_event(&mut client.events, 10_000, |e| {
+        matches!(e, ClientEvent::TimeSyncComplete { .. }).then_some(())
+    })
+    .await;
+
+    client.cmd.send(ClientCommand::Stop).await.ok();
+    expect_client_disconnected(&mut server2.events, ID).await;
 }
 
-/// A client pointed at an address with no server must emit `Disconnected`.
 #[tokio::test]
 async fn client_to_dead_address_emits_disconnected() {
     // A socket bound but not listening holds the port, so no parallel test's
@@ -157,83 +86,36 @@ async fn client_to_dead_address_emits_disconnected() {
     let dead_port = socket.local_addr().unwrap().port();
 
     let mut client = connect_client(dead_port).await;
-
     let reason = expect_event(&mut client.events, 5000, |e| match e {
         ClientEvent::Disconnected { reason } => Some(reason),
+        ClientEvent::Connected { .. } => panic!("nothing listens on the dead port"),
         _ => None,
     })
     .await;
-    assert!(
-        !reason.is_empty(),
-        "Disconnected to a dead address should carry a reason"
-    );
+    assert!(!reason.is_empty(), "Disconnected carries a reason");
 
-    client
-        .cmd
-        .send(snapcast_client::ClientCommand::Stop)
-        .await
-        .ok();
+    // Stop also ends the retry loop: the event channel closes.
+    client.cmd.send(ClientCommand::Stop).await.ok();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while client.events.recv().await.is_some() {}
+    })
+    .await;
+    assert!(closed.is_ok(), "Stop ends a client that is retrying");
 }
 
-/// Recovery of the full pipeline: an old server/client pair is brought up and
-/// then fully torn down (client Stop, then old server handles dropped). A brand
-/// new server is started and a brand new client completes the entire
-/// handshake/sync sequence again — Connected -> ServerSettings -> StreamStarted
-/// -> TimeSyncComplete — proving a fresh server can serve after a prior one.
 #[tokio::test]
-async fn fresh_server_completes_full_handshake_and_sync() {
-    // --- First generation: bring a server + client fully up, then tear down.
-    let mut server1 = start_server().await;
-    let mut client1 = connect_client(server1.port).await;
+async fn client_stop_after_handshake_cleanly_ends_session() {
+    const ID: &str = "stopping";
+    let mut server = start_server().await;
+    let mut client = snapcast_tests::connect_client_with_id(server.port, ID).await;
 
-    expect_full_sync(&mut client1.events, &server1.audio_tx).await;
-
-    let id1 = expect_server_event(&mut server1.events, 2000, |e| match e {
-        ServerEvent::ClientConnected { id, .. } => Some(id),
-        _ => None,
+    expect_event(&mut client.events, 2000, |e| {
+        matches!(e, ClientEvent::ServerSettings { .. }).then_some(())
     })
     .await;
-    assert!(!id1.is_empty());
+    expect_client_id_connected(&mut server.events, ID).await;
 
-    // Stop the first client cleanly, and confirm the first server sees it go.
-    client1
-        .cmd
-        .send(snapcast_client::ClientCommand::Stop)
-        .await
-        .ok();
-    expect_server_event(&mut server1.events, 3000, |e| match e {
-        ServerEvent::ClientDisconnected { id } if id == id1 => Some(()),
-        _ => None,
-    })
-    .await;
-
-    // Drop every handle to the first server: stops its accept loop and frees
-    // the port. (Its detached per-client task, if any, has already exited via
-    // the clean client Stop above.)
-    drop(server1);
-    drop(client1);
-
-    // --- Second generation: a FRESH server + FRESH client must resync fully.
-    let mut server2 = start_server().await;
-    let mut client2 = connect_client(server2.port).await;
-
-    expect_full_sync(&mut client2.events, &server2.audio_tx).await;
-
-    // The fresh server must observe the new client's completed handshake.
-    let id2 = expect_server_event(&mut server2.events, 2000, |e| match e {
-        ServerEvent::ClientConnected { id, .. } => Some(id),
-        _ => None,
-    })
-    .await;
-    assert!(
-        !id2.is_empty(),
-        "fresh server should see the reconnected client's handshake"
-    );
-
-    // Clean shutdown of the second generation.
-    client2
-        .cmd
-        .send(snapcast_client::ClientCommand::Stop)
-        .await
-        .ok();
+    client.cmd.send(ClientCommand::Stop).await.ok();
+    expect_client_disconnected(&mut server.events, ID).await;
+    expect_clean_stop(&mut client.events).await;
 }

@@ -1,51 +1,54 @@
-//! Wave-2 integration test: multi-client isolation.
+//! Multi-client isolation.
 //!
-//! The concurrent-client generalization of `stream_routing.rs`. Instead of a
-//! single client, we spin up three clients against ONE server, prove they all
-//! reach `Connected` + `ServerSettings`, then use server commands to route each
-//! client's group to a different stream and assert that:
+//! Several clients against one server, each with its own host id (which the
+//! server uses as the client id, so every client gets its own group). Server
+//! commands route the groups to different streams and mute a client, and
+//! each client's decoded audio is checked:
 //!
-//! - a client only ever receives audio from the stream its group is assigned to,
-//! - a client whose group is assigned to a different stream receives none of the
-//!   first stream's audio,
+//! - a client receives only the audio of the stream its group is assigned to
+//!   (the two streams carry different signals, told apart by content),
 //! - a muted client receives no audio at all.
-//!
-//! Unlike the single-client `stream_routing.rs` (which relies on "no panic"),
-//! this test makes *positive and negative* assertions on each client's decoded
-//! `audio_rx`: `should_send_chunk` filters chunks server-side by stream match
-//! and mute state, so a filtered client receives literally zero frames.
 
 use snapcast_client::ClientEvent;
 use snapcast_server::{AudioFrame, ServerCommand, ServerEvent};
 use snapcast_tests::{
-    TestClient, TwoStreamServer, client_group, connect_client_with_id, expect_event,
-    expect_server_event, server_status, start_two_stream_server, tone_frame,
+    TestClient, TwoStreamServer, client_group, connect_client_with_id, constant_frame,
+    expect_client_connected, expect_event, expect_server_event, server_status,
+    start_two_stream_server, tone_frame,
 };
 use tokio::sync::mpsc;
 
-/// Push enough tone frames on a stream to force the FLAC encoder (block size
-/// 1152 stereo frames) past several full blocks so decoded audio is emitted.
-async fn push_tone(stream: &mpsc::Sender<AudioFrame>, frames: usize) {
-    let mut ts = 1_000_000_000i64;
-    for _ in 0..frames {
-        stream.send(tone_frame(ts)).await.unwrap();
-        ts += 10_000; // 10ms increments, matching audio.rs
-    }
+/// Level of the constant signal on `stream_b`; `stream_a` carries a ramp.
+const LEVEL_B: f32 = 0.25;
+
+/// What a client decoded, in decoded frames (one per FLAC block).
+#[derive(Debug, Default)]
+struct Heard {
+    frames: usize,
+    /// Frames holding nothing but the `stream_b` level.
+    from_b: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Event-driven helpers (no fixed sleeps).
-// ---------------------------------------------------------------------------
+/// Push 300 ms of audio on both streams: a ramp on `stream_a`, the constant
+/// [`LEVEL_B`] on `stream_b`.
+async fn push_both(server: &TwoStreamServer) {
+    push(&server.stream_a, tone_frame).await;
+    push(&server.stream_b, |ts| constant_frame(LEVEL_B, ts)).await;
+}
+
+async fn push(stream: &mpsc::Sender<AudioFrame>, frame: impl Fn(i64) -> AudioFrame) {
+    let mut ts = 1_000_000_000i64;
+    for _ in 0..30 {
+        stream.send(frame(ts)).await.unwrap();
+        ts += 10_000;
+    }
+}
 
 /// Collect the ids of the next `n` distinct clients the server sees connect.
 async fn wait_for_n_connects(events: &mut mpsc::Receiver<ServerEvent>, n: usize) -> Vec<String> {
     let mut ids = Vec::new();
     while ids.len() < n {
-        let id = expect_server_event(events, 5000, |e| match e {
-            ServerEvent::ClientConnected { id, .. } => Some(id),
-            _ => None,
-        })
-        .await;
+        let id = expect_client_connected(events).await;
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -53,68 +56,36 @@ async fn wait_for_n_connects(events: &mut mpsc::Receiver<ServerEvent>, n: usize)
     ids
 }
 
-/// Drive a client through `Connected` then `ServerSettings`, asserting the
-/// handshake completes and settings are sane. Returns after `ServerSettings`.
-async fn expect_connected_and_settings(client: &mut TestClient) {
-    expect_event(&mut client.events, 5000, |e| match e {
-        ClientEvent::Connected { port, .. } => {
-            assert!(port > 0, "Connected reported a bound port");
-            Some(())
-        }
-        _ => None,
+/// Wait for `Connected`, `ServerSettings` and `StreamStarted`, so any
+/// WireChunk that arrives afterwards is decoded onto `audio_rx`.
+async fn expect_ready(client: &mut TestClient) {
+    expect_event(&mut client.events, 5000, |e| {
+        matches!(e, ClientEvent::Connected { .. }).then_some(())
     })
     .await;
-
-    expect_event(&mut client.events, 5000, |e| match e {
-        ClientEvent::ServerSettings { buffer_ms, .. } => {
-            assert!(buffer_ms > 0, "server advertised a positive buffer");
-            Some(())
-        }
-        _ => None,
+    expect_event(&mut client.events, 5000, |e| {
+        matches!(e, ClientEvent::ServerSettings { .. }).then_some(())
+    })
+    .await;
+    expect_event(&mut client.events, 5000, |e| {
+        matches!(e, ClientEvent::StreamStarted { .. }).then_some(())
     })
     .await;
 }
 
-/// Wait for the client's decoder to be set up (StreamStarted), so any WireChunk
-/// that arrives afterwards is decoded onto `audio_rx`.
-async fn wait_stream_started(client: &mut TestClient) {
-    expect_event(&mut client.events, 5000, |e| match e {
-        ClientEvent::StreamStarted { codec, .. } => {
-            assert!(!codec.is_empty());
-            Some(())
-        }
-        _ => None,
-    })
-    .await;
-}
-
-/// Drain the client's audio channel, returning total decoded samples seen.
-///
-/// Positive case: returns as soon as `min_samples` have arrived (fast).
-/// Negative case: pass `min_samples = usize::MAX` to keep draining until the
-/// per-recv `quiet_ms` window elapses with no frame — a *bounded* wait for
-/// "silence", not a blind sleep. Returns the total observed either way.
-async fn drain_audio(client: &mut TestClient, min_samples: usize, quiet_ms: u64) -> usize {
-    let mut total = 0usize;
-    loop {
-        if total >= min_samples {
-            return total;
-        }
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(quiet_ms),
-            client.audio_rx.recv(),
-        )
-        .await
-        {
-            Ok(Some(frame)) => {
-                assert_eq!(frame.sample_rate, 48000);
-                assert_eq!(frame.channels, 2);
-                total += frame.samples.len();
-            }
-            Ok(None) => return total, // channel closed
-            Err(_) => return total,   // quiet window elapsed: no more audio
+/// Drain the client's decoded audio until `quiet_ms` pass without a frame.
+/// Proving that a client hears nothing needs such a window.
+async fn drain_audio(client: &mut TestClient, quiet_ms: u64) -> Heard {
+    let mut heard = Heard::default();
+    let quiet = std::time::Duration::from_millis(quiet_ms);
+    while let Ok(Some(frame)) = tokio::time::timeout(quiet, client.audio_rx.recv()).await {
+        assert_eq!((frame.sample_rate, frame.channels), (48000, 2));
+        heard.frames += 1;
+        if frame.samples.iter().all(|&s| (s - LEVEL_B).abs() < 1e-3) {
+            heard.from_b += 1;
         }
     }
+    heard
 }
 
 /// Set a group's stream and wait for the `GroupStreamChanged` confirmation.
@@ -127,13 +98,11 @@ async fn route_group_to_stream(server: &mut TwoStreamServer, group_id: &str, str
         })
         .await
         .unwrap();
-    let want = stream_id.to_string();
-    let gid = group_id.to_string();
     expect_server_event(&mut server.events, 2000, |e| match e {
         ServerEvent::GroupStreamChanged {
-            group_id,
-            stream_id,
-        } if group_id == gid && stream_id == want => Some(()),
+            group_id: g,
+            stream_id: s,
+        } if g == group_id && s == stream_id => Some(()),
         _ => None,
     })
     .await;
@@ -150,157 +119,98 @@ async fn mute_client(server: &mut TwoStreamServer, client_id: &str) {
         })
         .await
         .unwrap();
-    let cid = client_id.to_string();
     expect_server_event(&mut server.events, 2000, |e| match e {
         ServerEvent::ClientVolumeChanged {
-            client_id, muted, ..
-        } if client_id == cid && muted => Some(()),
+            client_id: c,
+            muted: true,
+            ..
+        } if c == client_id => Some(()),
         _ => None,
     })
     .await;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Three clients against one server all reach Connected + ServerSettings, and
-/// the server independently observes three distinct ClientConnected events.
+/// Three clients all complete the handshake, and the server tracks each in
+/// a group of its own on the default stream.
 #[tokio::test]
-async fn three_clients_all_reach_connected_and_server_settings() {
+async fn three_clients_get_their_own_groups() {
     let mut server = start_two_stream_server().await;
+    let ids = ["client-a", "client-b", "client-c"];
+    let mut clients = Vec::new();
+    for id in ids {
+        clients.push(connect_client_with_id(server.port, id).await);
+    }
+    for client in &mut clients {
+        expect_ready(client).await;
+    }
 
-    let mut c1 = connect_client_with_id(server.port, "client-a").await;
-    let mut c2 = connect_client_with_id(server.port, "client-b").await;
-    let mut c3 = connect_client_with_id(server.port, "client-c").await;
+    let mut seen = wait_for_n_connects(&mut server.events, 3).await;
+    seen.sort();
+    assert_eq!(seen, ids, "client ids are the host ids");
 
-    // Each client independently completes the handshake.
-    expect_connected_and_settings(&mut c1).await;
-    expect_connected_and_settings(&mut c2).await;
-    expect_connected_and_settings(&mut c3).await;
-
-    // The server sees three distinct clients.
-    let ids = wait_for_n_connects(&mut server.events, 3).await;
-    assert_eq!(ids.len(), 3, "server saw three distinct client ids");
-
-    // Each connected client landed in its own group by default.
     let status = server_status(&server.cmd).await;
-    let total_clients: usize = status.server.groups.iter().map(|g| g.clients.len()).sum();
-    assert_eq!(total_clients, 3, "all three clients are tracked in groups");
+    assert_eq!(status.server.groups.len(), 3);
+    for group in &status.server.groups {
+        assert_eq!(group.clients.len(), 1, "one client per group");
+        assert_eq!(
+            group.stream_id, "stream_a",
+            "the first stream is the default"
+        );
+    }
 }
 
-/// Concurrent-client stream isolation: three clients on one server, each group
-/// routed to a different stream, plus one muted client. Assert every client
-/// only receives audio from the stream it is assigned to, and the muted client
-/// receives none.
+/// Three clients, groups routed to `stream_a`, `stream_b` and `stream_b`, the
+/// last client muted. Each client hears exactly its stream; the muted one
+/// hears nothing.
 #[tokio::test]
 async fn clients_receive_only_their_assigned_stream_audio() {
     let mut server = start_two_stream_server().await;
+    let mut on_a = connect_client_with_id(server.port, "client-a").await;
+    let mut on_b = connect_client_with_id(server.port, "client-b").await;
+    let mut muted = connect_client_with_id(server.port, "client-c").await;
+    expect_ready(&mut on_a).await;
+    expect_ready(&mut on_b).await;
+    expect_ready(&mut muted).await;
+    wait_for_n_connects(&mut server.events, 3).await;
 
-    let mut c1 = connect_client_with_id(server.port, "client-a").await;
-    let mut c2 = connect_client_with_id(server.port, "client-b").await;
-    let mut c3 = connect_client_with_id(server.port, "client-c").await;
+    let (group_b, _) = client_group(&server.cmd, "client-b").await;
+    let (group_c, _) = client_group(&server.cmd, "client-c").await;
+    route_group_to_stream(&mut server, &group_b, "stream_b").await;
+    route_group_to_stream(&mut server, &group_c, "stream_b").await;
+    mute_client(&mut server, "client-c").await;
 
-    // Drive all three through the handshake, then correlate to server ids via
-    // GetStatus. Each has a unique host_id, so the server tracks three distinct
-    // clients in three distinct groups.
-    expect_connected_and_settings(&mut c1).await;
-    expect_connected_and_settings(&mut c2).await;
-    expect_connected_and_settings(&mut c3).await;
-    wait_stream_started(&mut c1).await;
-    wait_stream_started(&mut c2).await;
-    wait_stream_started(&mut c3).await;
+    push_both(&server).await;
+    let a = drain_audio(&mut on_a, 400).await;
+    let b = drain_audio(&mut on_b, 400).await;
+    let c = drain_audio(&mut muted, 400).await;
 
-    let ids = wait_for_n_connects(&mut server.events, 3).await;
-    assert_eq!(ids.len(), 3);
-
-    // Every client starts in its own group assigned to the first stream
-    // ("stream_a", the default). Confirm and grab each group id.
-    let mut groups = Vec::new();
-    for id in &ids {
-        let (gid, stream) = client_group(&server.cmd, id).await;
-        assert_eq!(stream, "stream_a", "default routing is the first stream");
-        groups.push(gid);
-    }
-
-    // Route: group[0] -> stream_a, group[1] -> stream_b, group[2] -> stream_b,
-    // then mute the client in group[2]. Routing/mute are driven by server id, so
-    // this is deterministic. Since we cannot know which TestClient handle maps
-    // to which server id (clients spawn concurrently), the audio assertions
-    // below are on the aggregate: 2 handles hear audio, 1 (muted) is silent.
-    route_group_to_stream(&mut server, &groups[0], "stream_a").await;
-    route_group_to_stream(&mut server, &groups[1], "stream_b").await;
-    route_group_to_stream(&mut server, &groups[2], "stream_b").await;
-    mute_client(&mut server, &ids[2]).await;
-
-    // Push a burst of tone on BOTH streams concurrently.
-    push_tone(&server.stream_a, 30).await;
-    push_tone(&server.stream_b, 30).await;
-
-    // Drain each handle's audio channel until it goes quiet, tallying samples.
-    let got1 = drain_audio(&mut c1, usize::MAX, 400).await;
-    let got2 = drain_audio(&mut c2, usize::MAX, 400).await;
-    let got3 = drain_audio(&mut c3, usize::MAX, 400).await;
-    let received = [got1, got2, got3];
-
-    // Exactly two handles must have received audio (the stream_a client and the
-    // unmuted stream_b client); exactly one (the muted client) received none.
-    let with_audio = received.iter().filter(|&&n| n > 0).count();
-    let silent = received.iter().filter(|&&n| n == 0).count();
+    assert!(a.frames > 0, "stream_a client hears audio: {a:?}");
+    assert_eq!(a.from_b, 0, "stream_a client hears only stream_a: {a:?}");
+    assert!(b.frames > 0, "stream_b client hears audio: {b:?}");
     assert_eq!(
-        with_audio, 2,
-        "two of three clients receive audio (stream_a + unmuted stream_b): {received:?}"
+        b.from_b, b.frames,
+        "stream_b client hears only stream_b: {b:?}"
     );
-    assert_eq!(
-        silent, 1,
-        "the muted client receives no audio at all: {received:?}"
-    );
+    assert_eq!(c.frames, 0, "the muted client hears nothing: {c:?}");
 }
 
-/// A client whose group is on stream_b receives nothing when audio is pushed
-/// ONLY on stream_a — pure cross-stream isolation with a concurrent listener on
-/// stream_a that *does* receive it.
+/// Audio pushed only on `stream_a` reaches the client on `stream_a` and not
+/// the one moved to `stream_b`.
 #[tokio::test]
 async fn unassigned_stream_audio_is_not_delivered() {
     let mut server = start_two_stream_server().await;
+    let mut listener = connect_client_with_id(server.port, "listener").await;
+    let mut isolated = connect_client_with_id(server.port, "isolated").await;
+    expect_ready(&mut listener).await;
+    expect_ready(&mut isolated).await;
+    wait_for_n_connects(&mut server.events, 2).await;
 
-    let mut listener = connect_client_with_id(server.port, "listener").await; // stays on stream_a
-    let mut isolated = connect_client_with_id(server.port, "isolated").await; // moved to stream_b
+    let (group, _) = client_group(&server.cmd, "isolated").await;
+    route_group_to_stream(&mut server, &group, "stream_b").await;
 
-    expect_connected_and_settings(&mut listener).await;
-    expect_connected_and_settings(&mut isolated).await;
-    wait_stream_started(&mut listener).await;
-    wait_stream_started(&mut isolated).await;
-
-    let ids = wait_for_n_connects(&mut server.events, 2).await;
-    assert_eq!(ids.len(), 2);
-
-    // Move ONE client's group to stream_b; the other stays on stream_a. Which
-    // server id belongs to which TestClient handle is not guaranteed to follow
-    // connect order (clients are spawned concurrently), so we assert on the
-    // aggregate rather than a fixed handle->id mapping.
-    // ids[0]'s group stays on stream_a (the default); move ids[1]'s to stream_b.
-    let (g1, _) = client_group(&server.cmd, &ids[1]).await;
-    route_group_to_stream(&mut server, &g1, "stream_b").await;
-
-    // Push audio ONLY on stream_a.
-    push_tone(&server.stream_a, 30).await;
-
-    // Exactly one handle (the one still on stream_a) hears audio; the other
-    // (moved to stream_b) is silent — cross-stream isolation with a concurrent
-    // positive listener proving audio was actually flowing.
-    let got0 = drain_audio(&mut listener, usize::MAX, 400).await;
-    let got1 = drain_audio(&mut isolated, usize::MAX, 400).await;
-    let received = [got0, got1];
-
-    let with_audio = received.iter().filter(|&&n| n > 0).count();
-    let silent = received.iter().filter(|&&n| n == 0).count();
-    assert_eq!(
-        with_audio, 1,
-        "only the stream_a client hears stream_a audio: {received:?}"
-    );
-    assert_eq!(
-        silent, 1,
-        "the stream_b client receives no stream_a audio: {received:?}"
-    );
+    push(&server.stream_a, tone_frame).await;
+    let heard = drain_audio(&mut listener, 400).await;
+    let leaked = drain_audio(&mut isolated, 400).await;
+    assert!(heard.frames > 0, "the stream_a client hears stream_a");
+    assert_eq!(leaked.frames, 0, "the stream_b client hears nothing");
 }

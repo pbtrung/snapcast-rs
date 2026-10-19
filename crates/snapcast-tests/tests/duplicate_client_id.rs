@@ -5,7 +5,8 @@
 use snapcast_proto::message::factory::MessagePayload;
 use snapcast_server::ServerEvent;
 use snapcast_tests::{
-    RawClient, client_connected, constant_frame, expect_server_event, start_server,
+    RawClient, client_connected, constant_frame, expect_client_disconnected,
+    expect_client_id_connected, expect_no_server_event, start_server,
 };
 
 const ID: &str = "dup-client";
@@ -15,16 +16,10 @@ async fn reconnect_with_same_id_replaces_previous_session() {
     let mut server = start_server().await;
 
     let mut first = RawClient::connect(server.port, ID).await;
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientConnected { ref id, .. } if id == ID).then_some(())
-    })
-    .await;
+    expect_client_id_connected(&mut server.events, ID).await;
 
     let mut second = RawClient::connect(server.port, ID).await;
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientConnected { ref id, .. } if id == ID).then_some(())
-    })
-    .await;
+    expect_client_id_connected(&mut server.events, ID).await;
 
     assert!(
         first.closed_within(2000).await,
@@ -34,15 +29,13 @@ async fn reconnect_with_same_id_replaces_previous_session() {
 
     // The replaced session's cleanup must neither report a disconnect nor
     // flip the shared client record.
-    let spurious = tokio::time::timeout(std::time::Duration::from_millis(300), async {
-        loop {
-            if let Some(ServerEvent::ClientDisconnected { .. }) = server.events.recv().await {
-                return;
-            }
-        }
-    })
+    expect_no_server_event(
+        &mut server.events,
+        300,
+        "ClientDisconnected for a live client",
+        |e| matches!(e, ServerEvent::ClientDisconnected { .. }),
+    )
     .await;
-    assert!(spurious.is_err(), "no ClientDisconnected for a live client");
     assert_eq!(client_connected(&server.cmd, ID).await, Some(true));
 
     // The new session is still routed: it receives the stream's audio.
@@ -64,9 +57,6 @@ async fn reconnect_with_same_id_replaces_previous_session() {
 
     // Closing the current session is reported normally.
     drop(second);
-    expect_server_event(&mut server.events, 2000, |e| {
-        matches!(e, ServerEvent::ClientDisconnected { ref id } if id == ID).then_some(())
-    })
-    .await;
+    expect_client_disconnected(&mut server.events, ID).await;
     assert_eq!(client_connected(&server.cmd, ID).await, Some(false));
 }
