@@ -68,13 +68,18 @@ impl Resampler {
     /// next call.
     pub fn process(&mut self, data: &mut Vec<u8>) -> Result<()> {
         let sample_size = self.in_format.sample_size() as usize;
-        if self.in_format.frame_size() == 0 || sample_size == 0 {
+        let frame_size = self.in_format.frame_size() as usize;
+        if frame_size == 0 || sample_size == 0 {
             bail!("cannot resample zero-sized frames");
         }
 
+        // Whole frames only: a partial one would shift the channels of
+        // everything held back after it.
+        let whole = data.len() - data.len() % frame_size;
         let (encoding, bits) = (self.in_encoding, self.in_format.bits());
         self.pending.extend(
-            data.chunks_exact(sample_size)
+            data[..whole]
+                .chunks_exact(sample_size)
                 .map(|b| encoding.sample_to_f32(b, bits)),
         );
         data.clear();
@@ -193,5 +198,18 @@ mod tests {
         assert!(!data.is_empty());
         assert_eq!(r.pending.len(), (500 - frames) * 2);
         assert_eq!(r.input_frames_until_output(), frames - (500 - frames));
+    }
+
+    #[test]
+    fn drops_a_trailing_partial_frame() {
+        let in_fmt = SampleFormat::new(44100, 16, 2);
+        let out_fmt = SampleFormat::new(48000, 16, 2);
+        let mut r = Resampler::new_if_needed(in_fmt, out_fmt, SampleEncoding::PcmInt, 441)
+            .unwrap()
+            .unwrap();
+        // 10 frames and one sample of the next.
+        let mut data = vec![0u8; 10 * 4 + 2];
+        r.process(&mut data).unwrap();
+        assert_eq!(r.pending.len(), 10 * 2, "channels stay aligned");
     }
 }

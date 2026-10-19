@@ -299,9 +299,7 @@ mod tests {
             payload: sink.into_inner(),
         };
 
-        let config = flacenc::config::Encoder::default()
-            .into_verified()
-            .unwrap();
+        let config = flacenc::config::Encoder::default().into_verified().unwrap();
         let info = StreamInfo::new(48_000, 2, 16).unwrap();
         let mut framebuf = FrameBuf::with_size(2, BLOCK).unwrap();
         let frames = (0..blocks)
@@ -310,8 +308,7 @@ mod tests {
                     .map(|i| ((n * BLOCK * 2 + i) % 2000) as i32 * 10 - 10_000)
                     .collect();
                 framebuf.fill_interleaved(&samples).unwrap();
-                let frame =
-                    flacenc::encode_fixed_size_frame(&config, &framebuf, n, &info).unwrap();
+                let frame = flacenc::encode_fixed_size_frame(&config, &framebuf, n, &info).unwrap();
                 let mut sink = MemSink::<u8>::new();
                 frame.write(&mut sink).unwrap();
                 sink.into_inner()
