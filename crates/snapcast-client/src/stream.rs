@@ -430,13 +430,13 @@ impl Stream {
                 }
                 let remaining = frames - silent_frames;
                 if remaining > 0 {
-                    let offset = silent_frames as usize * frame_size;
-                    self.read_next(&mut output[offset..], remaining);
-                }
-                if silent_frames < frames {
+                    // Completed before reading on: a timestamp jump the read
+                    // runs into starts the next hard sync, which must stick.
                     self.hard_sync = false;
                     self.reset_buffers();
                     self.reset_soft_sync();
+                    let offset = silent_frames as usize * frame_size;
+                    self.read_next(&mut output[offset..], remaining);
                 }
                 return true;
             }
@@ -1063,6 +1063,23 @@ mod tests {
             (s.rate_correction, s.error_integral, s.correction_frames),
             (0.0, 0.0, 0.0)
         );
+    }
+
+    #[test]
+    fn timestamp_jump_read_by_the_completing_hard_sync_starts_another() {
+        // The hard sync aligns to the first chunk and reads on into the
+        // next, whose timestamp jumps 10 s.
+        let mut s = Stream::new(fmt());
+        s.set_buffer_ms(1000);
+        s.add_chunk(counter_chunk(99_000_000, 0, 240));
+        s.add_chunk(counter_chunk(109_005_000, 240, 480));
+        let mut buf = vec![0xAAu8; 480 * 4];
+        assert!(s.get_player_chunk(100_000_000, 0, &mut buf, 480));
+        assert!(s.hard_sync, "the jump starts the next hard sync");
+        let got = indices(&buf);
+        assert_eq!(got[239], 240);
+        assert!(got[240..].iter().all(|&i| i == 0));
+        assert_eq!(s.chunks.len(), 1, "the chunk is kept for the hard sync");
     }
 
     #[test]
