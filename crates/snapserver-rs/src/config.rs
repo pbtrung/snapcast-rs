@@ -423,6 +423,15 @@ mod tests {
         }
     }
 
+    /// The default codec: FLAC when built with it, else PCM.
+    fn default_codec() -> &'static str {
+        if cfg!(feature = "flac") {
+            "flac"
+        } else {
+            "pcm"
+        }
+    }
+
     fn config_from(contents: &str) -> BinaryConfig {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(tmp, "{contents}").unwrap();
@@ -442,9 +451,7 @@ mod tests {
         assert_eq!(config.http_bind_address, "0.0.0.0");
         assert_eq!(config.stream_bind_address, "0.0.0.0");
         assert_eq!(config.doc_root, None);
-        // Feature-dependent default codec: flac > pcm.
-        // With default features, `flac` is enabled.
-        assert_eq!(config.server.codec, "flac");
+        assert_eq!(config.server.codec, default_codec());
         assert_eq!(config.server.sample_format, "48000:16:2");
         assert_eq!(config.server.buffer_ms, 1000);
     }
@@ -466,7 +473,7 @@ mod tests {
         assert_eq!(config.sources, default_sources());
         assert_eq!(config.http_port, 1780);
         assert_eq!(config.control_port, 1705);
-        assert_eq!(config.server.codec, "flac");
+        assert_eq!(config.server.codec, default_codec());
     }
 
     // ---- Multiple sources ----

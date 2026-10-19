@@ -504,7 +504,14 @@ mod tests {
         loop {
             match tokio::time::timeout_at(deadline, events.recv()).await {
                 Ok(Some(ClientEvent::StreamStarted { codec, .. })) => {
-                    assert_eq!(codec, "flac");
+                    assert_eq!(
+                        codec,
+                        if cfg!(feature = "flac") {
+                            "flac"
+                        } else {
+                            "pcm"
+                        }
+                    );
                     break;
                 }
                 Ok(Some(_)) => {}
