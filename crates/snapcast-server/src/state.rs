@@ -370,17 +370,9 @@ impl ServerState {
                 id: s.id.clone(),
                 status: status::StreamStatus::from(s.status.as_str()),
                 uri: status::StreamUri::parse(&s.uri),
-                properties: (!s.properties.is_empty())
-                    .then(|| {
-                        serde_json::from_value(serde_json::Value::Object(
-                            s.properties.clone().into_iter().collect(),
-                        ))
-                        .inspect_err(
-                            |e| tracing::warn!(stream = %s.id, "Invalid stream properties: {e}"),
-                        )
-                        .ok()
-                    })
-                    .flatten(),
+                // Always present, as C++ snapserver reports it (the `can*`
+                // flags default to false).
+                properties: Some(stream_properties(&s.id, &s.properties)),
             })
             .collect();
         status::ServerStatus {
@@ -391,6 +383,30 @@ impl ServerState {
             },
         }
     }
+}
+
+/// Typed properties of stream `stream_id`. A property with a value of the
+/// wrong type is dropped (with a warning) instead of the whole set.
+fn stream_properties(
+    stream_id: &str,
+    properties: &HashMap<String, serde_json::Value>,
+) -> crate::status::StreamProperties {
+    let valid = properties
+        .iter()
+        .filter(|(key, value)| {
+            let single = serde_json::Map::from_iter([((*key).clone(), (*value).clone())]);
+            serde_json::from_value::<crate::status::StreamProperties>(serde_json::Value::Object(
+                single,
+            ))
+            .inspect_err(
+                |e| tracing::warn!(stream = %stream_id, %key, "Invalid stream property: {e}"),
+            )
+            .is_ok()
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    // Every property passed on its own, and they are independent.
+    serde_json::from_value(serde_json::Value::Object(valid)).unwrap_or_default()
 }
 
 fn generate_id() -> String {
@@ -511,7 +527,9 @@ mod tests {
 
         let json = serde_json::to_value(state.to_status()).unwrap();
         let streams = &json["server"]["streams"];
-        assert!(streams[0].get("properties").is_none());
+        // Present even when empty, as C++ snapserver reports it.
+        assert_eq!(streams[0]["properties"]["canPlay"], false);
+        assert_eq!(streams[0]["properties"]["canControl"], false);
         assert_eq!(streams[0]["uri"]["scheme"], "pipe");
         assert_eq!(streams[0]["uri"]["path"], "/tmp/snapfifo");
         assert_eq!(streams[0]["uri"]["raw"], "pipe:///tmp/snapfifo");
@@ -519,6 +537,20 @@ mod tests {
         assert_eq!(props["playbackStatus"], "playing");
         assert_eq!(props["metadata"]["title"], "Song");
         assert_eq!(props["metadata"]["artist"][0], "A");
+    }
+
+    #[test]
+    fn invalid_stream_property_drops_only_itself() {
+        let props = stream_properties(
+            "s",
+            &[
+                ("canPlay".into(), serde_json::json!(true)),
+                ("volume".into(), serde_json::json!("loud")),
+            ]
+            .into(),
+        );
+        assert!(props.can_play);
+        assert_eq!(props.volume, None);
     }
 
     #[test]
