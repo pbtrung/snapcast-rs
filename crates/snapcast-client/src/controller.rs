@@ -279,12 +279,13 @@ impl Controller {
                 if let Some(ref mut dec) = self.decoder {
                     let mut data = wc.payload;
                     if dec.decode(&mut data)? {
-                        // Also send to the external audio receiver, if still listening
-                        if !self.audio_tx.is_closed() {
+                        // Also send to the external audio receiver, if it is
+                        // still listening and keeping up (converted only then).
+                        if let Ok(permit) = self.audio_tx.try_reserve() {
                             let samples =
                                 samples_to_f32(&data, self.sample_format, self.sample_encoding);
                             if !samples.is_empty() {
-                                let _ = self.audio_tx.try_send(crate::AudioFrame {
+                                permit.send(crate::AudioFrame {
                                     samples,
                                     sample_rate: self.sample_format.rate(),
                                     channels: self.sample_format.channels(),
