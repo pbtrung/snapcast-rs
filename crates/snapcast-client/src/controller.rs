@@ -40,6 +40,8 @@ pub struct Controller {
     command_rx: mpsc::Receiver<ClientCommand>,
     /// Consecutive failed sessions; reset once a handshake succeeds.
     failed_attempts: u32,
+    /// Sends the latest settings events while the event channel is full.
+    settings_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Controller {
@@ -67,6 +69,7 @@ impl Controller {
             audio_tx,
             command_rx,
             failed_attempts: 0,
+            settings_task: None,
         })
     }
 
@@ -170,12 +173,7 @@ impl Controller {
             let response = self.recv_timeout(HELLO_TIMEOUT).await?;
             match response.payload {
                 MessagePayload::ServerSettings(ss) => {
-                    self.emit(ClientEvent::ServerSettings {
-                        buffer_ms: ss.buffer_ms,
-                        latency: ss.latency,
-                        volume: ss.volume,
-                        muted: ss.muted,
-                    });
+                    self.emit_settings(&ss, false);
                     // A CodecHeader may already have set up the stream.
                     self.apply_server_settings(&ss);
                     self.server_settings = Some(ss);
@@ -308,16 +306,7 @@ impl Controller {
                 }
             }
             MessagePayload::ServerSettings(ss) => {
-                self.emit(ClientEvent::ServerSettings {
-                    buffer_ms: ss.buffer_ms,
-                    latency: ss.latency,
-                    volume: ss.volume,
-                    muted: ss.muted,
-                });
-                self.emit(ClientEvent::VolumeChanged {
-                    volume: ss.volume,
-                    muted: ss.muted,
-                });
+                self.emit_settings(&ss, true);
                 self.apply_server_settings(&ss);
                 self.server_settings = Some(ss);
             }
@@ -399,6 +388,47 @@ impl Controller {
 
     fn emit(&self, event: ClientEvent) {
         let _ = self.event_tx.try_send(event);
+    }
+
+    /// Emit the server settings, plus `VolumeChanged` for an update. Never
+    /// dropped (the consumer would keep a stale volume), nor waited for:
+    /// while the channel is full a task sends them, replaced by the next
+    /// update's, so the consumer gets the latest settings.
+    fn emit_settings(&mut self, ss: &ServerSettings, update: bool) {
+        if let Some(task) = self.settings_task.take() {
+            task.abort();
+        }
+        let mut events = vec![ClientEvent::ServerSettings {
+            buffer_ms: ss.buffer_ms,
+            latency: ss.latency,
+            volume: ss.volume,
+            muted: ss.muted,
+        }];
+        if update {
+            events.push(ClientEvent::VolumeChanged {
+                volume: ss.volume,
+                muted: ss.muted,
+            });
+        }
+        let mut events = events.into_iter();
+        while let Some(event) = events.next() {
+            match self.event_tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    let tx = self.event_tx.clone();
+                    let rest: Vec<ClientEvent> = std::iter::once(event).chain(events).collect();
+                    self.settings_task = Some(tokio::spawn(async move {
+                        for event in rest {
+                            if tx.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -630,6 +660,43 @@ mod tests {
         };
         ctrl.handle_message(msg).unwrap();
         assert!(audio_rx.try_recv().is_err(), "no decoder → no audio frame");
+    }
+
+    #[tokio::test]
+    async fn settings_events_survive_a_full_event_channel() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (audio_tx, _audio_rx) = mpsc::channel(1);
+        let tp = Arc::new(Mutex::new(TimeProvider::new()));
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::default())));
+        let cfg = crate::ClientConfig {
+            host: "example.invalid".into(),
+            ..Default::default()
+        };
+        let mut ctrl = Controller::new(cfg, event_tx, cmd_rx, audio_tx, tp, stream).unwrap();
+        ctrl.emit(ClientEvent::TimeSyncComplete { diff_ms: 0.0 });
+        for volume in [10, 20] {
+            let msg = TypedMessage {
+                base: base(MessageType::ServerSettings),
+                payload: MessagePayload::ServerSettings(ServerSettings {
+                    buffer_ms: 1000,
+                    latency: 0,
+                    volume,
+                    muted: false,
+                }),
+            };
+            ctrl.handle_message(msg).unwrap();
+        }
+
+        let mut last_volume = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await
+        {
+            if let ClientEvent::VolumeChanged { volume, .. } = event {
+                last_volume = Some(volume);
+            }
+        }
+        assert_eq!(last_volume, Some(20), "the latest volume arrives");
     }
 
     // ---- init_audio_pipeline ----
