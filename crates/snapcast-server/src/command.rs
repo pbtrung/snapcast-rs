@@ -54,13 +54,25 @@ impl Dispatcher {
             after = ?after,
             "Removed clients disconnected for too long"
         );
-        self.announce_removed_clients(snapshot, None).await;
+        let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        self.announce_removed_clients(None).await;
         stale
     }
 
-    /// Report a structural change after clients were deleted.
-    async fn announce_removed_clients(&self, snapshot: ServerState, origin: Option<u64>) {
+    /// Apply `mutate` to the shared state, then report the result as a
+    /// [`ServerEvent::StateChanged`] snapshot. Returns what `mutate` returns.
+    async fn mutate_state<R>(&self, mutate: impl FnOnce(&mut ServerState) -> R) -> R {
+        let mut s = self.shared_state.lock().await;
+        let result = mutate(&mut s);
+        let snapshot = s.clone();
+        drop(s);
         let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        result
+    }
+
+    /// Report a structural change after clients were deleted (the
+    /// `StateChanged` snapshot is sent already).
+    async fn announce_removed_clients(&self, origin: Option<u64>) {
         // Mirrors Server.OnUpdate in C++ snapserver after Server.DeleteClient.
         self.notify(origin, ServerEvent::ServerUpdated);
         self.session_srv.update_routing_all().await;
@@ -117,15 +129,15 @@ impl Dispatcher {
                 volume,
                 muted,
             } => {
-                let mut s = self.shared_state.lock().await;
-                if let Some(c) = s.clients.get_mut(&client_id) {
-                    c.config.volume.percent = volume;
-                    c.config.volume.muted = muted;
-                }
-                let settings = self.settings_for(&s, [&client_id]);
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                let settings = self
+                    .mutate_state(|s| {
+                        if let Some(c) = s.clients.get_mut(&client_id) {
+                            c.config.volume.percent = volume;
+                            c.config.volume.muted = muted;
+                        }
+                        self.settings_for(s, [&client_id])
+                    })
+                    .await;
                 self.push_settings(settings).await;
                 self.notify(
                     origin,
@@ -138,14 +150,14 @@ impl Dispatcher {
                 self.session_srv.update_routing_for_client(&client_id).await;
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
-                let mut s = self.shared_state.lock().await;
-                if let Some(c) = s.clients.get_mut(&client_id) {
-                    c.config.latency = latency;
-                }
-                let settings = self.settings_for(&s, [&client_id]);
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                let settings = self
+                    .mutate_state(|s| {
+                        if let Some(c) = s.clients.get_mut(&client_id) {
+                            c.config.latency = latency;
+                        }
+                        self.settings_for(s, [&client_id])
+                    })
+                    .await;
                 self.push_settings(settings).await;
                 self.notify(
                     origin,
@@ -153,24 +165,22 @@ impl Dispatcher {
                 );
             }
             ServerCommand::SetClientName { client_id, name } => {
-                let mut s = self.shared_state.lock().await;
-                if let Some(c) = s.clients.get_mut(&client_id) {
-                    c.config.name = name.clone();
-                }
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.mutate_state(|s| {
+                    if let Some(c) = s.clients.get_mut(&client_id) {
+                        c.config.name = name.clone();
+                    }
+                })
+                .await;
                 self.notify(origin, ServerEvent::ClientNameChanged { client_id, name });
             }
             ServerCommand::SetGroupStream {
                 group_id,
                 stream_id,
             } => {
-                let mut s = self.shared_state.lock().await;
-                s.set_group_stream(&group_id, &stream_id);
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.mutate_state(|s| {
+                    s.set_group_stream(&group_id, &stream_id);
+                })
+                .await;
                 self.notify(
                     origin,
                     ServerEvent::GroupStreamChanged {
@@ -181,18 +191,18 @@ impl Dispatcher {
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupMute { group_id, muted } => {
-                let mut s = self.shared_state.lock().await;
-                let mut members = Vec::new();
-                if let Some(g) = s.groups.iter_mut().find(|g| g.id == group_id) {
-                    g.muted = muted;
-                    members.clone_from(&g.clients);
-                }
-                // The mute clients are told is their own or their group's,
-                // as in C++ snapserver.
-                let settings = self.settings_for(&s, &members);
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                let settings = self
+                    .mutate_state(|s| {
+                        let mut members = Vec::new();
+                        if let Some(g) = s.groups.iter_mut().find(|g| g.id == group_id) {
+                            g.muted = muted;
+                            members.clone_from(&g.clients);
+                        }
+                        // The mute clients are told is their own or their group's,
+                        // as in C++ snapserver.
+                        self.settings_for(s, &members)
+                    })
+                    .await;
                 self.push_settings(settings).await;
                 self.notify(
                     origin,
@@ -204,34 +214,30 @@ impl Dispatcher {
                 self.session_srv.update_routing_for_group(&group_id).await;
             }
             ServerCommand::SetGroupName { group_id, name } => {
-                let mut s = self.shared_state.lock().await;
-                if let Some(g) = s.groups.iter_mut().find(|g| g.id == group_id) {
-                    g.name = name.clone();
-                }
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                self.mutate_state(|s| {
+                    if let Some(g) = s.groups.iter_mut().find(|g| g.id == group_id) {
+                        g.name = name.clone();
+                    }
+                })
+                .await;
                 self.notify(origin, ServerEvent::GroupNameChanged { group_id, name });
             }
             ServerCommand::SetGroupClients { group_id, clients } => {
-                let mut s = self.shared_state.lock().await;
-                s.set_group_clients(&group_id, &clients);
-                // Moved clients may now be in a group muted differently.
-                let settings = self.settings_for(&s, s.clients.keys());
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                let settings = self
+                    .mutate_state(|s| {
+                        s.set_group_clients(&group_id, &clients);
+                        // Moved clients may now be in a group muted differently.
+                        self.settings_for(s, s.clients.keys())
+                    })
+                    .await;
                 self.push_settings(settings).await;
                 // Structural change — mirrors Server.OnUpdate in C++ snapserver
                 self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
             }
             ServerCommand::DeleteClient { client_id } => {
-                let mut s = self.shared_state.lock().await;
-                s.remove_client(&client_id);
-                let snapshot = s.clone();
-                drop(s);
-                self.announce_removed_clients(snapshot, origin).await;
+                self.mutate_state(|s| s.remove_client(&client_id)).await;
+                self.announce_removed_clients(origin).await;
             }
             ServerCommand::SetStreamMeta {
                 stream_id,
@@ -265,17 +271,16 @@ impl Dispatcher {
                     stops.remove(&stream_id);
                 }
                 self.session_srv.unregister_stream_codec(&stream_id).await;
-                let mut s = self.shared_state.lock().await;
-                s.streams.retain(|st| st.id != stream_id);
-                // Clear stream_id on groups that referenced this stream
-                for g in &mut s.groups {
-                    if g.stream_id == stream_id {
-                        g.stream_id.clear();
+                self.mutate_state(|s| {
+                    s.streams.retain(|st| st.id != stream_id);
+                    // Clear stream_id on groups that referenced this stream
+                    for g in &mut s.groups {
+                        if g.stream_id == stream_id {
+                            g.stream_id.clear();
+                        }
                     }
-                }
-                let snapshot = s.clone();
-                drop(s);
-                let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                })
+                .await;
                 self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
             }
