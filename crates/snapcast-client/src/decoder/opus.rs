@@ -14,7 +14,6 @@ use snapcast_proto::message::codec_header::CodecHeader;
 use crate::decoder::Decoder;
 
 use snapcast_proto::OPUS_HEADER_ID as OPUS_ID;
-const MAX_FRAME_SIZE: usize = 2880;
 
 /// Parse the Opus pseudo header.
 fn parse_opus_header(payload: &[u8]) -> Result<SampleFormat> {
@@ -91,12 +90,16 @@ pub fn create(header: &CodecHeader) -> Result<OpusDecoder> {
     let sf = parse_opus_header(&header.payload)?;
     let dec = OpusDec::new(sf.rate(), sf.channels() as usize)
         .map_err(|e| anyhow::anyhow!("failed to create Opus decoder: {e}"))?;
+    // Room for the longest packet (120 ms): one sized for less fails to
+    // decode longer ones.
+    let pcm_buf = vec![0i16; dec.max_frame_size_per_channel() * sf.channels() as usize];
     Ok(OpusDecoder {
         decoder: dec,
         sample_format: sf,
-        pcm_buf: vec![0i16; MAX_FRAME_SIZE * sf.channels() as usize],
+        pcm_buf,
     })
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +173,20 @@ mod tests {
         };
         let dec = create(&header);
         assert!(dec.is_ok());
+    }
+
+    #[test]
+    fn decodes_the_longest_packet() {
+        let header = CodecHeader {
+            codec: "opus".into(),
+            payload: opus_header(48000, 16, 2),
+        };
+        let mut dec = create(&header).unwrap();
+        // 6 frames of 20 ms (CELT fullband, stereo, code 3 CBR), each one
+        // byte of silence: 120 ms.
+        let mut data = vec![(31 << 3) | 0x04 | 3, 6];
+        data.extend([0u8; 6]);
+        assert!(dec.decode(&mut data).unwrap());
+        assert_eq!(data.len(), 5760 * 2 * 2);
     }
 }
