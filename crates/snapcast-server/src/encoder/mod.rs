@@ -110,32 +110,31 @@ pub(crate) fn f32_to_pcm(samples: &[f32], bits: u16) -> Vec<u8> {
     }
 }
 
-/// Convert PCM bytes to f32 samples at the given bit depth.
-/// Shared helper for encoders that need f32 input.
+/// Append PCM bytes at the given bit depth (16 bits for an unsupported one)
+/// to `out` as f32 samples, scaled by 2^(bits-1) as `opus_encode()` scales
+/// 16-bit input. Of a 24-bit sample only the low 3 bytes count, as in
+/// playback. Shared helper for encoders that need f32 input.
 #[cfg(any(feature = "opus", test))]
-pub(crate) fn pcm_to_f32(pcm: &[u8], bits: u16) -> Vec<f32> {
+pub(crate) fn extend_f32_from_pcm(out: &mut Vec<f32>, pcm: &[u8], bits: u16) {
     match bits {
-        16 => pcm
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32)
-            .collect(),
-        24 => pcm
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| {
-                i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / snapcast_proto::PCM_24BIT_MAX
-            })
-            .collect(),
-        32 => pcm
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32 / i32::MAX as f32)
-            .collect(),
-        _ => pcm_to_f32(pcm, 16),
+        24 => out.extend(
+            pcm.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| ((i32::from_le_bytes(*c) << 8) >> 8) as f32 / 8_388_608.0),
+        ),
+        32 => out.extend(
+            pcm.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c) as f32 / 2_147_483_648.0),
+        ),
+        _ => out.extend(
+            pcm.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from(i16::from_le_bytes(*c)) / 32768.0),
+        ),
     }
 }
 
@@ -147,7 +146,17 @@ mod tests {
     fn f32_to_24_bit_pcm_uses_padded_samples() {
         let pcm = f32_to_pcm(&[0.0, 1.0, -1.0], 24);
         assert_eq!(pcm.len(), 12);
-        assert_eq!(pcm_to_f32(&pcm, 24).len(), 3);
+        let mut samples = Vec::new();
+        extend_f32_from_pcm(&mut samples, &pcm, 24);
+        assert_eq!(samples.len(), 3);
+    }
+
+    #[test]
+    fn pcm_to_f32_ignores_the_24_bit_padding_byte() {
+        let mut samples = Vec::new();
+        // -1 in 24 bits, with a garbage top byte.
+        extend_f32_from_pcm(&mut samples, &0x12FF_FFFFu32.to_le_bytes(), 24);
+        assert_eq!(samples, [-1.0 / 8_388_608.0]);
     }
 
     #[test]

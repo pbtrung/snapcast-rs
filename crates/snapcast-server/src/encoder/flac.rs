@@ -178,11 +178,15 @@ impl FlacEncoder {
                     .iter()
                     .map(|c| i32::from(i16::from_le_bytes(*c))),
             ),
+            // 24-bit samples in 4 bytes (32-bit is rejected at construction).
+            // Only the low 3 bytes carry the sample, as for PCM playback:
+            // sign-extend them, or a stray padding byte would put the sample
+            // out of range and fail the whole block.
             4 => self.pending.extend(
                 pcm.as_chunks::<4>()
                     .0
                     .iter()
-                    .map(|c| i32::from_le_bytes(*c)),
+                    .map(|c| (i32::from_le_bytes(*c) << 8) >> 8),
             ),
             other => bail!("unsupported sample size: {other}"),
         }
@@ -391,6 +395,25 @@ mod tests {
             }
         }
         assert!(produced, "expected 24-bit FLAC frames");
+    }
+
+    #[test]
+    fn padding_byte_of_24_bit_samples_is_ignored() {
+        let fmt = SampleFormat::new(48000, 24, 2);
+        let samples: Vec<i32> = (0..BLOCK_SIZE as i32 * 2)
+            .map(|n| (n * 4099) % 8_000_000 - 4_000_000)
+            .collect();
+        let clean: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Same samples with garbage in the unused top byte.
+        let dirty: Vec<u8> = samples
+            .iter()
+            .flat_map(|v| (v ^ 0x5A00_0000u32 as i32).to_le_bytes())
+            .collect();
+        let mut a = FlacEncoder::new(fmt, "").unwrap();
+        let mut b = FlacEncoder::new(fmt, "").unwrap();
+        let a = a.encode(AudioData::Pcm(clean)).unwrap();
+        let b = b.encode(AudioData::Pcm(dirty)).expect("encodes");
+        assert_eq!(a[0].data, b[0].data);
     }
 
     #[test]

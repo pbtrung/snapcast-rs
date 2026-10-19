@@ -139,15 +139,9 @@ impl Encoder for OpusEncoder {
             // PCM is scaled exactly as opus_encode() does, so neither is
             // quantized here.
             AudioData::F32(samples) => self.pending.extend_from_slice(&samples),
-            AudioData::Pcm(data) if self.format.bits() == 16 => self.pending.extend(
-                data.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0),
-            ),
-            AudioData::Pcm(data) => self
-                .pending
-                .extend(super::pcm_to_f32(&data, self.format.bits())),
+            AudioData::Pcm(data) => {
+                super::extend_f32_from_pcm(&mut self.pending, &data, self.format.bits());
+            }
         }
         // Whole inter-channel frames only, so interleaving never shifts.
         self.pending
