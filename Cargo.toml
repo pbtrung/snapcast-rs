@@ -65,6 +65,9 @@ rubato = "5"
 # Audio backends
 alsa = "0.11"  # must match the version cpal uses (shared alsa-sys)
 
+# Property tests (dev)
+proptest = "1"
+
 
 [profile.release]
 lto = true

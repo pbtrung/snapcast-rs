@@ -30,7 +30,7 @@ websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
 resampler = ["dep:rubato"]
 
 [dev-dependencies]
-proptest = "1"
+proptest = { workspace = true }
 # Encodes the FLAC frames the decoder tests feed in.
 flacenc = { version = "0.5", default-features = false }
 
