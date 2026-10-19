@@ -8,12 +8,11 @@
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
 use snapcast_server::AudioFrame;
-use snapcast_server::time::ChunkTimestamper;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PcmEncoding, PumpEnd, RETRY_DELAY, frames_duration, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
 
 /// Configure reading PCM from a named pipe; the returned closure starts it.
 pub fn reader(
@@ -27,9 +26,7 @@ pub fn reader(
         Some("read") => false,
         Some(other) => anyhow::bail!("pipe source mode must be create or read, got {other:?}"),
     };
-    let encoding = PcmEncoding::from_uri(&uri)?;
-    let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
-    let chunk_duration = frames_duration(format, chunk_frames);
+    let chunking = Chunking::from_uri(&uri, format, chunk_frames)?;
 
     Ok(move |tx: mpsc::Sender<AudioFrame>| {
         tokio::spawn(async move {
@@ -59,24 +56,14 @@ pub fn reader(
                     } else {
                         tokio::fs::File::open(&path)
                             .await
-                            .map(|file| Box::new(Follow::new(file, chunk_duration)) as _)
+                            .map(|file| Box::new(Follow::new(file, chunking.duration())) as _)
                     };
                 match opened {
                     Ok(mut reader) => {
                         tracing::info!(path, "Pipe stream opened");
-                        let mut ts = ChunkTimestamper::new(format.rate());
-                        match pump_pcm(
-                            &mut reader,
-                            &mut ts,
-                            chunk_frames,
-                            chunk_bytes,
-                            encoding,
-                            &tx,
-                            Some(chunk_duration),
-                        )
-                        .await
-                        {
-                            PumpEnd::SourceEnded => {
+                        let mut ts = chunking.timestamper();
+                        match pump_pcm(&mut reader, &mut ts, &chunking, &tx).await {
+                            PumpEnd::SourceEnded { .. } => {
                                 tracing::debug!(path, "Pipe read ended, reopening");
                             }
                             PumpEnd::TxClosed => return,

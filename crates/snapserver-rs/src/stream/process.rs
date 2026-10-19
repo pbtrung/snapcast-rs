@@ -3,13 +3,12 @@
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
 use snapcast_server::AudioFrame;
-use snapcast_server::time::ChunkTimestamper;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PcmEncoding, PumpEnd, RETRY_DELAY, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
 
 /// Configure a child process whose stdout PCM is read, restarted whenever
 /// it exits; the returned closure starts it.
@@ -21,12 +20,10 @@ pub fn reader(
     let path = uri.path.clone();
     let params = uri.param("params").unwrap_or("").to_string();
     let args = split_args(&params);
-    let encoding = PcmEncoding::from_uri(&uri)?;
-    let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
+    let chunking = Chunking::from_uri(&uri, format, chunk_frames)?;
 
     Ok(move |tx: mpsc::Sender<AudioFrame>| {
         tokio::spawn(async move {
-            let mut ts = ChunkTimestamper::new(format.rate());
             loop {
                 tracing::info!(path, params, "Starting process stream");
                 let mut child = match Command::new(&path)
@@ -50,24 +47,13 @@ pub fn reader(
                     continue;
                 };
 
-                if let PumpEnd::TxClosed = pump_pcm(
-                    &mut stdout,
-                    &mut ts,
-                    chunk_frames,
-                    chunk_bytes,
-                    encoding,
-                    &tx,
-                    None,
-                )
-                .await
-                {
-                    let _ = child.kill().await;
+                let mut ts = chunking.timestamper();
+                let end = pump_pcm(&mut stdout, &mut ts, &chunking, &tx).await;
+                let _ = child.kill().await;
+                if let PumpEnd::TxClosed = end {
                     return;
                 }
-
-                let _ = child.kill().await;
                 tracing::info!(path, "Process exited, restarting");
-                ts.reset();
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         })

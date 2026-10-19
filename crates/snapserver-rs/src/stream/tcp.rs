@@ -6,13 +6,12 @@
 use anyhow::Result;
 use snapcast_proto::SampleFormat;
 use snapcast_server::AudioFrame;
-use snapcast_server::time::ChunkTimestamper;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{PcmEncoding, PumpEnd, RETRY_DELAY, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
 
 /// Configure reading PCM over TCP; the returned closure starts it.
 pub fn reader(
@@ -35,14 +34,12 @@ pub fn reader(
         uri.host.clone()
     };
     let port = uri.port;
-    let encoding = PcmEncoding::from_uri(&uri)?;
-    let chunk_bytes = encoding.chunk_bytes(format, chunk_frames);
+    let chunking = Chunking::from_uri(&uri, format, chunk_frames)?;
 
     Ok(move |tx: mpsc::Sender<AudioFrame>| {
         tokio::spawn(async move {
-            let mut ts = ChunkTimestamper::new(format.rate());
-            let pump = async |stream: &mut TcpStream, ts: &mut ChunkTimestamper| {
-                pump_pcm(stream, ts, chunk_frames, chunk_bytes, encoding, &tx, None).await
+            let pump = async |stream: &mut TcpStream| {
+                pump_pcm(stream, &mut chunking.timestamper(), &chunking, &tx).await
             };
 
             if client {
@@ -50,10 +47,9 @@ pub fn reader(
                     match TcpStream::connect((host.as_str(), port)).await {
                         Ok(mut stream) => {
                             tracing::info!(host, port, "TCP stream connected");
-                            match pump(&mut stream, &mut ts).await {
-                                PumpEnd::SourceEnded => {
+                            match pump(&mut stream).await {
+                                PumpEnd::SourceEnded { .. } => {
                                     tracing::info!(host, port, "TCP stream disconnected");
-                                    ts.reset();
                                 }
                                 PumpEnd::TxClosed => return,
                             }
@@ -80,10 +76,9 @@ pub fn reader(
                 match listener.accept().await {
                     Ok((mut stream, peer)) => {
                         tracing::info!(%peer, "TCP stream client connected");
-                        match pump(&mut stream, &mut ts).await {
-                            PumpEnd::SourceEnded => {
+                        match pump(&mut stream).await {
+                            PumpEnd::SourceEnded { .. } => {
                                 tracing::info!(%peer, "TCP stream client disconnected");
-                                ts.reset();
                             }
                             PumpEnd::TxClosed => return,
                         }
