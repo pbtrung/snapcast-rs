@@ -116,15 +116,21 @@ async fn handle_entry(
     Some(response)
 }
 
-/// Fetch server status via GetStatus command, serialized to JSON.
-pub(crate) async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
+/// Fetch server status via GetStatus command.
+async fn get_typed_status(
+    cmd_tx: &mpsc::Sender<ServerCommand>,
+) -> Option<snapcast_server::status::ServerStatus> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(ServerCommand::GetStatus { response_tx: tx })
         .await
         .ok()?;
-    let status = rx.await.ok()?;
-    serde_json::to_value(status).ok()
+    rx.await.ok()
+}
+
+/// Fetch server status via GetStatus command, serialized to JSON.
+pub(crate) async fn get_status(cmd_tx: &mpsc::Sender<ServerCommand>) -> Option<Value> {
+    serde_json::to_value(get_typed_status(cmd_tx).await?).ok()
 }
 
 /// The entries of array `key` in `value`, none if it is not an array.
@@ -137,11 +143,6 @@ pub(crate) fn find_client<'a>(status: &'a Value, client_id: &str) -> Option<&'a 
     entries(&status["server"], "groups")
         .flat_map(|g| entries(g, "clients"))
         .find(|c| c["id"].as_str() == Some(client_id))
-}
-
-/// Find a group in a serialized server status by ID.
-fn find_group<'a>(status: &'a Value, group_id: &str) -> Option<&'a Value> {
-    entries(&status["server"], "groups").find(|g| g["id"].as_str() == Some(group_id))
 }
 
 /// Find a stream in a serialized server status by ID.
@@ -158,13 +159,32 @@ enum Target {
 }
 
 impl Target {
-    fn find(self, status: &Value, target_id: &str) -> Option<Value> {
+    /// The entry `target_id` of `status`, as JSON. Only that entry is
+    /// serialized, not the whole status.
+    fn find(
+        self,
+        status: &snapcast_server::status::ServerStatus,
+        target_id: &str,
+    ) -> Option<Value> {
+        let groups = &status.server.groups;
         match self {
-            Self::Client => find_client(status, target_id),
-            Self::Group => find_group(status, target_id),
-            Self::Stream => find_stream(status, target_id),
-        }
-        .cloned()
+            Self::Client => groups
+                .iter()
+                .flat_map(|g| &g.clients)
+                .find(|c| c.id == target_id)
+                .map(serde_json::to_value),
+            Self::Group => groups
+                .iter()
+                .find(|g| g.id == target_id)
+                .map(serde_json::to_value),
+            Self::Stream => status
+                .server
+                .streams
+                .iter()
+                .find(|s| s.id == target_id)
+                .map(serde_json::to_value),
+        }?
+        .ok()
     }
 
     /// The error message when it does not exist (as C++ snapserver's).
@@ -186,7 +206,7 @@ async fn require(
     target_id: &str,
     cmd_tx: &mpsc::Sender<ServerCommand>,
 ) -> Result<Value, Value> {
-    let Some(status) = get_status(cmd_tx).await else {
+    let Some(status) = get_typed_status(cmd_tx).await else {
         return Err(err(id, INTERNAL_ERROR, "status unavailable"));
     };
     target
@@ -262,31 +282,30 @@ pub(crate) async fn handle_request(
         }
         "Client.SetVolume" => {
             let client_id = require_str!(params, "id", id);
-            let client = require!(Client, client_id, id, cmd_tx);
             let requested = &params["volume"];
             // Like C++ snapserver, a field left out keeps its current value,
-            // so `{"muted": true}` mutes without touching the level.
-            let current = &client["config"]["volume"];
-            let volume = requested["percent"]
-                .as_u64()
-                .map(|p| p.min(100))
-                .or(current["percent"].as_u64())
-                .unwrap_or(100) as u16;
-            let muted = requested["muted"]
-                .as_bool()
-                .or(current["muted"].as_bool())
-                .unwrap_or(false);
+            // so `{"muted": true}` mutes without touching the level. The
+            // server fills it in, so concurrent updates can't undo each
+            // other.
+            let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = cmd_tx
                 .send(tagged(
                     origin,
-                    ServerCommand::SetClientVolume {
+                    ServerCommand::UpdateClientVolume {
                         client_id: client_id.to_string(),
-                        volume,
-                        muted,
+                        volume: requested["percent"].as_u64().map(|p| p.min(100) as u16),
+                        muted: requested["muted"].as_bool(),
+                        response_tx: tx,
                     },
                 ))
                 .await;
-            ok(id, json!({"volume": {"percent": volume, "muted": muted}}))
+            match rx.await {
+                Ok(Some((volume, muted))) => {
+                    ok(id, json!({"volume": {"percent": volume, "muted": muted}}))
+                }
+                Ok(None) => err(id, INTERNAL_ERROR, Target::Client.not_found()),
+                Err(_) => err(id, INTERNAL_ERROR, "command failed"),
+            }
         }
         "Client.SetLatency" => {
             let client_id = require_str!(params, "id", id);
@@ -307,10 +326,16 @@ pub(crate) async fn handle_request(
                 ))
                 .await;
             // The server limits the latency: answer with what it stored.
-            let stored = get_status(cmd_tx)
-                .await
-                .and_then(|status| find_client(&status, client_id)?["config"]["latency"].as_i64());
-            ok(id, json!({"latency": stored.unwrap_or(i64::from(latency))}))
+            let stored = get_typed_status(cmd_tx).await.and_then(|status| {
+                status
+                    .server
+                    .groups
+                    .iter()
+                    .flat_map(|g| &g.clients)
+                    .find(|c| c.id == client_id)
+                    .map(|c| c.config.latency)
+            });
+            ok(id, json!({"latency": stored.unwrap_or(latency)}))
         }
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
@@ -585,6 +610,19 @@ mod tests {
                     } => {
                         volume = v;
                         muted = m;
+                    }
+                    ServerCommand::UpdateClientVolume {
+                        client_id,
+                        volume: v,
+                        muted: m,
+                        response_tx,
+                    } => {
+                        let result = (client_id == "c1").then(|| {
+                            volume = v.unwrap_or(volume);
+                            muted = m.unwrap_or(muted);
+                            (volume, muted)
+                        });
+                        let _ = response_tx.send(result);
                     }
                     // Limited as the server does, with a 1000 ms buffer.
                     ServerCommand::SetClientLatency { latency: l, .. } => {
@@ -1420,11 +1458,36 @@ mod tests {
                             },
                         });
                     }
-                    cmd => record.lock().unwrap().push(cmd),
+                    cmd => record.lock().unwrap().push(answered(cmd)),
                 }
             }
         });
         (cmd_tx, seen)
+    }
+
+    /// `cmd`, with its response (if it awaits one) sent.
+    fn answered(cmd: ServerCommand) -> ServerCommand {
+        match cmd {
+            ServerCommand::FromControl { origin, command } => ServerCommand::FromControl {
+                origin,
+                command: Box::new(answered(*command)),
+            },
+            ServerCommand::UpdateClientVolume {
+                client_id,
+                volume,
+                muted,
+                response_tx,
+            } => {
+                let _ = response_tx.send(Some((volume.unwrap_or(100), muted.unwrap_or(false))));
+                ServerCommand::UpdateClientVolume {
+                    client_id,
+                    volume,
+                    muted,
+                    response_tx: tokio::sync::oneshot::channel().0,
+                }
+            }
+            cmd => cmd,
+        }
     }
 
     #[tokio::test]
@@ -1487,7 +1550,7 @@ mod tests {
         .await;
         assert!(matches!(
             seen.lock().unwrap()[..],
-            [ServerCommand::SetClientVolume { .. }]
+            [ServerCommand::UpdateClientVolume { .. }]
         ));
     }
 

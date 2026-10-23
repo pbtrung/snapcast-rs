@@ -51,6 +51,8 @@ pub struct PcmChunk {
     /// Encoding of the sample bytes.
     pub encoding: SampleEncoding,
     read_pos: usize,
+    /// Silence a [`Stream`] inserted, whose buffer it reuses.
+    silent: bool,
 }
 
 impl PcmChunk {
@@ -72,6 +74,7 @@ impl PcmChunk {
             format,
             encoding,
             read_pos: 0,
+            silent: false,
         }
     }
 
@@ -181,6 +184,21 @@ const DISCONTINUITY_HARD_SYNC_USEC: i64 = HARD_SYNC_AGE_USEC;
 const QUEUE_SLACK_MS: i64 = 3000;
 /// Upper bound on the bytes queued, whatever the format and buffer.
 const MAX_QUEUE_BYTES: usize = 128 << 20;
+/// Sync events kept for [`Stream::log_events`]; more are only counted.
+const MAX_SYNC_EVENTS: usize = 32;
+
+/// Something worth logging that happened while reading audio. Reads run
+/// in the audio callback, where writing a log line could stall playback,
+/// so events are kept and logged later by [`Stream::log_events`].
+#[derive(Debug, Clone, Copy)]
+enum SyncEvent {
+    /// A hard sync started: `reason`, with the value that caused it (µs).
+    HardSync { reason: &'static str, usec: i64 },
+    /// Silence was inserted for a gap between chunks.
+    Gap { usec: i64, frames: i64 },
+    /// Audio already played was skipped where chunks overlap.
+    Overlap { usec: i64, frames: i64 },
+}
 
 /// Time-synchronized PCM stream buffer.
 ///
@@ -254,6 +272,14 @@ pub struct Stream {
     frame_delta: i32,
     /// Internal buffer used for sample insertion/removal.
     read_buf: Vec<u8>,
+    /// Buffer for the silence filling a gap, reserved for the longest gap
+    /// played (longer ones hard sync) and reused, so the audio callback
+    /// never allocates it.
+    silence: Vec<u8>,
+    /// Events to log, at most [`MAX_SYNC_EVENTS`] (never reallocated).
+    events: Vec<SyncEvent>,
+    /// Events not kept since the last [`Stream::log_events`].
+    events_dropped: u32,
 
     /// Last time (in server seconds) that stats were logged.
     last_log_sec: i64,
@@ -285,7 +311,70 @@ impl Stream {
             correction_frames: 0.0,
             frame_delta: 0,
             read_buf: Vec::new(),
+            silence: Vec::with_capacity(Self::max_gap_bytes(format)),
+            events: Vec::with_capacity(MAX_SYNC_EVENTS),
+            events_dropped: 0,
             last_log_sec: 0,
+        }
+    }
+
+    /// Bytes of the silence for the longest gap filled.
+    fn max_gap_bytes(format: SampleFormat) -> usize {
+        let frames = DISCONTINUITY_HARD_SYNC_USEC as u64 * u64::from(format.rate()) / 1_000_000 + 1;
+        frames as usize * format.frame_size() as usize
+    }
+
+    fn record(&mut self, event: SyncEvent) {
+        // Within the reserved capacity: never allocates.
+        if self.events.len() < self.events.capacity() {
+            self.events.push(event);
+        } else {
+            self.events_dropped += 1;
+        }
+    }
+
+    /// Log the sync events (hard syncs, gaps, overlaps) since the last call.
+    /// Call it outside the audio callback, now and then: the callback only
+    /// records them, as writing log lines could stall it.
+    pub fn log_events(&mut self) {
+        for event in self.events.drain(..) {
+            match event {
+                SyncEvent::HardSync { reason, usec } => {
+                    tracing::info!(usec, "Hard sync: {reason}");
+                }
+                SyncEvent::Gap { usec, frames } => {
+                    tracing::info!(
+                        gap_usec = usec,
+                        frames,
+                        "Gap between chunks, inserted silence"
+                    );
+                }
+                SyncEvent::Overlap { usec, frames } => {
+                    tracing::info!(
+                        overlap_usec = usec,
+                        frames,
+                        "Chunks overlap, skipped audio already played"
+                    );
+                }
+            }
+        }
+        if self.events_dropped > 0 {
+            tracing::info!(count = self.events_dropped, "More sync events not logged");
+            self.events_dropped = 0;
+        }
+    }
+
+    /// Make `next` the current chunk, keeping the buffer of a silent one.
+    fn replace_current(&mut self, next: Option<PcmChunk>) {
+        if let Some(old) = std::mem::replace(&mut self.current, next) {
+            self.recycle(old);
+        }
+    }
+
+    /// Done with `chunk`: keep its buffer if it was inserted silence.
+    fn recycle(&mut self, chunk: PcmChunk) {
+        if chunk.silent && chunk.data.capacity() >= self.silence.capacity() {
+            self.silence = chunk.data;
         }
     }
 
@@ -409,10 +498,11 @@ impl Stream {
     ) -> bool {
         let needs_new = self.current.as_ref().is_none_or(|c| c.is_end());
         if needs_new {
-            self.current = match self.current.as_ref() {
+            let next = match self.current.as_ref() {
                 Some(ended) if !self.hard_sync => self.next_chunk(ended.end_usec()),
                 _ => self.pop_front_chunk(),
             };
+            self.replace_current(next);
         }
         if self.current.is_none() {
             return false;
@@ -455,6 +545,7 @@ impl Stream {
                         self.current = Some(c);
                         break;
                     }
+                    self.recycle(c);
                 }
                 if self.current.is_none() {
                     return false;
@@ -509,32 +600,35 @@ impl Stream {
             && self.median.abs() > HARD_SYNC_MEDIAN_USEC
             && age_usec.abs() > HARD_SYNC_MIN_AGE_USEC
         {
-            tracing::info!(
-                median = self.median,
-                "Hard sync: buffer full, |median| > 2ms"
-            );
+            self.record(SyncEvent::HardSync {
+                reason: "buffer full, |median| > 2ms",
+                usec: self.median,
+            });
             self.hard_sync = true;
         } else if self.short_buffer.full()
             && self.short_median.abs() > HARD_SYNC_SHORT_MEDIAN_USEC
             && age_usec.abs() > HARD_SYNC_MIN_AGE_USEC
         {
-            tracing::info!(
-                short_median = self.short_median,
-                "Hard sync: short buffer full, |short_median| > 5ms"
-            );
+            self.record(SyncEvent::HardSync {
+                reason: "short buffer full, |short_median| > 5ms",
+                usec: self.short_median,
+            });
             self.hard_sync = true;
         } else if self.mini_buffer.full()
             && self.mini_buffer.median().abs() > HARD_SYNC_MINI_MEDIAN_USEC
             && age_usec.abs() > HARD_SYNC_MIN_AGE_USEC
         {
-            tracing::info!(
-                age_usec,
-                mini_median = self.mini_buffer.median(),
-                "Hard sync: mini buffer full, |mini_median| > 50ms"
-            );
+            let mini_median = self.mini_buffer.median();
+            self.record(SyncEvent::HardSync {
+                reason: "mini buffer full, |mini_median| > 50ms",
+                usec: mini_median,
+            });
             self.hard_sync = true;
         } else if age_usec.abs() > HARD_SYNC_AGE_USEC {
-            tracing::info!(age_usec, "Hard sync: |age| > 500ms");
+            self.record(SyncEvent::HardSync {
+                reason: "|age| > 500ms",
+                usec: age_usec,
+            });
             self.hard_sync = true;
         }
 
@@ -609,7 +703,7 @@ impl Stream {
             if read < frames && chunk.is_end() {
                 let ended = chunk.end_usec();
                 match self.next_chunk(ended) {
-                    Some(next) => self.current = Some(next),
+                    Some(next) => self.replace_current(Some(next)),
                     None => break,
                 }
             } else if n == 0 {
@@ -644,34 +738,38 @@ impl Stream {
                 return Some(next);
             }
             if jump.abs() > DISCONTINUITY_HARD_SYNC_USEC {
-                tracing::info!(jump_usec = jump, "Hard sync: chunk timestamps jump");
+                self.record(SyncEvent::HardSync {
+                    reason: "chunk timestamps jump",
+                    usec: jump,
+                });
                 self.push_front_chunk(next);
                 self.hard_sync = true;
                 return None;
             }
             let frames = (jump.abs() * rate + 500_000) / 1_000_000;
             if jump > 0 {
-                tracing::info!(
-                    gap_usec = jump,
-                    frames,
-                    "Gap between chunks, inserting silence"
-                );
+                self.record(SyncEvent::Gap { usec: jump, frames });
                 self.push_front_chunk(next);
                 let bytes = frames as usize * self.format.frame_size() as usize;
-                return Some(PcmChunk::new_with_encoding(
+                // The reserved buffer: no allocation in the audio callback.
+                let mut data = std::mem::take(&mut self.silence);
+                data.clear();
+                data.resize(bytes, 0);
+                let mut silence = PcmChunk::new_with_encoding(
                     Timeval::from_usec(prev_end_usec),
-                    vec![0; bytes],
+                    data,
                     self.format,
                     self.encoding,
-                ));
+                );
+                silence.silent = true;
+                return Some(silence);
             }
             let remaining = (next.data.len() - next.read_pos) as i64
                 / i64::from(self.format.frame_size().max(1));
-            tracing::info!(
-                overlap_usec = -jump,
-                frames = frames.min(remaining),
-                "Chunks overlap, skipping audio already played"
-            );
+            self.record(SyncEvent::Overlap {
+                usec: -jump,
+                frames: frames.min(remaining),
+            });
             if frames >= remaining {
                 continue;
             }
@@ -1211,6 +1309,49 @@ mod tests {
         assert_eq!(got[720], 721, "resumes at the late chunk's first frame");
         assert_eq!(got[1199], 1200);
         assert!(got[1200..].iter().all(|&i| i == 0), "underrun");
+    }
+
+    /// The silence of a gap reuses the buffer reserved at construction, so
+    /// the audio callback never allocates it, and the event is only logged
+    /// later.
+    #[test]
+    fn gap_silence_reuses_the_reserved_buffer() {
+        let mut s = stream_of(vec![
+            counter_chunk(T, 0, 480),
+            counter_chunk(T + 15_000, 720, 480),
+            counter_chunk(T + 30_000, 1440, 480),
+        ]);
+        let reserved = s.silence.as_ptr();
+        assert!(s.silence.capacity() >= Stream::max_gap_bytes(fmt()));
+        let mut out = vec![0u8; 720 * 4];
+        s.read_next(&mut out, 720);
+        let current = s.current.as_ref().unwrap();
+        assert!(current.silent);
+        assert_eq!(current.data.as_ptr(), reserved, "no new buffer");
+        // Past the silence: the buffer is back for the next gap.
+        s.read_next(&mut out, 480);
+        assert_eq!(s.silence.as_ptr(), reserved);
+        // The second gap (240 frames) takes it again, and gives it back.
+        s.read_next(&mut out, 480);
+        assert_eq!(indices(&out)[240], 1441);
+        assert_eq!(s.silence.as_ptr(), reserved);
+
+        assert_eq!(s.events.len(), 2, "both gaps recorded");
+        s.log_events();
+        assert!(s.events.is_empty());
+    }
+
+    #[test]
+    fn sync_events_never_grow_past_their_capacity() {
+        let mut s = Stream::new(fmt());
+        let capacity = s.events.capacity();
+        for _ in 0..capacity + 5 {
+            s.record(SyncEvent::Gap { usec: 1, frames: 1 });
+        }
+        assert_eq!(s.events.capacity(), capacity);
+        assert_eq!(s.events_dropped, 5);
+        s.log_events();
+        assert_eq!(s.events_dropped, 0);
     }
 
     #[test]

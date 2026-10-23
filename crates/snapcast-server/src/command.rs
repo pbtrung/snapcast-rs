@@ -108,6 +108,38 @@ impl Dispatcher {
         Some(result)
     }
 
+    /// Set the fields of a client's volume that are given, under one state
+    /// lock. Returns the resulting `(volume, muted)`, `None` for an unknown
+    /// client (which changes nothing).
+    async fn update_client_volume(
+        &self,
+        origin: Option<u64>,
+        client_id: &str,
+        volume: Option<u16>,
+        muted: Option<bool>,
+    ) -> Option<(u16, bool)> {
+        let (result, settings) = self
+            .mutate_state_if(|s| {
+                let v = &mut s.clients.get_mut(client_id)?.config.volume;
+                v.percent = volume.unwrap_or(v.percent).min(100);
+                v.muted = muted.unwrap_or(v.muted);
+                let result = (v.percent, v.muted);
+                Some((result, self.settings_for(s, [&client_id.to_string()])))
+            })
+            .await?;
+        self.push_settings(settings).await;
+        self.notify(
+            origin,
+            ServerEvent::ClientVolumeChanged {
+                client_id: client_id.to_string(),
+                volume: result.0,
+                muted: result.1,
+            },
+        );
+        self.session_srv.update_routing_for_client(client_id).await;
+        Some(result)
+    }
+
     /// Report a structural change after clients were deleted (the
     /// `StateChanged` snapshot is sent already).
     async fn announce_removed_clients(&self, origin: Option<u64>) {
@@ -167,25 +199,19 @@ impl Dispatcher {
                 volume,
                 muted,
             } => {
-                let settings = self
-                    .mutate_state(|s| {
-                        if let Some(c) = s.clients.get_mut(&client_id) {
-                            c.config.volume.percent = volume;
-                            c.config.volume.muted = muted;
-                        }
-                        self.settings_for(s, [&client_id])
-                    })
+                self.update_client_volume(origin, &client_id, Some(volume), Some(muted))
                     .await;
-                self.push_settings(settings).await;
-                self.notify(
-                    origin,
-                    ServerEvent::ClientVolumeChanged {
-                        client_id: client_id.clone(),
-                        volume,
-                        muted,
-                    },
-                );
-                self.session_srv.update_routing_for_client(&client_id).await;
+            }
+            ServerCommand::UpdateClientVolume {
+                client_id,
+                volume,
+                muted,
+                response_tx,
+            } => {
+                let result = self
+                    .update_client_volume(origin, &client_id, volume, muted)
+                    .await;
+                let _ = response_tx.send(result);
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
                 // As C++ snapserver: a latency beyond the buffer leaves the
@@ -503,7 +529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_client_volume_unknown_client_is_noop_but_still_notifies() {
+    async fn set_client_volume_unknown_client_is_a_silent_noop() {
         let (d, mut rx) = dispatcher_with(ServerState::default());
         d.dispatch(
             None,
@@ -514,11 +540,43 @@ mod tests {
             },
         )
         .await;
-        assert!(
-            drain(&mut rx)
-                .iter()
-                .any(|e| matches!(e, ServerEvent::ClientVolumeChanged { .. }))
+        assert!(drain(&mut rx).is_empty(), "no events for an unknown client");
+    }
+
+    /// Regression: partial volume updates were filled in from a status read
+    /// earlier, so two concurrent ones (one setting only the level, one only
+    /// the mute) could undo each other.
+    #[tokio::test]
+    async fn partial_volume_updates_keep_the_other_field() {
+        let (state, _gid) = state_with_client();
+        let (d, _rx) = dispatcher_with(state);
+        let update = |client_id: &str, volume, muted| {
+            let (tx, rx) = oneshot::channel();
+            let cmd = ServerCommand::UpdateClientVolume {
+                client_id: client_id.into(),
+                volume,
+                muted,
+                response_tx: tx,
+            };
+            (cmd, rx)
+        };
+        let (mute, mute_rx) = update("c1", None, Some(true));
+        let (level, level_rx) = update("c1", Some(150), None);
+        d.dispatch(None, mute).await;
+        d.dispatch(None, level).await;
+        assert_eq!(mute_rx.await.unwrap(), Some((100, true)));
+        assert_eq!(
+            level_rx.await.unwrap(),
+            Some((100, true)),
+            "clamped, still muted"
         );
+        let (lower, lower_rx) = update("c1", Some(30), None);
+        d.dispatch(None, lower).await;
+        assert_eq!(lower_rx.await.unwrap(), Some((30, true)));
+
+        let (ghost, ghost_rx) = update("ghost", Some(1), None);
+        d.dispatch(None, ghost).await;
+        assert_eq!(ghost_rx.await.unwrap(), None);
     }
 
     #[test]

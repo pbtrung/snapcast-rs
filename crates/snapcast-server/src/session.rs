@@ -101,6 +101,11 @@ struct SessionContext {
     settings_senders: Mutex<HashMap<String, watch::Sender<ClientSettingsUpdate>>>,
     routing_senders: Mutex<HashMap<String, watch::Sender<SessionRouting>>>,
     codec_headers: Mutex<HashMap<String, StreamCodecInfo>>,
+    /// Each registered stream's encoded audio. Sessions subscribe only to
+    /// their own stream, so an encoder runs only while someone listens to
+    /// it, and one stream's audio never fills another's backlog. A plain
+    /// mutex, held only to look up or change the map.
+    audio: std::sync::Mutex<HashMap<String, broadcast::Sender<WireChunkData>>>,
     /// The one live session per client id. A reconnect with the same id
     /// replaces (and cancels) the previous session.
     sessions: Mutex<HashMap<String, ActiveSession>>,
@@ -343,6 +348,19 @@ impl SessionContext {
         }
     }
 
+    /// A subscription to the audio a session with `routing` plays: none
+    /// while it is muted (unless muted clients get audio) or its stream is
+    /// not registered.
+    fn subscribe(&self, routing: &SessionRouting) -> Option<broadcast::Receiver<WireChunkData>> {
+        if !self.send_audio_to_muted && (routing.client_muted || routing.group_muted) {
+            return None;
+        }
+        let audio = self.audio.lock().unwrap_or_else(|e| e.into_inner());
+        audio
+            .get(&routing.stream_id)
+            .map(broadcast::Sender::subscribe)
+    }
+
     /// Get codec header for a stream. Returns None if not registered.
     async fn codec_header_for(&self, stream_id: &str) -> Option<StreamCodecInfo> {
         self.codec_headers.lock().await.get(stream_id).cloned()
@@ -390,6 +408,7 @@ impl SessionServer {
                 settings_senders: Mutex::new(HashMap::new()),
                 routing_senders: Mutex::new(HashMap::new()),
                 codec_headers: Mutex::new(HashMap::new()),
+                audio: Default::default(),
                 sessions: Mutex::new(HashMap::new()),
                 next_generation: AtomicU64::new(0),
                 shared_state: config.shared_state,
@@ -400,7 +419,13 @@ impl SessionServer {
     }
 
     /// Register a stream's codec header (called during stream setup).
-    pub async fn register_stream_codec(&self, stream_id: &str, codec: &str, header: &[u8]) {
+    /// Returns the sender for the stream's encoded audio.
+    pub async fn register_stream_codec(
+        &self,
+        stream_id: &str,
+        codec: &str,
+        header: &[u8],
+    ) -> broadcast::Sender<WireChunkData> {
         self.ctx.codec_headers.lock().await.insert(
             stream_id.to_string(),
             StreamCodecInfo {
@@ -408,11 +433,18 @@ impl SessionServer {
                 header: header.to_vec(),
             },
         );
+        let (tx, _) = broadcast::channel(crate::CHUNK_CHANNEL_SIZE);
+        let mut audio = self.ctx.audio.lock().unwrap_or_else(|e| e.into_inner());
+        audio.insert(stream_id.to_string(), tx.clone());
+        tx
     }
 
-    /// Forget a removed stream's codec header.
+    /// Forget a removed stream's codec header and audio channel. Its
+    /// sessions get no audio until their routing moves them on.
     pub async fn unregister_stream_codec(&self, stream_id: &str) {
         self.ctx.codec_headers.lock().await.remove(stream_id);
+        let mut audio = self.ctx.audio.lock().unwrap_or_else(|e| e.into_inner());
+        audio.remove(stream_id);
     }
 
     /// Push a settings update to a specific streaming client. Never waits
@@ -457,7 +489,6 @@ impl SessionServer {
         &self,
         listener: TcpListener,
         mut incoming: mpsc::Receiver<IncomingClient>,
-        chunk_tx: broadcast::Sender<WireChunkData>,
         event_tx: mpsc::Sender<ServerEvent>,
     ) {
         tracing::info!(
@@ -478,7 +509,7 @@ impl SessionServer {
                         sock.set_tcp_keepalive(&ka).ok();
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         sock.set_tcp_notsent_lowat(NOTSENT_LOWAT).ok();
-                        self.spawn_client(&mut clients, stream, peer, "tcp", &chunk_tx, &event_tx);
+                        self.spawn_client(&mut clients, stream, peer, "tcp", &event_tx);
                     }
                     // Failures such as an aborted handshake or running out of
                     // file descriptors are transient: keep accepting.
@@ -489,7 +520,7 @@ impl SessionServer {
                 },
                 client = incoming.recv(), if incoming_open => match client {
                     Some(client) => {
-                        self.spawn_client(&mut clients, client.transport, client.peer, "external", &chunk_tx, &event_tx);
+                        self.spawn_client(&mut clients, client.transport, client.peer, "external", &event_tx);
                     }
                     None => incoming_open = false,
                 },
@@ -510,17 +541,15 @@ impl SessionServer {
         stream: S,
         peer: SocketAddr,
         transport: &'static str,
-        chunk_tx: &broadcast::Sender<WireChunkData>,
         event_tx: &mpsc::Sender<ServerEvent>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         tracing::info!(%peer, transport, "Client connecting");
         let ctx = Arc::clone(&self.ctx);
-        let chunk_tx = chunk_tx.clone();
         let event_tx = event_tx.clone();
         clients.spawn(async move {
-            let result = handle_client(stream, peer, chunk_tx, &ctx, event_tx).await;
+            let result = handle_client(stream, peer, &ctx, event_tx).await;
             if let Err(e) = result {
                 tracing::debug!(%peer, error = %e, "Client session ended");
             }
@@ -539,7 +568,6 @@ pub(crate) struct IncomingClient {
 async fn handle_client<S>(
     stream: S,
     peer: SocketAddr,
-    chunk_tx: broadcast::Sender<WireChunkData>,
     ctx: &SessionContext,
     event_tx: mpsc::Sender<ServerEvent>,
 ) -> Result<()>
@@ -589,14 +617,13 @@ where
         joins_new_group,
         snapshot,
     } = ctx.register_session(&client_id, &hello, peer).await;
-    // Subscribed only now, so a connection that never completes its Hello
-    // neither keeps the encoders running nor collects a backlog of audio.
-    let chunk_rx = chunk_tx.subscribe();
-    drop(chunk_tx);
     // What the client is set up for. Routing updates from here on are
     // compared against it, so a stream switch before the session loop
     // starts still sends the new stream's codec header.
     let initial_routing = routing_rx.borrow().clone();
+    // Subscribed only now, so a connection that never completes its Hello
+    // neither keeps an encoder running nor collects a backlog of audio.
+    let chunk_rx = ctx.subscribe(&initial_routing);
     ctx.events.state_changed(snapshot);
 
     // From here on the session is registered, so every exit path must run
@@ -769,7 +796,8 @@ async fn send_initial_messages<W: AsyncWrite + Unpin>(
 struct SessionLoop<'a, S> {
     frames: FrameReader<ReadHalf<S>>,
     writer: DeadlineWriter<WriteHalf<S>>,
-    chunk_rx: broadcast::Receiver<WireChunkData>,
+    /// The audio of the client's stream, `None` while it gets none.
+    chunk_rx: Option<broadcast::Receiver<WireChunkData>>,
     settings_rx: watch::Receiver<ClientSettingsUpdate>,
     /// The routing the client is set up for (its stream's codec header sent).
     routing: SessionRouting,
@@ -883,9 +911,13 @@ where
                             write_codec_header(&mut writer, info).await?;
                         }
                     }
+                    // Follow the stream, and stop taking audio while muted.
+                    if new != routing {
+                        chunk_rx = ctx.subscribe(&new);
+                    }
                     routing = new;
                 }
-                chunk = chunk_rx.recv() => {
+                chunk = recv_audio(&mut chunk_rx) => {
                     let chunk = match chunk {
                         Ok(c) => c,
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -895,9 +927,12 @@ where
                             audio.lagged += n;
                             continue;
                         }
+                        // The stream was removed: no audio until the
+                        // routing moves the client on.
                         Err(broadcast::error::RecvError::Closed) => {
-                            tracing::warn!("Broadcast closed");
-                            anyhow::bail!("broadcast closed");
+                            tracing::debug!(id = %client_id, stream = %routing.stream_id, "Stream gone");
+                            chunk_rx = None;
+                            continue;
                         }
                     };
                     if !should_send_chunk(&chunk, &routing, ctx.send_audio_to_muted) {
@@ -924,6 +959,16 @@ where
 }
 
 // ── Helpers ───────────────────────────────────────────────────
+
+/// The next chunk of `rx`; never resolves without a subscription.
+async fn recv_audio(
+    rx: &mut Option<broadcast::Receiver<WireChunkData>>,
+) -> Result<WireChunkData, broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Timestamps of the audio sent to a session, to tell how much audio a
 /// broadcast lag dropped.
@@ -1668,19 +1713,17 @@ mod tests {
         (frames, writer)
     }
 
-    /// Serve one client over an in-memory pipe of `capacity` bytes. The
-    /// session lives as long as `chunk_tx`.
+    /// Serve one client over an in-memory pipe of `capacity` bytes.
     async fn connect_duplex(
         server: &SessionServer,
         clients: &mut JoinSet<()>,
-        chunk_tx: &broadcast::Sender<WireChunkData>,
         id: &str,
         capacity: usize,
     ) -> ClientSide<tokio::io::DuplexStream> {
         let (client, served) = tokio::io::duplex(capacity);
         let (event_tx, _) = mpsc::channel(16);
         let peer = "127.0.0.1:1".parse().unwrap();
-        server.spawn_client(clients, served, peer, "test", chunk_tx, &event_tx);
+        server.spawn_client(clients, served, peer, "test", &event_tx);
         handshake(client, id).await
     }
 
@@ -1698,9 +1741,7 @@ mod tests {
             .muted = true;
         let server = test_server(state);
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel(16);
-        let (_frames, mut writer) =
-            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        let (_frames, mut writer) = connect_duplex(&server, &mut clients, "c1", 4096).await;
         assert!(routing_of(&server, "c1").await.client_muted);
 
         send_msg(
@@ -1726,11 +1767,9 @@ mod tests {
     async fn push_settings_does_not_wait_for_a_stalled_client() {
         let server = test_server(crate::state::ServerState::default());
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel(16);
         // Room for about one settings frame: the session stalls on the next
         // write while the client reads nothing.
-        let (mut frames, _writer) =
-            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 64).await;
+        let (mut frames, _writer) = connect_duplex(&server, &mut clients, "c1", 64).await;
         let update = |volume| ClientSettingsUpdate {
             client_id: "c1".into(),
             buffer_ms: 1000,
@@ -1764,9 +1803,7 @@ mod tests {
     async fn push_after_the_client_changed_its_own_volume_is_sent() {
         let server = test_server(crate::state::ServerState::default());
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel(16);
-        let (mut frames, mut writer) =
-            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        let (mut frames, mut writer) = connect_duplex(&server, &mut clients, "c1", 4096).await;
         // The Hello was answered with volume 100; the client turns itself down.
         send_msg(
             &mut writer,
@@ -1820,13 +1857,12 @@ mod tests {
         server.register_stream_codec("default", "pcm", &[1]).await;
         server.register_stream_codec("other", "flac", &[2]).await;
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel(16);
         // Too small for the ServerSettings frame: the handshake stalls until
         // the client reads.
         let (client, served) = tokio::io::duplex(16);
         let (event_tx, _events) = mpsc::channel(16);
         let peer = "127.0.0.1:1".parse().unwrap();
-        server.spawn_client(&mut clients, served, peer, "test", &chunk_tx, &event_tx);
+        server.spawn_client(&mut clients, served, peer, "test", &event_tx);
         let (reader, mut writer) = tokio::io::split(client);
         let mut frames = FrameReader::new(reader);
         send_msg(
@@ -1868,26 +1904,75 @@ mod tests {
     #[tokio::test]
     async fn sessions_subscribe_to_audio_only_after_hello() {
         let server = test_server(crate::state::ServerState::default());
+        let chunk_tx = server.register_stream_codec("default", "pcm", &[]).await;
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel::<WireChunkData>(16);
         let (_client, served) = tokio::io::duplex(4096);
         let (event_tx, _events) = mpsc::channel(16);
         let peer = "127.0.0.1:1".parse().unwrap();
-        server.spawn_client(&mut clients, served, peer, "test", &chunk_tx, &event_tx);
+        server.spawn_client(&mut clients, served, peer, "test", &event_tx);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(chunk_tx.receiver_count(), 0, "no Hello yet");
 
-        let (_frames, _writer) = connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        let (_frames, _writer) = connect_duplex(&server, &mut clients, "c1", 4096).await;
         assert_eq!(chunk_tx.receiver_count(), 1);
+    }
+
+    /// Wait until `tx` has `count` receivers.
+    async fn listeners(tx: &broadcast::Sender<WireChunkData>, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tx.receiver_count() != count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} listeners, expected {count}", tx.receiver_count()));
+    }
+
+    /// Sessions listen to their own stream only, and not while muted, so
+    /// the encoders of streams nobody hears pause.
+    #[tokio::test]
+    async fn sessions_listen_to_their_stream_only_while_audible() {
+        let server = test_server(crate::state::ServerState::default());
+        let a = server.register_stream_codec("default", "pcm", &[]).await;
+        let b = server.register_stream_codec("b", "pcm", &[]).await;
+        let mut clients = JoinSet::new();
+        let (_frames, _writer) = connect_duplex(&server, &mut clients, "c1", 4096).await;
+        listeners(&a, 1).await;
+        listeners(&b, 0).await;
+
+        let gid = {
+            let mut s = server.ctx.shared_state.lock().await;
+            let gid = s.group_of("c1").unwrap().id.clone();
+            s.set_group_stream(&gid, "b");
+            gid
+        };
+        server.update_routing_all().await;
+        listeners(&a, 0).await;
+        listeners(&b, 1).await;
+
+        server.ctx.shared_state.lock().await.groups[0].muted = true;
+        server.update_routing_for_group(&gid).await;
+        listeners(&b, 0).await;
+
+        // A removed stream's session waits for its routing, it doesn't end.
+        server.ctx.shared_state.lock().await.groups[0].muted = false;
+        server.update_routing_for_group(&gid).await;
+        listeners(&b, 1).await;
+        drop(b);
+        server.unregister_stream_codec("b").await;
+        {
+            let mut s = server.ctx.shared_state.lock().await;
+            s.set_group_stream(&gid, "default");
+        }
+        server.update_routing_all().await;
+        listeners(&a, 1).await;
     }
 
     #[tokio::test]
     async fn unchanged_settings_are_not_resent() {
         let server = test_server(crate::state::ServerState::default());
         let mut clients = JoinSet::new();
-        let (chunk_tx, _) = broadcast::channel(16);
-        let (mut frames, _writer) =
-            connect_duplex(&server, &mut clients, &chunk_tx, "c1", 4096).await;
+        let (mut frames, _writer) = connect_duplex(&server, &mut clients, "c1", 4096).await;
         let update = |volume| ClientSettingsUpdate {
             client_id: "c1".into(),
             buffer_ms: 1000,
@@ -1918,12 +2003,11 @@ mod tests {
         let server = Arc::new(test_server(crate::state::ServerState::default()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (chunk_tx, _) = broadcast::channel(16);
         let (_incoming_tx, incoming_rx) = mpsc::channel(1);
         let (event_tx, _events) = mpsc::channel(16);
         let run = tokio::spawn({
             let server = Arc::clone(&server);
-            async move { server.run(listener, incoming_rx, chunk_tx, event_tx).await }
+            async move { server.run(listener, incoming_rx, event_tx).await }
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();

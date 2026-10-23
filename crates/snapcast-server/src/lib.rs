@@ -60,7 +60,7 @@ const EVENT_CHANNEL_SIZE: usize = 256;
 const COMMAND_CHANNEL_SIZE: usize = 64;
 const INCOMING_CLIENT_CHANNEL_SIZE: usize = 16;
 const AUDIO_CHANNEL_SIZE: usize = 256;
-/// Encoded chunks buffered per session before it lags.
+/// Encoded chunks of a stream buffered per session before it lags.
 const CHUNK_CHANNEL_SIZE: usize = 256;
 
 /// Channel size for F32 embedded sources — backpressure from encoder pacing.
@@ -395,6 +395,20 @@ pub enum ServerCommand {
         /// Mute state.
         muted: bool,
     },
+    /// Change a client's volume and/or mute state, keeping a field that is
+    /// `None`. The current value is read and updated in one step, so two
+    /// partial updates never undo each other.
+    UpdateClientVolume {
+        /// Client ID.
+        client_id: String,
+        /// New volume (0–100), or `None` to keep it.
+        volume: Option<u16>,
+        /// New mute state, or `None` to keep it.
+        muted: Option<bool>,
+        /// Response: the resulting `(volume, muted)`, `None` for an unknown
+        /// client.
+        response_tx: tokio::sync::oneshot::Sender<Option<(u16, bool)>>,
+    },
     /// Set a client's latency offset.
     SetClientLatency {
         /// Client ID.
@@ -649,8 +663,6 @@ pub struct SnapServer {
     command_rx: Option<mpsc::Receiver<ServerCommand>>,
     /// Named audio streams — each gets its own encoder at serve().
     streams: Vec<(String, StreamConfig, mpsc::Receiver<AudioFrame>)>,
-    /// Broadcast channel for encoded chunks → sessions.
-    chunk_tx: broadcast::Sender<WireChunkData>,
 }
 
 /// A frame starting further than this (µs) from where the previous one
@@ -677,9 +689,9 @@ fn frame_count(data: &AudioData, format: SampleFormat) -> usize {
 /// Spawn a per-stream encode loop on a dedicated thread.
 ///
 /// Receives `AudioFrame`, passes `AudioData` directly to the encoder,
-/// and broadcasts encoded `WireChunkData` to sessions. While no session is
-/// connected, frames are still received and paced but not encoded; the
-/// encoder is reset when the first session arrives, and whenever a frame's
+/// and broadcasts encoded `WireChunkData` to the sessions of the stream.
+/// While no session listens to this stream, frames are still received and
+/// paced but not encoded; the encoder is reset when the first one does, and whenever a frame's
 /// timestamp does not continue the previous frame (see [`AudioFrame`]).
 ///
 /// Audio arriving makes the stream `playing`, none for [`STREAM_IDLE_AFTER`]
@@ -764,14 +776,14 @@ fn spawn_stream_encoder(
                 if chunk_tx.receiver_count() == 0 {
                     if !idle {
                         idle = true;
-                        tracing::debug!(stream = %stream_id, "No clients, pausing encoding");
+                        tracing::debug!(stream = %stream_id, "No listeners, pausing encoding");
                     }
                     continue;
                 }
                 if idle {
                     idle = false;
                     enc.reset();
-                    tracing::debug!(stream = %stream_id, "Client connected, resuming encoding");
+                    tracing::debug!(stream = %stream_id, "Listener back, resuming encoding");
                 } else if discontinuity {
                     // The audio buffered toward a packet would otherwise be
                     // sent at the new time.
@@ -834,7 +846,6 @@ impl SnapServer {
     pub fn new(config: ServerConfig) -> (Self, mpsc::Receiver<ServerEvent>) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_SIZE);
-        let (chunk_tx, _) = broadcast::channel(CHUNK_CHANNEL_SIZE);
         let (client_tx, client_rx) = mpsc::channel(INCOMING_CLIENT_CHANNEL_SIZE);
         let server = Self {
             config,
@@ -844,7 +855,6 @@ impl SnapServer {
             command_tx,
             command_rx: Some(command_rx),
             streams: Vec::new(),
-            chunk_tx,
         };
         (server, event_rx)
     }
@@ -1018,14 +1028,14 @@ impl SnapServer {
                 }
             }
             tracing::info!(stream = %name, codec = enc.name(), format = %format, "Stream registered");
-            session_srv
+            let chunk_tx = session_srv
                 .register_stream_codec(&name, enc.name(), enc.header())
                 .await;
             let stop = spawn_stream_encoder(
                 name.as_str().into(),
                 rx,
                 enc,
-                self.chunk_tx.clone(),
+                chunk_tx,
                 format,
                 status_tx.clone(),
             );
@@ -1038,17 +1048,11 @@ impl SnapServer {
             .ok_or_else(|| anyhow::anyhow!("serve() already called"))?;
         let session_for_run = Arc::clone(&session_srv);
         let session_event_tx = self.event_tx.clone();
-        let session_chunk_tx = self.chunk_tx.clone();
         // Aborting this task on stop also ends every client session; the
         // guard aborts it too if this future is dropped instead.
         let _session_task = AbortOnDrop(tokio::spawn(async move {
             session_for_run
-                .run(
-                    listener,
-                    incoming_clients,
-                    session_chunk_tx,
-                    session_event_tx,
-                )
+                .run(listener, incoming_clients, session_event_tx)
                 .await;
         }));
 

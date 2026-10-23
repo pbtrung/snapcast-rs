@@ -278,6 +278,12 @@ impl Controller {
                         let tp = self.time_provider.lock().unwrap_or_else(|e| e.into_inner());
                         (tp.is_synced(), tp.diff_to_server_usec())
                     };
+                    // What playback recorded, logged here rather than in the
+                    // audio callback.
+                    self.stream
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .log_events();
                     if quick_syncs_remaining > 0 {
                         quick_syncs_remaining -= 1;
                         if quick_syncs_remaining == 0 {
