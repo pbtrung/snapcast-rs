@@ -232,7 +232,9 @@ profile.
 ### Supported format envelope (the one behavioral narrowing)
 
 `flacenc` 0.5.x verifies a narrower format envelope at construction than the
-vendored libFLAC did:
+vendored libFLAC did. The table lists the dependency's capability; what this
+project exposes is narrower still: stream sample formats are 16, 24 or 32-bit
+PCM, and the FLAC encoder rejects 32-bit, so FLAC streams are 16 or 24-bit.
 
 | Parameter | `flacenc` (now) | libFLAC (before) |
 |---|---|---|

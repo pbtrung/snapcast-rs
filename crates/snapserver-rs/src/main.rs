@@ -10,13 +10,15 @@ mod ws_transport;
 use clap::Parser;
 use snapcast_server::{ServerCommand, SnapServer};
 
+const DEFAULT_CONFIG_PATH: &str = "/etc/snapserver.conf";
+
 /// Snapcast server — synchronized multiroom audio server.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
-    /// Config file path
-    #[arg(short, long, default_value = "/etc/snapserver.conf")]
-    config: String,
+    /// Config file path [default: /etc/snapserver.conf, used only if present]
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// TCP port for binary protocol (client connections)
     #[arg(long)]
@@ -168,7 +170,11 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     // Load config file, then merge CLI overrides
-    let file_config = config::parse_config_file(&cli.config);
+    // A file named with -c must exist; the default one is optional.
+    let file_config = match &cli.config {
+        Some(path) => config::parse_config_file(path, true)?,
+        None => config::parse_config_file(DEFAULT_CONFIG_PATH, false)?,
+    };
     let server_config = config::merge_cli(
         file_config,
         config::CliOverrides {
@@ -343,6 +349,7 @@ fn main() -> anyhow::Result<()> {
                 auth_config: std::sync::Arc::clone(&auth_cfg),
                 cmd_tx: server.command_sender(),
                 client_acceptor: server.client_acceptor(),
+                allowed_origins: server_config.http_allowed_origins.clone(),
             };
             tokio::spawn(async move {
                 if let Err(e) = http::serve(listener, http_cfg).await {

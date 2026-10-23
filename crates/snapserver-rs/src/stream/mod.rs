@@ -61,6 +61,9 @@ pub(crate) enum PcmEncoding {
     /// round trip through integer PCM. The `sampleformat` bit depth is then
     /// only what integer encoders (PCM, FLAC) convert to.
     Float,
+    /// Packed 24-bit little-endian integers, three bytes per sample (as in
+    /// WAV files), padded to the four bytes 24-bit PCM is sent in.
+    Int24Packed,
 }
 
 impl PcmEncoding {
@@ -73,11 +76,13 @@ impl PcmEncoding {
         }
     }
 
-    /// Bytes in `frames` frames of a source with this encoding.
-    fn chunk_bytes(self, format: SampleFormat, frames: usize) -> usize {
+    /// Bytes in one frame of a source with this encoding.
+    fn frame_bytes(self, format: SampleFormat) -> usize {
+        let channels = format.channels() as usize;
         match self {
-            Self::Int => frames * format.frame_size() as usize,
-            Self::Float => frames * format.channels() as usize * 4,
+            Self::Int => format.frame_size() as usize,
+            Self::Float => channels * 4,
+            Self::Int24Packed => channels * 3,
         }
     }
 
@@ -89,6 +94,13 @@ impl PcmEncoding {
                     .0
                     .iter()
                     .map(|b| f32::from_le_bytes(*b))
+                    .collect(),
+            ),
+            Self::Int24Packed => AudioData::Pcm(
+                buf.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|&[a, b, c]| [a, b, c, if c & 0x80 != 0 { 0xFF } else { 0 }])
                     .collect(),
             ),
         }
@@ -114,18 +126,61 @@ impl Chunking {
         format: SampleFormat,
         frames: usize,
     ) -> anyhow::Result<Self> {
-        let encoding = PcmEncoding::from_uri(uri)?;
-        Ok(Self {
+        Ok(Self::with_encoding(
+            PcmEncoding::from_uri(uri)?,
             format,
             frames,
-            bytes: encoding.chunk_bytes(format, frames),
+        ))
+    }
+
+    fn with_encoding(encoding: PcmEncoding, format: SampleFormat, frames: usize) -> Self {
+        Self {
+            format,
+            frames,
+            bytes: frames * encoding.frame_bytes(format),
             encoding,
-        })
+        }
     }
 
     /// How long one chunk plays.
     pub(crate) fn duration(&self) -> Duration {
         frames_duration(self.format, self.frames)
+    }
+
+    /// The chunking for a WAV source whose `fmt ` chunk is `wav`: its
+    /// encoding is what the file declares, which must match the source's
+    /// sample format.
+    pub(crate) fn for_wav(&self, wav: &file::WavFormat) -> anyhow::Result<Self> {
+        let format = self.format;
+        let declared = format!("{}:{}:{}", wav.rate, wav.bits, wav.channels);
+        anyhow::ensure!(
+            wav.rate == format.rate() && wav.channels == format.channels(),
+            "WAV file is {declared}, but the source's sampleformat is {format}: \
+             set sampleformat={}:{}:{} on the source",
+            wav.rate,
+            if wav.float { format.bits() } else { wav.bits },
+            wav.channels
+        );
+        let channels = usize::from(wav.channels);
+        let encoding = match (wav.float, wav.bits) {
+            (true, 32) => PcmEncoding::Float,
+            (false, bits) if bits == format.bits() => {
+                match usize::from(wav.block_align) / channels.max(1) {
+                    3 if bits == 24 => PcmEncoding::Int24Packed,
+                    n if n == format.sample_size() as usize => PcmEncoding::Int,
+                    _ => anyhow::bail!(
+                        "unsupported WAV block alignment {} for {declared}",
+                        wav.block_align
+                    ),
+                }
+            }
+            (false, _) => anyhow::bail!(
+                "WAV file is {declared}, but the source's sampleformat is {format}: \
+                 set sampleformat={declared} on the source"
+            ),
+            (true, bits) => anyhow::bail!("unsupported {bits}-bit float WAV file"),
+        };
+        Ok(Self::with_encoding(encoding, format, self.frames))
     }
 
     /// A timestamper anchored now, for a source that was just opened.
@@ -147,6 +202,17 @@ pub(crate) enum PumpEnd {
     TxClosed,
 }
 
+/// Tell the encoder that the source ended (see `snapcast_server::AudioFrame`):
+/// the audio it holds toward an incomplete packet is sent now, instead of
+/// being held until the source restarts.
+pub(crate) async fn flush_encoder(ts: &mut ChunkTimestamper, tx: &mpsc::Sender<AudioFrame>) {
+    let frame = AudioFrame {
+        timestamp_usec: ts.next(0),
+        data: AudioData::Pcm(Vec::new()),
+    };
+    let _ = tx.send(frame).await;
+}
+
 /// Read fixed-size PCM chunks from `reader`, timestamp them, and forward to `tx`.
 ///
 /// The shared inner loop of every stream reader: chunks are cut and decoded
@@ -157,6 +223,9 @@ pub(crate) enum PumpEnd {
 /// back by backpressure instead of flooding the encoder and clients with
 /// audio stamped ever further in the future; one that fell slightly behind
 /// (a short stall) is read without waiting until it has caught up again.
+///
+/// The whole frames of a last, shorter chunk before the source ends are
+/// forwarded too.
 pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     ts: &mut ChunkTimestamper,
@@ -164,7 +233,7 @@ pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
     tx: &mpsc::Sender<AudioFrame>,
 ) -> PumpEnd {
     let mut buf = vec![0u8; chunking.bytes];
-    let chunk_usec = chunking.duration().as_micros() as i64;
+    let frame_bytes = chunking.encoding.frame_bytes(chunking.format);
     let mut chunks = 0;
     // The timestamp the next chunk will get, unless the source falls behind.
     let mut next_due_usec = None;
@@ -175,27 +244,40 @@ pub(crate) async fn pump_pcm<R: AsyncReadExt + Unpin>(
                 tokio::time::sleep(Duration::from_micros(ahead as u64)).await;
             }
         }
-        if reader.read_exact(&mut buf).await.is_err() {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match reader.read(&mut buf[filled..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => filled += n,
+            }
+        }
+        let ended = filled < buf.len();
+        // A partial frame at the end is dropped, whole frames are not.
+        let frames = filled / frame_bytes;
+        if frames > 0 {
+            // Audio that arrives later than realtime (late start, stall) is
+            // stamped from now on, so clients don't discard it as too old.
+            if let Some(lag) = ts.resync_if_behind(MAX_SOURCE_LAG_USEC) {
+                tracing::info!(
+                    lag_ms = lag / 1000,
+                    "Source behind realtime, resyncing timestamps"
+                );
+            }
+            let timestamp_usec = ts.next(frames as u32);
+            next_due_usec =
+                Some(timestamp_usec + frames_duration(chunking.format, frames).as_micros() as i64);
+            let frame = AudioFrame {
+                timestamp_usec,
+                data: chunking.encoding.audio_data(&buf[..frames * frame_bytes]),
+            };
+            if tx.send(frame).await.is_err() {
+                return PumpEnd::TxClosed;
+            }
+            chunks += 1;
+        }
+        if ended {
             return PumpEnd::SourceEnded { chunks };
         }
-        // Audio that arrives later than realtime (late start, stall) is
-        // stamped from now on, so clients don't discard it as too old.
-        if let Some(lag) = ts.resync_if_behind(MAX_SOURCE_LAG_USEC) {
-            tracing::info!(
-                lag_ms = lag / 1000,
-                "Source behind realtime, resyncing timestamps"
-            );
-        }
-        let timestamp_usec = ts.next(chunking.frames as u32);
-        next_due_usec = Some(timestamp_usec + chunk_usec);
-        let frame = AudioFrame {
-            timestamp_usec,
-            data: chunking.encoding.audio_data(&buf),
-        };
-        if tx.send(frame).await.is_err() {
-            return PumpEnd::TxClosed;
-        }
-        chunks += 1;
     }
 }
 
@@ -291,6 +373,39 @@ mod tests {
         // 1 s of 20 ms chunks is 50; without catching up it was 42.
         assert!((47..=53).contains(&stamps.len()), "{} chunks", stamps.len());
         assert!(stamps.windows(2).all(|w| w[1] - w[0] == 20_000), "gap");
+    }
+
+    /// Regression: the last, shorter chunk was dropped whole at EOF.
+    #[tokio::test]
+    async fn last_partial_chunk_keeps_its_whole_frames() {
+        // 1060 frames and a stray byte, in 960-frame chunks.
+        let data = vec![0u8; 1060 * 4 + 1];
+        let mut reader = data.as_slice();
+        let chunking = chunking("");
+        let mut ts = chunking.timestamper();
+        let (tx, mut rx) = mpsc::channel(8);
+        let end = pump_pcm(&mut reader, &mut ts, &chunking, &tx).await;
+        assert!(matches!(end, PumpEnd::SourceEnded { chunks: 2 }));
+        let mut lens = Vec::new();
+        let mut stamps = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let AudioData::Pcm(data) = frame.data else {
+                panic!("expected PCM");
+            };
+            lens.push(data.len());
+            stamps.push(frame.timestamp_usec);
+        }
+        assert_eq!(lens, [960 * 4, 100 * 4]);
+        assert_eq!(stamps[1] - stamps[0], 20_000);
+    }
+
+    #[test]
+    fn packed_24_bit_is_padded_and_sign_extended() {
+        let data = PcmEncoding::Int24Packed.audio_data(&[0x01, 0x02, 0x03, 0xFF, 0xFF, 0xFF]);
+        let AudioData::Pcm(pcm) = data else {
+            panic!("expected PCM");
+        };
+        assert_eq!(pcm, [0x01, 0x02, 0x03, 0x00, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]

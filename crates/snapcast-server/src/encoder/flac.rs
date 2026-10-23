@@ -280,6 +280,22 @@ impl Encoder for FlacEncoder {
     fn reset(&mut self) {
         self.pending.clear();
     }
+
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        let channels = self.format.channels() as usize;
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let carried_frames = (self.pending.len() / channels) as i64;
+        // Padded to a whole block: the stream announces a fixed block size.
+        self.pending.resize(BLOCK_SIZE * channels, 0);
+        let block = self.encode_block(0..self.pending.len());
+        self.pending.clear();
+        Ok(vec![EncodedPacket {
+            data: block?,
+            offset_frames: -carried_frames,
+        }])
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +456,23 @@ mod tests {
         assert!(out.is_empty());
         assert!(!enc.pending.is_empty());
         enc.reset();
+        assert!(enc.pending.is_empty());
+    }
+
+    #[test]
+    fn flush_pads_the_partial_block() {
+        let fmt = SampleFormat::new(48000, 16, 2);
+        let mut enc = FlacEncoder::new(fmt, "").unwrap();
+        assert!(enc.flush().unwrap().is_empty(), "nothing pending");
+        assert!(
+            enc.encode(AudioData::Pcm(vec![7u8; 100 * 4]))
+                .unwrap()
+                .is_empty()
+        );
+        let packets = enc.flush().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].offset_frames, -100);
+        assert_eq!(packets[0].data[0], 0xFF, "a whole FLAC frame");
         assert!(enc.pending.is_empty());
     }
 

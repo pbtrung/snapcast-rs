@@ -78,6 +78,14 @@ pub enum AudioData {
 }
 
 /// A timestamped audio frame for server input.
+///
+/// Frames are expected back to back: a frame whose timestamp is not where
+/// the previous one ended (a source that restarted or stalled) resets the
+/// encoder, so no buffered audio from before the jump is sent at the new
+/// time. A frame without samples flushes the encoder instead: the audio it
+/// holds toward an incomplete packet is padded with silence and sent, its
+/// timestamp being where the audio sent so far ends. Send one at the end of
+/// a track or source, or its last fraction of a packet is held back.
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
     /// Audio samples.
@@ -149,8 +157,10 @@ impl F32AudioSender {
         Ok(())
     }
 
-    /// Flush remaining samples (< 20ms) as a final short chunk.
-    /// Call at end-of-track to avoid losing the last few milliseconds.
+    /// Send the remaining samples (< 20ms) as a final short chunk, then
+    /// flush the encoder, which pads the audio it buffers toward a whole
+    /// codec packet with silence and sends it. Call at end-of-track so the
+    /// last few milliseconds reach clients now.
     ///
     /// A trailing partial frame (input that was not a whole number of
     /// frames) is dropped, so channel interleaving never shifts.
@@ -158,17 +168,28 @@ impl F32AudioSender {
         let ch = self.channels.max(1) as usize;
         let mut chunk: Vec<f32> = std::mem::take(&mut self.buf);
         chunk.truncate(chunk.len() / ch * ch);
-        if chunk.is_empty() {
+        if self.ts.is_none() && chunk.is_empty() {
+            // Nothing was sent: there is nothing to flush either.
             return Ok(());
         }
-        let frames = (chunk.len() / ch) as u32;
         let ts = self
             .ts
             .get_or_insert_with(|| time::ChunkTimestamper::new(self.sample_rate));
-        let timestamp_usec = ts.next(frames);
+        if !chunk.is_empty() {
+            let frames = (chunk.len() / ch) as u32;
+            let timestamp_usec = ts.next(frames);
+            self.tx
+                .send(AudioFrame {
+                    data: AudioData::F32(chunk),
+                    timestamp_usec,
+                })
+                .await?;
+        }
+        // An empty frame flushes the encoder (see `AudioFrame`).
+        let timestamp_usec = ts.next(0);
         self.tx
             .send(AudioFrame {
-                data: AudioData::F32(chunk),
+                data: AudioData::F32(Vec::new()),
                 timestamp_usec,
             })
             .await
@@ -190,6 +211,7 @@ pub struct WireChunkData {
 pub mod auth;
 pub(crate) mod command;
 pub(crate) mod encoder;
+pub(crate) mod events;
 pub(crate) mod session;
 pub mod state;
 pub use state::ServerState;
@@ -291,7 +313,8 @@ pub enum ServerEvent {
         /// Mute state.
         muted: bool,
     },
-    /// A stream's status changed (playing, idle, unknown).
+    /// A stream's status changed: `playing` once audio arrives, `idle` once
+    /// none arrived for a few seconds.
     StreamStatus {
         /// Stream identifier.
         stream_id: String,
@@ -531,6 +554,9 @@ pub struct ServerConfig {
     pub remove_disconnected_clients_after: Option<std::time::Duration>,
 }
 
+/// Largest [`ServerConfig::buffer_ms`] accepted: one hour.
+const MAX_BUFFER_MS: i32 = 3_600_000;
+
 /// Default for [`ServerConfig::client_idle_timeout`].
 pub const DEFAULT_CLIENT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -627,12 +653,37 @@ pub struct SnapServer {
     chunk_tx: broadcast::Sender<WireChunkData>,
 }
 
+/// A frame starting further than this (µs) from where the previous one
+/// ended is a discontinuity, which resets the encoder. Generous: timestamps
+/// carry rounding, and an embedder may stamp frames from a jittery clock;
+/// a source restart or stall jumps much further.
+const DISCONTINUITY_TOLERANCE_USEC: i64 = 20_000;
+
+/// A playing stream with no audio for this long is idle.
+const STREAM_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Stream status values, as C++ snapserver reports them.
+const STATUS_PLAYING: &str = "playing";
+const STATUS_IDLE: &str = "idle";
+
+/// Number of whole frames in `data`.
+fn frame_count(data: &AudioData, format: SampleFormat) -> usize {
+    match data {
+        AudioData::F32(samples) => samples.len() / usize::from(format.channels().max(1)),
+        AudioData::Pcm(bytes) => bytes.len() / usize::from(format.frame_size().max(1)),
+    }
+}
+
 /// Spawn a per-stream encode loop on a dedicated thread.
 ///
 /// Receives `AudioFrame`, passes `AudioData` directly to the encoder,
 /// and broadcasts encoded `WireChunkData` to sessions. While no session is
 /// connected, frames are still received and paced but not encoded; the
-/// encoder is reset when the first session arrives.
+/// encoder is reset when the first session arrives, and whenever a frame's
+/// timestamp does not continue the previous frame (see [`AudioFrame`]).
+///
+/// Audio arriving makes the stream `playing`, none for [`STREAM_IDLE_AFTER`]
+/// `idle`: each change is sent on `status_tx`, whether clients listen or not.
 ///
 /// The loop ends once the audio sender is dropped, or the returned handle is
 /// (stream removed, server stopped); the latter drops the receiver, so the
@@ -643,9 +694,10 @@ fn spawn_stream_encoder(
     mut rx: mpsc::Receiver<AudioFrame>,
     mut enc: Box<dyn encoder::Encoder>,
     chunk_tx: broadcast::Sender<WireChunkData>,
-    sample_rate: u32,
-    channels: u16,
+    format: SampleFormat,
+    status_tx: mpsc::UnboundedSender<(Arc<str>, &'static str)>,
 ) -> tokio::sync::oneshot::Sender<()> {
+    let (sample_rate, channels) = (format.rate(), format.channels());
     let (stop_tx, mut stop) = tokio::sync::oneshot::channel::<()>();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -656,6 +708,12 @@ fn spawn_stream_encoder(
         rt.block_on(async {
             let mut next_tick: Option<tokio::time::Instant> = None;
             let mut idle = false;
+            // Where the previous frame ended (µs).
+            let mut expected_usec: Option<i64> = None;
+            let mut playing = false;
+            let set_status = |status| {
+                let _ = status_tx.send((Arc::clone(&stream_id), status));
+            };
             loop {
                 let frame = tokio::select! {
                     frame = rx.recv() => match frame {
@@ -663,6 +721,11 @@ fn spawn_stream_encoder(
                         None => break,
                     },
                     _ = &mut stop => break,
+                    () = tokio::time::sleep(STREAM_IDLE_AFTER), if playing => {
+                        playing = false;
+                        set_status(STATUS_IDLE);
+                        continue;
+                    }
                 };
                 // Pace F32 sources to realtime (pipe sources pace naturally via blocking read)
                 if let AudioData::F32(ref samples) = frame.data {
@@ -684,6 +747,20 @@ fn spawn_stream_encoder(
                     *tick += chunk_dur;
                     tokio::time::sleep_until(*tick).await;
                 }
+                let frames = frame_count(&frame.data, format) as i64;
+                let flush = frames == 0;
+                if !flush && !playing {
+                    playing = true;
+                    set_status(STATUS_PLAYING);
+                }
+                let discontinuity = !flush
+                    && expected_usec.is_some_and(|expected| {
+                        (frame.timestamp_usec - expected).abs() > DISCONTINUITY_TOLERANCE_USEC
+                    });
+                if !flush {
+                    expected_usec =
+                        Some(frame.timestamp_usec + frames * 1_000_000 / i64::from(sample_rate));
+                }
                 if chunk_tx.receiver_count() == 0 {
                     if !idle {
                         idle = true;
@@ -695,8 +772,18 @@ fn spawn_stream_encoder(
                     idle = false;
                     enc.reset();
                     tracing::debug!(stream = %stream_id, "Client connected, resuming encoding");
+                } else if discontinuity {
+                    // The audio buffered toward a packet would otherwise be
+                    // sent at the new time.
+                    enc.reset();
+                    tracing::debug!(stream = %stream_id, "Timestamps jump, encoder reset");
                 }
-                match enc.encode(frame.data) {
+                let encoded = if flush {
+                    enc.flush()
+                } else {
+                    enc.encode(frame.data)
+                };
+                match encoded {
                     // One WireChunk per packet: clients decode each chunk as a
                     // single codec packet. Empty while the encoder buffers.
                     Ok(packets) => {
@@ -713,6 +800,9 @@ fn spawn_stream_encoder(
                         tracing::warn!(stream = %stream_id, error = %e, "Encode failed");
                     }
                 }
+            }
+            if playing {
+                set_status(STATUS_IDLE);
             }
         });
     });
@@ -825,9 +915,19 @@ impl SnapServer {
             .take()
             .ok_or_else(|| anyhow::anyhow!("serve() already called"))?;
 
-        let event_tx = self.event_tx.clone();
+        let events = events::EventSink::new(self.event_tx.clone());
 
         let sample_format = parse_pcm_format(&self.config.sample_format)?;
+        // Sent to clients as an i32.
+        let buffer_ms = i32::try_from(self.config.buffer_ms)
+            .ok()
+            .filter(|&ms| ms <= MAX_BUFFER_MS)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "buffer_ms must be at most {MAX_BUFFER_MS}, got {}",
+                    self.config.buffer_ms
+                )
+            })?;
 
         anyhow::ensure!(
             !self.streams.is_empty(),
@@ -888,15 +988,17 @@ impl SnapServer {
             .map(|(n, ..)| n.clone())
             .unwrap_or_default();
         let session_srv = Arc::new(session::SessionServer::new(session::SessionServerConfig {
-            buffer_ms: self.config.buffer_ms as i32,
+            buffer_ms,
             auth: self.config.auth.clone(),
             client_filter: self.config.client_filter.clone(),
             shared_state: Arc::clone(&shared_state),
             default_stream: first_name,
             send_audio_to_muted: self.config.send_audio_to_muted,
             idle_timeout: self.config.client_idle_timeout,
+            events: events.clone(),
         }));
 
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
         let mut encoder_stops = std::collections::HashMap::with_capacity(encoders.len());
         for (name, uri, rx, enc, format) in encoders {
             {
@@ -924,8 +1026,8 @@ impl SnapServer {
                 rx,
                 enc,
                 self.chunk_tx.clone(),
-                format.rate(),
-                format.channels(),
+                format,
+                status_tx.clone(),
             );
             encoder_stops.insert(name, stop);
         }
@@ -935,7 +1037,7 @@ impl SnapServer {
             .take()
             .ok_or_else(|| anyhow::anyhow!("serve() already called"))?;
         let session_for_run = Arc::clone(&session_srv);
-        let session_event_tx = event_tx.clone();
+        let session_event_tx = self.event_tx.clone();
         let session_chunk_tx = self.chunk_tx.clone();
         // Aborting this task on stop also ends every client session; the
         // guard aborts it too if this future is dropped instead.
@@ -953,8 +1055,8 @@ impl SnapServer {
         let dispatcher = command::Dispatcher {
             shared_state: Arc::clone(&shared_state),
             session_srv: Arc::clone(&session_srv),
-            event_tx: event_tx.clone(),
-            buffer_ms: self.config.buffer_ms as i32,
+            events,
+            buffer_ms,
             encoder_stops: std::sync::Mutex::new(encoder_stops),
         };
 
@@ -968,6 +1070,9 @@ impl SnapServer {
         // Main loop
         loop {
             tokio::select! {
+                Some((stream_id, status)) = status_rx.recv() => {
+                    dispatcher.set_stream_status(&stream_id, status).await;
+                }
                 _ = client_sweep.tick(), if remove_after.is_some() => {
                     if let Some(after) = remove_after {
                         dispatcher.remove_disconnected_clients(after).await;
@@ -1076,8 +1181,8 @@ mod tests {
             rx,
             Box::new(SplittingEncoder),
             chunk_tx,
-            48000,
-            2,
+            SampleFormat::new(48000, 16, 2),
+            mpsc::unbounded_channel().0,
         );
 
         tx.send(pcm_frame(1_000_000)).await.unwrap();
@@ -1166,6 +1271,20 @@ mod tests {
         assert!(server.add_f32_stream("f").is_err());
     }
 
+    /// Regression: a `buffer_ms` above `i32::MAX` was cast to a negative
+    /// buffer.
+    #[tokio::test]
+    async fn serve_rejects_an_out_of_range_buffer() {
+        let (mut server, _events) = SnapServer::new(ServerConfig {
+            buffer_ms: u32::MAX,
+            ..Default::default()
+        });
+        server.add_stream("s");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let err = server.serve(listener).await.unwrap_err().to_string();
+        assert!(err.contains("buffer_ms"), "{err}");
+    }
+
     #[tokio::test]
     async fn f32_sender_at_a_very_low_rate_still_chunks() {
         let (mut server, _events) = SnapServer::new(ServerConfig {
@@ -1187,13 +1306,23 @@ mod tests {
         // Three samples of stereo: one frame and a stray sample.
         sender.send(&[0.1, 0.2, 0.3]).await.unwrap();
         sender.flush().await.unwrap();
-        let AudioData::F32(chunk) = rx.recv().await.unwrap().data else {
+        let tail = rx.recv().await.unwrap();
+        let AudioData::F32(chunk) = tail.data else {
             panic!("expected F32");
         };
         assert_eq!(chunk, [0.1, 0.2]);
-        // Nothing but a stray sample: nothing to send.
+        // Then the encoder flush: no samples, timestamped where they end.
+        let marker = rx.recv().await.unwrap();
+        assert!(matches!(&marker.data, AudioData::F32(s) if s.is_empty()));
+        assert_eq!(marker.timestamp_usec, tail.timestamp_usec + 20);
+        // Nothing but a stray sample: only the encoder flush.
         sender.send(&[0.5]).await.unwrap();
         sender.flush().await.unwrap();
+        assert!(matches!(rx.recv().await.unwrap().data, AudioData::F32(s) if s.is_empty()));
+        assert!(rx.try_recv().is_err());
+        // Never sent anything: nothing at all.
+        let (tx, mut rx) = mpsc::channel(4);
+        F32AudioSender::new(tx, 48000, 2).flush().await.unwrap();
         assert!(rx.try_recv().is_err());
     }
 
@@ -1207,10 +1336,18 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
         let (chunk_tx, _) = broadcast::channel(16);
-        let _stop = spawn_stream_encoder("s".into(), rx, enc, chunk_tx.clone(), 48000, 2);
+        let _stop = spawn_stream_encoder(
+            "s".into(),
+            rx,
+            enc,
+            chunk_tx.clone(),
+            SampleFormat::new(48000, 16, 2),
+            mpsc::unbounded_channel().0,
+        );
 
+        // Back to back: 960 frames are 20 ms.
         for ts in 1..=3 {
-            tx.send(pcm_frame(ts)).await.unwrap();
+            tx.send(pcm_frame(ts * 20_000)).await.unwrap();
         }
         drain(&tx).await;
         assert_eq!(
@@ -1220,21 +1357,96 @@ mod tests {
         );
 
         let mut chunks = chunk_tx.subscribe();
-        tx.send(pcm_frame(4)).await.unwrap();
+        tx.send(pcm_frame(80_000)).await.unwrap();
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.recv())
             .await
             .expect("chunk after a client connected")
             .unwrap();
-        assert_eq!(chunk.timestamp_usec, 4);
+        assert_eq!(chunk.timestamp_usec, 80_000);
         assert_eq!(encodes.load(Ordering::SeqCst), 1);
         assert_eq!(resets.load(Ordering::SeqCst), 1, "reset once on resume");
 
-        tx.send(pcm_frame(5)).await.unwrap();
+        tx.send(pcm_frame(100_000)).await.unwrap();
         chunks.recv().await.unwrap();
         assert_eq!(
             resets.load(Ordering::SeqCst),
             1,
             "no reset while clients stay"
         );
+
+        // A source restart: the timestamps jump.
+        tx.send(pcm_frame(10_000_000)).await.unwrap();
+        chunks.recv().await.unwrap();
+        assert_eq!(
+            resets.load(Ordering::SeqCst),
+            2,
+            "reset on a timestamp jump"
+        );
+    }
+
+    /// Regression: FLAC samples buffered before a source restart were sent
+    /// in a block timestamped relative to the input after it.
+    #[cfg(feature = "flac")]
+    #[tokio::test]
+    async fn timestamp_jump_drops_buffered_codec_input() {
+        let format = SampleFormat::new(48000, 16, 2);
+        let enc = encoder::create(&encoder::EncoderConfig {
+            codec: "flac".into(),
+            format,
+        })
+        .unwrap();
+        let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
+        let (chunk_tx, mut chunks) = broadcast::channel(16);
+        let _stop = spawn_stream_encoder(
+            "s".into(),
+            rx,
+            enc,
+            chunk_tx,
+            format,
+            mpsc::unbounded_channel().0,
+        );
+
+        tx.send(pcm_frame(1_000_000)).await.unwrap();
+        tx.send(pcm_frame(10_000_000)).await.unwrap();
+        // 1152-frame blocks: only the second input's 960 frames are left,
+        // so a block completes only with more input after the jump.
+        tx.send(pcm_frame(10_020_000)).await.unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.recv())
+            .await
+            .expect("a block")
+            .unwrap();
+        assert_eq!(chunk.timestamp_usec, 10_000_000);
+    }
+
+    /// Regression: `flush` forwarded the sender's samples but the encoder
+    /// kept holding them toward a whole packet.
+    #[cfg(feature = "flac")]
+    #[tokio::test]
+    async fn f32_flush_flushes_the_encoder() {
+        let format = SampleFormat::new(48000, 16, 2);
+        let enc = encoder::create(&encoder::EncoderConfig {
+            codec: "flac".into(),
+            format,
+        })
+        .unwrap();
+        let (tx, rx) = mpsc::channel(AUDIO_CHANNEL_SIZE);
+        let (chunk_tx, mut chunks) = broadcast::channel(16);
+        let _stop = spawn_stream_encoder(
+            "s".into(),
+            rx,
+            enc,
+            chunk_tx,
+            format,
+            mpsc::unbounded_channel().0,
+        );
+        let mut sender = F32AudioSender::new(tx, 48000, 2);
+
+        sender.send(&[0.25; 200]).await.unwrap();
+        sender.flush().await.unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), chunks.recv())
+            .await
+            .expect("the flushed block")
+            .unwrap();
+        assert!(!chunk.data.is_empty());
     }
 }

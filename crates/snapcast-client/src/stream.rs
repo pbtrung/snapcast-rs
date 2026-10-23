@@ -19,7 +19,9 @@ pub enum SampleEncoding {
 impl SampleEncoding {
     /// Convert one sample, as stored in a [`PcmChunk`] (`bits` wide,
     /// little-endian, 24-bit padded to 4 bytes), to `f32` at full scale ±1.
-    /// A width this encoding doesn't store, or too few bytes, is silence.
+    /// The padding byte of a 24-bit sample is ignored: the low 24 bits are
+    /// sign-extended, as the server's encoders do. A width this encoding
+    /// doesn't store, or too few bytes, is silence.
     pub fn sample_to_f32(self, bytes: &[u8], bits: u16) -> f32 {
         match (self, bits) {
             (Self::Float32, _) => bytes.first_chunk().map_or(0.0, |b| f32::from_le_bytes(*b)),
@@ -27,7 +29,7 @@ impl SampleEncoding {
                 f32::from(i16::from_le_bytes(*b)) / f32::from(i16::MAX)
             }),
             (Self::PcmInt, 24) => bytes.first_chunk().map_or(0.0, |b| {
-                i32::from_le_bytes(*b) as f32 / snapcast_proto::PCM_24BIT_MAX
+                ((i32::from_le_bytes(*b) << 8) >> 8) as f32 / snapcast_proto::PCM_24BIT_MAX
             }),
             (Self::PcmInt, 32) => bytes
                 .first_chunk()
@@ -173,6 +175,12 @@ const DEFAULT_BUFFER_MS: i64 = 1000;
 const DISCONTINUITY_TOLERANCE_USEC: i64 = 500;
 /// A discontinuity larger than this (µs) is resolved by a hard sync.
 const DISCONTINUITY_HARD_SYNC_USEC: i64 = HARD_SYNC_AGE_USEC;
+/// Audio queued beyond the playout buffer plus this (ms) is obsolete: it is
+/// only there when nothing plays it (no output device, or playback waiting
+/// for time sync) or the server sends faster than real time.
+const QUEUE_SLACK_MS: i64 = 3000;
+/// Upper bound on the bytes queued, whatever the format and buffer.
+const MAX_QUEUE_BYTES: usize = 128 << 20;
 
 /// Time-synchronized PCM stream buffer.
 ///
@@ -216,6 +224,8 @@ pub struct Stream {
     encoding: SampleEncoding,
     /// Queue of pending PCM chunks.
     chunks: VecDeque<PcmChunk>,
+    /// Sum of `data.len()` over `chunks`.
+    queued_bytes: usize,
     /// The chunk currently being read from.
     current: Option<PcmChunk>,
     /// Target buffer size in milliseconds.
@@ -261,6 +271,7 @@ impl Stream {
             format,
             encoding,
             chunks: VecDeque::new(),
+            queued_bytes: 0,
             current: None,
             buffer_ms: DEFAULT_BUFFER_MS,
             hard_sync: true,
@@ -304,8 +315,41 @@ impl Stream {
     }
 
     /// Enqueue a decoded PCM chunk.
+    ///
+    /// The queue is bounded to the playout buffer plus a few seconds (and
+    /// [`MAX_QUEUE_BYTES`]): beyond that the oldest chunks are dropped, as
+    /// they are past their playout time by then.
     pub fn add_chunk(&mut self, chunk: PcmChunk) {
+        self.queued_bytes += chunk.data.len();
         self.chunks.push_back(chunk);
+        let limit = self.max_queue_bytes();
+        let mut dropped = 0usize;
+        while self.queued_bytes > limit && self.chunks.len() > 1 {
+            self.pop_front_chunk();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            tracing::debug!(dropped, "Playout queue full, dropped the oldest chunks");
+        }
+    }
+
+    /// Most bytes [`add_chunk`](Self::add_chunk) keeps queued.
+    fn max_queue_bytes(&self) -> usize {
+        let bytes_per_sec = u64::from(self.format.rate()) * u64::from(self.format.frame_size());
+        let ms = (self.buffer_ms.max(0) + QUEUE_SLACK_MS) as u64;
+        let bytes = bytes_per_sec.saturating_mul(ms) / 1000;
+        usize::try_from(bytes).map_or(MAX_QUEUE_BYTES, |b| b.min(MAX_QUEUE_BYTES))
+    }
+
+    fn pop_front_chunk(&mut self) -> Option<PcmChunk> {
+        let chunk = self.chunks.pop_front()?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(chunk.data.len());
+        Some(chunk)
+    }
+
+    fn push_front_chunk(&mut self, chunk: PcmChunk) {
+        self.queued_bytes += chunk.data.len();
+        self.chunks.push_front(chunk);
     }
 
     /// Number of queued chunks.
@@ -316,6 +360,7 @@ impl Stream {
     /// Clear all queued chunks and reset sync state.
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.queued_bytes = 0;
         self.current = None;
         self.hard_sync = true;
     }
@@ -366,7 +411,7 @@ impl Stream {
         if needs_new {
             self.current = match self.current.as_ref() {
                 Some(ended) if !self.hard_sync => self.next_chunk(ended.end_usec()),
-                _ => self.chunks.pop_front(),
+                _ => self.pop_front_chunk(),
             };
         }
         if self.current.is_none() {
@@ -392,9 +437,9 @@ impl Stream {
                 // Too old: drop frames until the playout point. The current
                 // chunk is a candidate too (it may only be partly stale).
                 if let Some(c) = self.current.take() {
-                    self.chunks.push_front(c);
+                    self.push_front_chunk(c);
                 }
-                while let Some(mut c) = self.chunks.pop_front() {
+                while let Some(mut c) = self.pop_front_chunk() {
                     let a = playout_usec - c.start_usec();
                     if a <= 0 {
                         self.current = Some(c);
@@ -593,14 +638,14 @@ impl Stream {
     fn next_chunk(&mut self, prev_end_usec: i64) -> Option<PcmChunk> {
         let rate = i64::from(self.format.rate());
         loop {
-            let mut next = self.chunks.pop_front()?;
+            let mut next = self.pop_front_chunk()?;
             let jump = next.start_usec() - prev_end_usec;
             if jump.abs() <= DISCONTINUITY_TOLERANCE_USEC || rate == 0 {
                 return Some(next);
             }
             if jump.abs() > DISCONTINUITY_HARD_SYNC_USEC {
                 tracing::info!(jump_usec = jump, "Hard sync: chunk timestamps jump");
-                self.chunks.push_front(next);
+                self.push_front_chunk(next);
                 self.hard_sync = true;
                 return None;
             }
@@ -611,7 +656,7 @@ impl Stream {
                     frames,
                     "Gap between chunks, inserting silence"
                 );
-                self.chunks.push_front(next);
+                self.push_front_chunk(next);
                 let bytes = frames as usize * self.format.frame_size() as usize;
                 return Some(PcmChunk::new_with_encoding(
                     Timeval::from_usec(prev_end_usec),
@@ -943,6 +988,25 @@ mod tests {
         assert_eq!(pcm.sample_to_f32(&i32::MAX.to_le_bytes(), 32), 1.0);
         let f = SampleEncoding::Float32;
         assert_eq!(f.sample_to_f32(&0.5f32.to_le_bytes(), 32), 0.5);
+    }
+
+    /// Regression: the padding byte was read as signal, so a zero-padded
+    /// -1 became about +2.0.
+    #[test]
+    fn sample_to_f32_24bit_ignores_padding_byte() {
+        let pcm = SampleEncoding::PcmInt;
+        let minus_one = -1.0 / snapcast_proto::PCM_24BIT_MAX;
+        for padding in [0x00, 0xFF, 0x5A] {
+            assert_eq!(
+                pcm.sample_to_f32(&[0xFF, 0xFF, 0xFF, padding], 24),
+                minus_one
+            );
+            assert_eq!(pcm.sample_to_f32(&[0xFF, 0xFF, 0x7F, padding], 24), 1.0);
+            assert_eq!(
+                pcm.sample_to_f32(&[0x00, 0x00, 0x80, padding], 24),
+                -8_388_608.0 / snapcast_proto::PCM_24BIT_MAX
+            );
+        }
     }
 
     #[test]

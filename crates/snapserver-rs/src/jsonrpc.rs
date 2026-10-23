@@ -306,7 +306,11 @@ pub(crate) async fn handle_request(
                     },
                 ))
                 .await;
-            ok(id, json!({"latency": latency}))
+            // The server limits the latency: answer with what it stored.
+            let stored = get_status(cmd_tx)
+                .await
+                .and_then(|status| find_client(&status, client_id)?["config"]["latency"].as_i64());
+            ok(id, json!({"latency": stored.unwrap_or(i64::from(latency))}))
         }
         "Client.SetName" => {
             let client_id = require_str!(params, "id", id);
@@ -536,6 +540,7 @@ mod tests {
         tokio::spawn(async move {
             let mut volume: u16 = 100;
             let mut muted = false;
+            let mut latency = 0;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     ServerCommand::GetStatus { response_tx } => {
@@ -552,6 +557,7 @@ mod tests {
                                                 percent: volume,
                                                 muted,
                                             },
+                                            latency,
                                             ..Default::default()
                                         },
                                         host: status::Host {
@@ -579,6 +585,10 @@ mod tests {
                     } => {
                         volume = v;
                         muted = m;
+                    }
+                    // Limited as the server does, with a 1000 ms buffer.
+                    ServerCommand::SetClientLatency { latency: l, .. } => {
+                        latency = l.clamp(-10_000, 1000);
                     }
                     _ => {}
                 }
@@ -925,6 +935,14 @@ mod tests {
         });
         let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
         assert_eq!(response["result"]["latency"], 100);
+
+        // Answered with the latency the server stored, not the request's.
+        let req = json!({
+            "jsonrpc": "2.0", "id": 27,
+            "method": "Client.SetLatency", "params": {"id": "c1", "latency": i32::MIN}
+        });
+        let response = handle_request(&req, &auth_config, &cmd_tx, None).await;
+        assert_eq!(response["result"]["latency"], -10_000);
     }
 
     #[tokio::test]

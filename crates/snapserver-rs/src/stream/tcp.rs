@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, flush_encoder, pump_pcm};
 
 /// Configure reading PCM over TCP; the returned closure starts it.
 pub fn reader(
@@ -35,11 +35,28 @@ pub fn reader(
     };
     let port = uri.port;
     let chunking = Chunking::from_uri(&uri, format, chunk_frames)?;
+    // Bound now, so a port that is taken is reported at startup rather than
+    // leaving a stream that never plays.
+    let listener = match client {
+        true => None,
+        false => {
+            let listener = std::net::TcpListener::bind((host.as_str(), port))
+                .map_err(|e| anyhow::anyhow!("cannot listen on {host}:{port}: {e}"))?;
+            listener.set_nonblocking(true)?;
+            tracing::info!(bind_address = %host, port, "TCP stream listening");
+            Some(listener)
+        }
+    };
 
     Ok(move |tx: mpsc::Sender<AudioFrame>| {
         tokio::spawn(async move {
             let pump = async |stream: &mut TcpStream| {
-                pump_pcm(stream, &mut chunking.timestamper(), &chunking, &tx).await
+                let mut ts = chunking.timestamper();
+                let end = pump_pcm(stream, &mut ts, &chunking, &tx).await;
+                if let PumpEnd::SourceEnded { .. } = end {
+                    flush_encoder(&mut ts, &tx).await;
+                }
+                end
             };
 
             if client {
@@ -62,15 +79,13 @@ pub fn reader(
                 }
             }
 
-            let listener = match TcpListener::bind((host.as_str(), port)).await {
-                Ok(l) => {
-                    tracing::info!(bind_address = %host, port, "TCP stream listening");
-                    l
-                }
-                Err(e) => {
-                    tracing::error!(bind_address = %host, port, error = %e, "Failed to bind TCP stream");
+            let listener = match listener.map(TcpListener::from_std) {
+                Some(Ok(l)) => l,
+                Some(Err(e)) => {
+                    tracing::error!(bind_address = %host, port, error = %e, "Failed to listen for the TCP stream");
                     return;
                 }
+                None => unreachable!("bound unless in client mode"),
             };
             loop {
                 match listener.accept().await {
@@ -107,6 +122,19 @@ mod tests {
         assert!(reader(uri, format, 960).is_err());
         let uri = StreamUri::parse("tcp://?name=t&mode=client").unwrap();
         assert!(reader(uri, format, 960).is_err());
+    }
+
+    /// Regression: the listener was bound inside the reader task, so a
+    /// taken port left a registered stream that never played.
+    #[test]
+    fn taken_port_fails_configuration() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let uri = StreamUri::parse(&format!("tcp://127.0.0.1:{port}?name=t")).unwrap();
+        let err = reader(uri, SampleFormat::new(48000, 16, 2), 960)
+            .err()
+            .expect("port in use");
+        assert!(err.to_string().contains("cannot listen"), "{err}");
     }
 
     /// `mode=client` connects out to the source and reads PCM from it.

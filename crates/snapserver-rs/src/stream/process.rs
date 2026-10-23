@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, flush_encoder, pump_pcm};
 
 /// Configure a child process whose stdout PCM is read, restarted whenever
 /// it exits; the returned closure starts it.
@@ -53,6 +53,7 @@ pub fn reader(
                 if let PumpEnd::TxClosed = end {
                     return;
                 }
+                flush_encoder(&mut ts, &tx).await;
                 tracing::info!(path, "Process exited, restarting");
                 tokio::time::sleep(RETRY_DELAY).await;
             }

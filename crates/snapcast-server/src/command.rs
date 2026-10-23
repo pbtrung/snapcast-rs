@@ -8,11 +8,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 
+use crate::events::EventSink;
 use crate::session::SessionServer;
 use crate::state::ServerState;
 use crate::{ClientSettingsUpdate, ServerCommand, ServerEvent};
+
+/// Lowest client latency accepted (ms), as in C++ snapserver.
+const MIN_CLIENT_LATENCY_MS: i32 = -10_000;
 
 /// The handles and config a command handler needs (everything but loop control).
 pub(crate) struct Dispatcher {
@@ -20,8 +24,8 @@ pub(crate) struct Dispatcher {
     pub(crate) shared_state: Arc<Mutex<ServerState>>,
     /// Session server — pushes settings and recomputes audio routing.
     pub(crate) session_srv: Arc<SessionServer>,
-    /// Outbound event channel to the embedder (events + state snapshots).
-    pub(crate) event_tx: mpsc::Sender<ServerEvent>,
+    /// Outbound events to the embedder (events + state snapshots).
+    pub(crate) events: EventSink,
     /// Playout buffer size in milliseconds (pushed to clients).
     pub(crate) buffer_ms: i32,
     /// Per-stream encoder handles: dropping one stops that stream's encoder.
@@ -54,7 +58,7 @@ impl Dispatcher {
             after = ?after,
             "Removed clients disconnected for too long"
         );
-        let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        self.events.state_changed(snapshot);
         self.announce_removed_clients(None).await;
         stale
     }
@@ -66,8 +70,42 @@ impl Dispatcher {
         let result = mutate(&mut s);
         let snapshot = s.clone();
         drop(s);
-        let _ = self.event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        self.events.state_changed(snapshot);
         result
+    }
+
+    /// Record a stream's activity status (from its encoder) and announce a
+    /// change.
+    pub(crate) async fn set_stream_status(&self, stream_id: &str, status: &str) {
+        let changed = self
+            .mutate_state_if(|s| {
+                let stream = s.streams.iter_mut().find(|st| st.id == stream_id)?;
+                (stream.status != status).then(|| stream.status = status.to_string())
+            })
+            .await;
+        if changed.is_some() {
+            self.notify(
+                None,
+                ServerEvent::StreamStatus {
+                    stream_id: stream_id.to_string(),
+                    status: status.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Like [`Self::mutate_state`], reporting a snapshot only if `mutate`
+    /// returns `Some` (it changed something).
+    async fn mutate_state_if<R>(
+        &self,
+        mutate: impl FnOnce(&mut ServerState) -> Option<R>,
+    ) -> Option<R> {
+        let mut s = self.shared_state.lock().await;
+        let result = mutate(&mut s)?;
+        let snapshot = s.clone();
+        drop(s);
+        self.events.state_changed(snapshot);
+        Some(result)
     }
 
     /// Report a structural change after clients were deleted (the
@@ -109,7 +147,7 @@ impl Dispatcher {
             },
             None => event,
         };
-        let _ = self.event_tx.try_send(event);
+        self.events.notify(event);
     }
 
     /// Handle one command, already taken out of its
@@ -150,6 +188,9 @@ impl Dispatcher {
                 self.session_srv.update_routing_for_client(&client_id).await;
             }
             ServerCommand::SetClientLatency { client_id, latency } => {
+                // As C++ snapserver: a latency beyond the buffer leaves the
+                // client nothing to play anyway.
+                let latency = latency.clamp(MIN_CLIENT_LATENCY_MS, self.buffer_ms.max(0));
                 let settings = self
                     .mutate_state(|s| {
                         if let Some(c) = s.clients.get_mut(&client_id) {
@@ -237,6 +278,10 @@ impl Dispatcher {
             }
             ServerCommand::DeleteClient { client_id } => {
                 self.mutate_state(|s| s.remove_client(&client_id)).await;
+                // A connected client's session would otherwise keep
+                // streaming, invisible in the status. It reconnects as a
+                // new client.
+                self.session_srv.disconnect_client(&client_id).await;
                 self.announce_removed_clients(origin).await;
             }
             ServerCommand::SetStreamMeta {
@@ -271,16 +316,19 @@ impl Dispatcher {
                     stops.remove(&stream_id);
                 }
                 self.session_srv.unregister_stream_codec(&stream_id).await;
-                self.mutate_state(|s| {
-                    s.streams.retain(|st| st.id != stream_id);
-                    // Clear stream_id on groups that referenced this stream
-                    for g in &mut s.groups {
-                        if g.stream_id == stream_id {
-                            g.stream_id.clear();
-                        }
+                let mut s = self.shared_state.lock().await;
+                s.streams.retain(|st| st.id != stream_id);
+                // Groups on the removed stream move to the default one
+                // (none once the last stream is gone).
+                let default = self.session_srv.default_stream(&s).await;
+                for g in &mut s.groups {
+                    if g.stream_id == stream_id {
+                        g.stream_id.clone_from(&default);
                     }
-                })
-                .await;
+                }
+                let snapshot = s.clone();
+                drop(s);
+                self.events.state_changed(snapshot);
                 self.notify(origin, ServerEvent::ServerUpdated);
                 self.session_srv.update_routing_all().await;
             }
@@ -291,11 +339,18 @@ impl Dispatcher {
             } => {
                 tracing::debug!(stream_id, command, ?params, "Stream control forwarded");
                 // Forward to embedder via event — the library doesn't own stream readers
-                let _ = self.event_tx.try_send(ServerEvent::StreamControl {
-                    stream_id,
-                    command,
-                    params,
-                });
+                if self
+                    .events
+                    .sender()
+                    .try_send(ServerEvent::StreamControl {
+                        stream_id,
+                        command,
+                        params,
+                    })
+                    .is_err()
+                {
+                    tracing::warn!("Event channel full, stream control command dropped");
+                }
             }
             ServerCommand::GetStatus { response_tx } => {
                 let s = self.shared_state.lock().await;
@@ -310,6 +365,7 @@ mod tests {
     use super::*;
     use crate::session::SessionServerConfig;
     use crate::state::{ServerState, StreamInfo};
+    use tokio::sync::mpsc;
 
     /// Build a dispatcher over `state`, returning it and its event receiver. The
     /// session server has no registered client senders, so `push_settings` /
@@ -317,6 +373,8 @@ mod tests {
     /// the command state machine.
     fn dispatcher_with(state: ServerState) -> (Dispatcher, mpsc::Receiver<ServerEvent>) {
         let shared_state = Arc::new(Mutex::new(state));
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let events = EventSink::new(event_tx);
         let session_srv = Arc::new(SessionServer::new(SessionServerConfig {
             buffer_ms: 1000,
             auth: None,
@@ -325,13 +383,13 @@ mod tests {
             default_stream: "default".into(),
             send_audio_to_muted: false,
             idle_timeout: None,
+            events: events.clone(),
         }));
-        let (event_tx, event_rx) = mpsc::channel(256);
         (
             Dispatcher {
                 shared_state,
                 session_srv,
-                event_tx,
+                events,
                 buffer_ms: 1000,
                 encoder_stops: Default::default(),
             },
@@ -501,6 +559,26 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ServerEvent::ClientLatencyChanged { latency: 33, .. }))
         );
+    }
+
+    /// Regression: any i32 latency was accepted, and clients overflowed
+    /// subtracting it from the buffer.
+    #[tokio::test]
+    async fn set_client_latency_is_clamped() {
+        let (state, _gid) = state_with_client();
+        let (d, _rx) = dispatcher_with(state);
+        for (latency, expected) in [(i32::MIN, -10_000), (i32::MAX, 1000), (-200, -200)] {
+            d.dispatch(
+                None,
+                ServerCommand::SetClientLatency {
+                    client_id: "c1".into(),
+                    latency,
+                },
+            )
+            .await;
+            let s = d.shared_state.lock().await;
+            assert_eq!(s.clients.get("c1").unwrap().config.latency, expected);
+        }
     }
 
     #[tokio::test]

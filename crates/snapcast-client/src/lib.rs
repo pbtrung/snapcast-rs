@@ -13,9 +13,25 @@
 //! use snapcast_client::{SnapClient, ClientConfig, ClientEvent, ClientCommand};
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let config = ClientConfig::default();
+//! let config = ClientConfig {
+//!     host: "192.168.1.50".into(),
+//!     // Only the audio receiver below is used: no synchronized playout.
+//!     playout_buffer: false,
+//!     ..ClientConfig::default()
+//! };
 //! let (mut client, mut events, mut audio_rx) = SnapClient::new(config);
 //! let cmd = client.command_sender();
+//!
+//! // Decoded audio as it arrives, with the server time each frame is due
+//! // at. Delivery is not playback: an embedder playing it must schedule it
+//! // by `timestamp_usec` itself (or read `SnapClient::stream`, as the
+//! // snapclient binary does, with `playout_buffer` left on). Frames are
+//! // dropped while this receiver is full.
+//! tokio::spawn(async move {
+//!     while let Some(frame) = audio_rx.recv().await {
+//!         let _ = (frame.timestamp_usec, frame.samples.len());
+//!     }
+//! });
 //!
 //! // React to events in a separate task
 //! tokio::spawn(async move {
@@ -156,6 +172,12 @@ pub struct ClientConfig {
     pub latency: i32,
     /// Client name sent in Hello. Default: "Snapclient".
     pub client_name: String,
+    /// Queue decoded audio in [`SnapClient::stream`] for synchronized
+    /// playout (what the snapclient binary's player reads). Default: true.
+    /// Set it to false when only consuming the audio receiver: nothing would
+    /// read that queue. Either way the queue is bounded, dropping the oldest
+    /// audio when nothing plays it.
+    pub playout_buffer: bool,
 }
 
 impl Default for ClientConfig {
@@ -169,6 +191,7 @@ impl Default for ClientConfig {
             host_id: String::new(),
             latency: 0,
             client_name: snapcast_proto::DEFAULT_CLIENT_NAME.into(),
+            playout_buffer: true,
         }
     }
 }

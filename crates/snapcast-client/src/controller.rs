@@ -20,7 +20,14 @@ use crate::{ClientCommand, ClientEvent};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RECONNECT_DELAY_SECS: u32 = 30;
+/// The whole handshake (Hello sent, ServerSettings received) must finish
+/// within this.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A write that makes no progress for this long fails the session.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// With no Time reply for this long, the server is gone (a silent but
+/// writable connection) and the client reconnects.
+const TIME_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const QUICK_SYNC_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -42,6 +49,11 @@ pub struct Controller {
     failed_attempts: u32,
     /// Sends the latest settings events while the event channel is full.
     settings_task: Option<tokio::task::JoinHandle<()>>,
+    /// When the last Time reply arrived.
+    last_time_reply: tokio::time::Instant,
+    /// [`HELLO_TIMEOUT`] and [`TIME_REPLY_TIMEOUT`]; shortened by tests.
+    hello_timeout: Duration,
+    time_reply_timeout: Duration,
 }
 
 impl Controller {
@@ -70,6 +82,9 @@ impl Controller {
             command_rx,
             failed_attempts: 0,
             settings_task: None,
+            last_time_reply: tokio::time::Instant::now(),
+            hello_timeout: HELLO_TIMEOUT,
+            time_reply_timeout: TIME_REPLY_TIMEOUT,
         })
     }
 
@@ -133,12 +148,24 @@ impl Controller {
             port: self.settings.port,
         });
 
-        self.send_hello().await?;
+        if !self.handshake().await? {
+            return Ok(());
+        }
         self.failed_attempts = 0;
         self.receive_loop().await
     }
 
-    async fn send_hello(&mut self) -> Result<()> {
+    /// Send Hello and wait for ServerSettings, within [`HELLO_TIMEOUT`]
+    /// overall. Returns false if Stop arrived first.
+    async fn handshake(&mut self) -> Result<bool> {
+        let timeout = self.hello_timeout;
+        match tokio::time::timeout(timeout, self.send_hello()).await {
+            Ok(res) => res,
+            Err(_) => bail!("no ServerSettings within {timeout:?} of Hello"),
+        }
+    }
+
+    async fn send_hello(&mut self) -> Result<bool> {
         let mac = get_mac_address();
         let host_id = if self.settings.host_id.is_empty() {
             mac.clone()
@@ -164,20 +191,26 @@ impl Controller {
             auth,
         };
 
-        self.connection
-            .send(MessageType::Hello, &MessagePayload::Hello(hello))
-            .await?;
+        if !self
+            .send_or_stop(MessageType::Hello, &MessagePayload::Hello(hello))
+            .await?
+        {
+            return Ok(false);
+        }
 
         // Expect ServerSettings as first or one of first messages
         loop {
-            let response = self.recv_timeout(HELLO_TIMEOUT).await?;
+            let response = tokio::select! {
+                msg = self.connection.recv() => msg?,
+                _ = wait_for_stop(&mut self.command_rx) => return Ok(false),
+            };
             match response.payload {
                 MessagePayload::ServerSettings(ss) => {
                     self.emit_settings(&ss, false);
                     // A CodecHeader may already have set up the stream.
                     self.apply_server_settings(&ss);
                     self.server_settings = Some(ss);
-                    return Ok(());
+                    return Ok(true);
                 }
                 MessagePayload::CodecHeader(ch) => {
                     self.init_audio_pipeline(&ch)?;
@@ -205,7 +238,10 @@ impl Controller {
         let sync_timer = tokio::time::sleep(sync_jitter.next(QUICK_SYNC_INTERVAL));
         tokio::pin!(sync_timer);
 
-        self.send_time_request().await;
+        self.last_time_reply = tokio::time::Instant::now();
+        if !self.send_time_request().await? {
+            return Ok(());
+        }
 
         loop {
             tokio::select! {
@@ -221,22 +257,23 @@ impl Controller {
                         }
                         Some(ClientCommand::SetVolume { volume, muted }) => {
                             tracing::debug!(volume, muted, "Sending volume change to server");
-                            self.connection
-                                .send(
-                                    MessageType::ClientInfo,
-                                    &MessagePayload::ClientInfo(
-                                        snapcast_proto::message::client_info::ClientInfo {
-                                            volume,
-                                            muted,
-                                        },
-                                    ),
-                                )
-                                .await?;
+                            let info = MessagePayload::ClientInfo(
+                                snapcast_proto::message::client_info::ClientInfo { volume, muted },
+                            );
+                            if !self.send_or_stop(MessageType::ClientInfo, &info).await? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
                 () = &mut sync_timer => {
-                    self.send_time_request().await;
+                    let silent = self.last_time_reply.elapsed();
+                    if silent > self.time_reply_timeout {
+                        bail!("no time reply from the server for {silent:?}");
+                    }
+                    if !self.send_time_request().await? {
+                        return Ok(());
+                    }
                     let (synced, diff) = {
                         let tp = self.time_provider.lock().unwrap_or_else(|e| e.into_inner());
                         (tp.is_synced(), tp.diff_to_server_usec())
@@ -264,11 +301,27 @@ impl Controller {
         }
     }
 
-    async fn send_time_request(&mut self) {
-        self.connection
-            .send(MessageType::Time, &MessagePayload::Time(Time::new()))
+    /// Returns false if Stop arrived first.
+    async fn send_time_request(&mut self) -> Result<bool> {
+        self.send_or_stop(MessageType::Time, &MessagePayload::Time(Time::new()))
             .await
-            .ok();
+    }
+
+    /// Send a message, failing after [`WRITE_TIMEOUT`] without progress (a
+    /// peer that stopped reading). Returns false if Stop arrived first, so a
+    /// stalled write never delays stopping.
+    async fn send_or_stop(
+        &mut self,
+        msg_type: MessageType,
+        payload: &MessagePayload,
+    ) -> Result<bool> {
+        tokio::select! {
+            res = tokio::time::timeout(WRITE_TIMEOUT, self.connection.send(msg_type, payload)) => {
+                res.map_err(|_| anyhow::anyhow!("sending {msg_type:?} timed out"))??;
+                Ok(true)
+            }
+            _ = wait_for_stop(&mut self.command_rx) => Ok(false),
+        }
     }
 
     fn handle_message(&mut self, msg: TypedMessage) -> Result<()> {
@@ -292,16 +345,18 @@ impl Controller {
                             }
                         }
 
-                        let chunk = PcmChunk::new_with_encoding(
-                            wc.timestamp,
-                            data,
-                            self.sample_format,
-                            self.sample_encoding,
-                        );
-                        self.stream
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .add_chunk(chunk);
+                        if self.settings.playout_buffer {
+                            let chunk = PcmChunk::new_with_encoding(
+                                wc.timestamp,
+                                data,
+                                self.sample_format,
+                                self.sample_encoding,
+                            );
+                            self.stream
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .add_chunk(chunk);
+                        }
                     }
                 }
             }
@@ -314,6 +369,7 @@ impl Controller {
                 self.init_audio_pipeline(&ch)?;
             }
             MessagePayload::Time(t) => {
+                self.last_time_reply = tokio::time::Instant::now();
                 // Timed by the arrival, not by when it is handled here.
                 let s2c = msg.base.received - msg.base.sent;
                 self.time_provider
@@ -336,7 +392,8 @@ impl Controller {
     /// Playout buffer for the stream: server buffer minus server- and
     /// client-side latency (as C++ `Controller`).
     fn buffer_ms(&self, ss: &ServerSettings) -> i64 {
-        i64::from((ss.buffer_ms - ss.latency - self.settings.latency).max(0))
+        // In i64: the i32 operands can each be anywhere in their range.
+        (i64::from(ss.buffer_ms) - i64::from(ss.latency) - i64::from(self.settings.latency)).max(0)
     }
 
     fn apply_server_settings(&self, ss: &ServerSettings) {
@@ -372,12 +429,6 @@ impl Controller {
 
         self.decoder = Some(dec);
         Ok(())
-    }
-
-    async fn recv_timeout(&mut self, timeout: Duration) -> Result<TypedMessage> {
-        tokio::time::timeout(timeout, self.connection.recv())
-            .await
-            .map_err(|_| anyhow::anyhow!("receive timed out"))?
     }
 
     fn cleanup(&mut self) {
@@ -813,6 +864,181 @@ mod tests {
         // The first reconnect delay is 1 s; Stop must end run() well before.
         let res = tokio::time::timeout(Duration::from_millis(500), client.run()).await;
         assert!(matches!(res, Ok(Ok(()))), "run() should stop promptly");
+    }
+
+    /// Regression: the subtractions ran in i32 and overflowed (a panic in
+    /// debug builds, a wrapped zero buffer in release).
+    #[test]
+    fn buffer_ms_handles_extreme_latencies() {
+        let (ctrl, _e, _a, _s) = make_controller();
+        let ss = |buffer_ms, latency| ServerSettings {
+            buffer_ms,
+            latency,
+            volume: 100,
+            muted: false,
+        };
+        assert_eq!(
+            ctrl.buffer_ms(&ss(1000, i32::MIN)),
+            1000 - i64::from(i32::MIN)
+        );
+        assert_eq!(ctrl.buffer_ms(&ss(i32::MIN, i32::MAX)), 0);
+        assert_eq!(ctrl.buffer_ms(&ss(1000, 200)), 800);
+    }
+
+    fn pcm_wirechunk(sec: i32) -> TypedMessage {
+        TypedMessage {
+            base: base(MessageType::WireChunk),
+            payload: MessagePayload::WireChunk(WireChunk {
+                timestamp: Timeval { sec, usec: 0 },
+                payload: vec![0u8; 960 * 4],
+            }),
+        }
+    }
+
+    #[test]
+    fn playout_buffer_off_leaves_the_stream_empty() {
+        let (mut ctrl, _e, mut audio_rx, stream) = make_controller();
+        ctrl.settings.playout_buffer = false;
+        ctrl.init_audio_pipeline(&CodecHeader {
+            codec: "pcm".into(),
+            payload: wav_header(),
+        })
+        .unwrap();
+        ctrl.handle_message(pcm_wirechunk(1)).unwrap();
+        assert!(audio_rx.try_recv().is_ok(), "the receiver still gets audio");
+        assert_eq!(stream.lock().unwrap().chunk_count(), 0);
+    }
+
+    /// Regression: with nothing playing the stream, every decoded chunk
+    /// stayed queued.
+    #[test]
+    fn unplayed_audio_is_bounded() {
+        let (mut ctrl, _e, _a, stream) = make_controller();
+        ctrl.init_audio_pipeline(&CodecHeader {
+            codec: "pcm".into(),
+            payload: wav_header(),
+        })
+        .unwrap();
+        for i in 0..10_000 {
+            ctrl.handle_message(pcm_wirechunk(i)).unwrap();
+        }
+        // 1 s default buffer + 3 s slack in 20 ms chunks.
+        assert_eq!(stream.lock().unwrap().chunk_count(), 200);
+    }
+
+    /// Server stand-in that reads Hello and then calls `after_hello` with the
+    /// socket, holding it open until the test ends.
+    async fn fake_server<F, Fut>(after_hello: F) -> u16
+    where
+        F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        use snapcast_proto::message::factory;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            while factory::take_frame(&mut buf).unwrap().is_none() {
+                if sock.read_buf(&mut buf).await.unwrap() == 0 {
+                    return;
+                }
+            }
+            after_hello(sock).await;
+        });
+        port
+    }
+
+    fn controller_for(port: u16) -> (Controller, mpsc::Sender<ClientCommand>) {
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (audio_tx, _audio_rx) = mpsc::channel(8);
+        let cfg = crate::ClientConfig {
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        let tp = Arc::new(Mutex::new(TimeProvider::new()));
+        let stream = Arc::new(Mutex::new(Stream::new(SampleFormat::default())));
+        let ctrl = Controller::new(cfg, event_tx, cmd_rx, audio_tx, tp, stream).unwrap();
+        (ctrl, cmd_tx)
+    }
+
+    async fn send_frame(
+        sock: &mut tokio::net::TcpStream,
+        msg_type: MessageType,
+        payload: MessagePayload,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let frame =
+            snapcast_proto::message::factory::serialize(&mut base(msg_type), &payload).unwrap();
+        sock.write_all(&frame).await.unwrap();
+    }
+
+    /// Regression: Stop waited for the server's reply to Hello.
+    #[tokio::test]
+    async fn stop_interrupts_a_withheld_handshake() {
+        let port = fake_server(|sock| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(sock);
+        })
+        .await;
+        let (mut ctrl, cmd) = controller_for(port);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cmd.send(ClientCommand::Stop).await.unwrap();
+        });
+        let res = tokio::time::timeout(Duration::from_secs(1), ctrl.session()).await;
+        assert!(matches!(res, Ok(Ok(()))), "session should stop promptly");
+    }
+
+    /// Regression: each message other than ServerSettings restarted the
+    /// handshake timeout, so a server could hold it open forever.
+    #[tokio::test]
+    async fn handshake_deadline_is_overall() {
+        let port = fake_server(|mut sock| async move {
+            loop {
+                send_frame(
+                    &mut sock,
+                    MessageType::Time,
+                    MessagePayload::Time(Time::new()),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let (mut ctrl, _cmd) = controller_for(port);
+        ctrl.hello_timeout = Duration::from_millis(300);
+        let res = tokio::time::timeout(Duration::from_secs(2), ctrl.session()).await;
+        let err = res.expect("handshake should time out").unwrap_err();
+        assert!(err.to_string().contains("ServerSettings"), "{err}");
+    }
+
+    /// Regression: after the handshake a server that stopped answering kept
+    /// the session alive forever.
+    #[tokio::test]
+    async fn silent_server_after_handshake_ends_the_session() {
+        let port = fake_server(|mut sock| async move {
+            let settings = MessagePayload::ServerSettings(ServerSettings {
+                buffer_ms: 1000,
+                latency: 0,
+                volume: 100,
+                muted: false,
+            });
+            send_frame(&mut sock, MessageType::ServerSettings, settings).await;
+            // Keep reading (so writes succeed), never reply.
+            let mut buf = vec![0u8; 4096];
+            use tokio::io::AsyncReadExt;
+            while sock.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        })
+        .await;
+        let (mut ctrl, _cmd) = controller_for(port);
+        ctrl.time_reply_timeout = Duration::from_millis(500);
+        let res = tokio::time::timeout(Duration::from_secs(3), ctrl.session()).await;
+        let err = res.expect("session should end").unwrap_err();
+        assert!(err.to_string().contains("no time reply"), "{err}");
     }
 
     #[tokio::test]

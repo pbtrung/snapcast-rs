@@ -47,6 +47,14 @@ pub(crate) trait Encoder: Send {
     /// Drop buffered input and codec state before encoding resumes after a
     /// gap, so the first output after the gap holds no audio from before it.
     fn reset(&mut self) {}
+
+    /// Encode the input still buffered toward an incomplete packet, padded
+    /// with silence to a whole packet (end of a track or of the source).
+    /// `offset_frames` is relative to the end of the input so far, so it is
+    /// negative.
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Configuration for creating an encoder.

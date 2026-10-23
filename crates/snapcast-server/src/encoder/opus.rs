@@ -184,6 +184,22 @@ impl Encoder for OpusEncoder {
             tracing::warn!(codec = "opus", error = %e, "reset failed");
         }
     }
+
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
+        let channels = self.format.channels() as usize;
+        let carried_frames = (self.pending.len() / channels) as i64;
+        if carried_frames == 0 {
+            return Ok(Vec::new());
+        }
+        // Padded to a whole 20 ms packet, the only size clients expect.
+        self.pending.resize(self.frame_size * channels, 0.0);
+        let mut packets = self.encode(AudioData::F32(Vec::new()))?;
+        for packet in &mut packets {
+            // `encode` counted the padding as input too.
+            packet.offset_frames = -carried_frames;
+        }
+        Ok(packets)
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +302,20 @@ mod tests {
         assert!(enc.encode(AudioData::Pcm(tone(500))).unwrap().is_empty());
         enc.reset();
         assert!(enc.pending.is_empty());
+    }
+
+    #[test]
+    fn flush_pads_the_partial_packet() {
+        let mut enc = OpusEncoder::new(SampleFormat::new(48000, 16, 2), "").unwrap();
+        assert!(enc.flush().unwrap().is_empty(), "nothing pending");
+        assert!(enc.encode(AudioData::Pcm(tone(300))).unwrap().is_empty());
+        let packets = enc.flush().unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].offset_frames, -300);
+        assert!(enc.pending.is_empty());
+        let mut dec = opus::Decoder::new(48000, Channels::Stereo).unwrap();
+        let mut out = vec![0i16; 5760 * 2];
+        assert_eq!(dec.decode(&packets[0].data, &mut out, false).unwrap(), 960);
     }
 
     #[test]

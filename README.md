@@ -10,7 +10,7 @@ A Rust reimplementation of [Snapcast](https://github.com/snapcast/snapcast), the
 - **Integrated Resampling**: Optional `rubato`-based resampling (the client's `resampler` feature) when the local hardware doesn't support the server's native format.
 - **Bounded Protocol Reads**: Client and server reject oversized binary-protocol payloads before allocation.
 - **Per-Stream Format Ownership**: Each server stream owns its codec/sample-format encoder state.
-- **Lossless f32 Decode Path**: The FLAC decoder outputs native f32 samples — no intermediate 16-bit quantization.
+- **Lossless f32 Decode Path**: The FLAC decoder outputs native f32 samples, which hold the 16- and 24-bit FLAC the server sends exactly — no intermediate 16-bit quantization.
 - **WebSocket Streaming**: Clients can stream over `ws://host:1780` (the server's `/stream` endpoint on its HTTP port) as well as plain TCP, one binary-protocol frame per WebSocket message, as in C++ Snapcast. Snapweb works against `snapserver-rs` for both control and in-browser playback (FLAC, PCM and Opus). No TLS (`wss://`) support.
 - **Configurable Bind Addresses**: Listeners bind loopback, IPv4, IPv6, or specific interfaces.
 - **Systemd Integration**: `snapclient-rs` reports readiness and status via `sd-notify` on Linux.
@@ -49,16 +49,16 @@ Client (`snapclient-rs`; FLAC, PCM and Opus decoding are always built in, all pu
 
 ## Stream Sources
 
-`--source` (repeatable) or `source = ...` under `[stream]` in `snapserver.conf` (default path `/etc/snapserver.conf`, set with `-c`). Each URI takes `?name=<id>` (unique per stream) plus, as in C++ snapserver, optional `&sampleformat=<rate>:<bits>:<channels>`, `&codec=<codec>` and `&chunk_ms=<ms>` overriding the server-wide `sampleformat`, `codec` and `chunk_ms` of `[stream]`:
+`--source` (repeatable) or `source = ...` under `[stream]` in `snapserver.conf` (default path `/etc/snapserver.conf`, used if it exists; a file named with `-c` must exist). A config file that can't be read or parsed, or holds an invalid value, stops the server at startup instead of being replaced by the defaults. Each URI takes `?name=<id>` (unique per stream) plus, as in C++ snapserver, optional `&sampleformat=<rate>:<bits>:<channels>`, `&codec=<codec>` and `&chunk_ms=<ms>` overriding the server-wide `sampleformat`, `codec` and `chunk_ms` of `[stream]`:
 
 - `pipe:///path/to/fifo`: named pipe (the default source is `pipe:///tmp/snapfifo?name=default`)
-- `file:///path/to/file.pcm`: raw PCM or WAV file, played in real time and looped
+- `file:///path/to/file.pcm`: raw PCM or WAV file, played in real time and looped. A WAV file must have the source's sample rate and channels, and either integer PCM of its bit depth (24-bit packed in 3 bytes or padded to 4) or 32-bit float; anything else is rejected with the `sampleformat` to set
 - `process:///path/to/binary?params=...`: a child process's stdout, restarted when it exits (`"..."` groups an argument with spaces in `params`)
 - `tcp://<bind-host>:<port>`: listen for TCP connections sending PCM (default port 4953); with `&mode=client`, connect to `<host>:<port>` instead
 
-Sources send signed little-endian integer PCM by default. Add `&encoding=float` to send 32-bit little-endian floats instead (ffmpeg `-f f32le`). The Opus encoder then works on the floats directly, so nothing is quantized to 16 bits before encoding. With `float`, the bit depth in `sampleformat` only sets what the PCM and FLAC codecs convert to.
+Sources send signed little-endian integer PCM by default. 24-bit samples take **four** bytes each (the low three hold the sample), as Snapcast sends them, not the packed three bytes of ffmpeg's `s24le`; to feed 24-bit audio, send floats instead. Add `&encoding=float` to send 32-bit little-endian floats (ffmpeg `-f f32le`). The Opus encoder then works on the floats directly, so nothing is quantized to 16 bits before encoding. With `float`, the bit depth in `sampleformat` only sets what the PCM and FLAC codecs convert to.
 
-Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root` or `doc_root` under `[http]`). `enabled = false` under `[tcp-control]` or `[http]` turns that server off. `send_to_muted = true` under `[stream]` keeps sending audio to muted clients.
+Ports: 1704 (audio), 1705 (TCP JSON-RPC control), 1780 (HTTP/WebSocket JSON-RPC, `/stream` and Snapweb via `--doc-root` or `doc_root` under `[http]`). A `tcp://` source's port is bound at startup too; when it is taken, that stream is skipped with an error. `enabled = false` under `[tcp-control]` or `[http]` turns that server off. `send_to_muted = true` under `[stream]` keeps sending audio to muted clients.
 
 ## Inactive Clients
 
@@ -81,13 +81,19 @@ Library users set `ServerConfig::client_idle_timeout` and
 ## Control API
 
 JSON-RPC 2.0 as in C++ snapserver, over TCP (port 1705, one message per line),
-WebSocket (`ws://host:1780/jsonrpc`) and HTTP `POST /jsonrpc`. Change
+WebSocket (`ws://host:1780/jsonrpc`) and HTTP `POST /jsonrpc`. The envelope
+is checked leniently on purpose, for clients that are loose with it:
+`"jsonrpc": "2.0"` is not required, any JSON value is accepted as the `id`,
+and an object without an `id` is ignored as a notification. Change
 notifications (`Client.OnVolumeChanged`, `Server.OnUpdate`, ...) go to every
 TCP and WebSocket connection except the one whose request caused the change,
 which gets the response instead. Changes made over HTTP, by audio clients or
 by the server itself are announced to all of them. Library users get the same
 through `ServerCommand::FromControl`, whose notifications come back as
 `ServerEvent::FromControl`.
+
+A stream's status is `playing` while audio arrives from its source and
+`idle` a few seconds after it stops (`Stream.OnUpdate` announces each change).
 
 None of the stream sources can be controlled (play, pause, next, ...), so
 `Stream.Control` and the C++ form of `Stream.SetProperty`
@@ -98,6 +104,23 @@ stream's properties, e.g. for a script publishing what is playing; use the
 `Server.GetStatus` shape (`{"metadata": {"title": ...}, "playbackStatus":
 "playing", ...}`). `Stream.OnProperties` then carries `{"id", "properties"}`
 with the properties exactly as `Server.GetStatus` shows them.
+
+### Browser Origins
+
+The HTTP and WebSocket control API at `/jsonrpc` refuses requests that a web
+page on another site makes through a visitor's browser (HTTP 403): pages are
+only allowed from the server's own origin, such as Snapweb served with
+`doc_root`. Clients that are not browsers send no `Origin` and are not
+affected. To use another web UI, list its origins:
+
+```ini
+[http]
+allowed_origins = http://snapweb.lan:8080, https://music.example
+# or `*` for any origin
+```
+
+This does not protect against DNS rebinding; enable authentication when
+browsers that visit untrusted pages can reach the server.
 
 ### Authentication
 
@@ -183,7 +206,7 @@ The binaries land in `target/release/snapserver-rs` and `target/release/snapclie
 
 Pre-built Linux binaries are on the [Releases](https://github.com/pbtrung/snapcast-rs/releases) page, named `snapserver-rs-<target>` / `snapclient-rs-<target>` for `x86_64` and `aarch64`, each as `-unknown-linux-gnu` and `-unknown-linux-musl`. The server is built with Opus (libopus linked in statically). The gnu builds need glibc 2.34+, and the gnu client needs `alsa-lib`. The musl builds are fully static, but the static client can't load ALSA plugins such as PipeWire's, so use the gnu client on PipeWire/PulseAudio desktops. The binaries are built in an Arch Linux container with `docker-build/build.sh` (see [docker-build/README.md](docker-build/README.md)).
 
-Run the checks with `make check` (fmt, clippy, tests).
+Run the checks with `make check` (fmt, clippy and tests, with default, all and no optional features).
 
 ## Usage
 

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::uri::StreamUri;
-use super::{Chunking, PumpEnd, RETRY_DELAY, pump_pcm};
+use super::{Chunking, PumpEnd, RETRY_DELAY, flush_encoder, pump_pcm};
 
 /// Configure reading PCM from a named pipe; the returned closure starts it.
 pub fn reader(
@@ -64,6 +64,7 @@ pub fn reader(
                         let mut ts = chunking.timestamper();
                         match pump_pcm(&mut reader, &mut ts, &chunking, &tx).await {
                             PumpEnd::SourceEnded { .. } => {
+                                flush_encoder(&mut ts, &tx).await;
                                 tracing::debug!(path, "Pipe read ended, reopening");
                             }
                             PumpEnd::TxClosed => return,

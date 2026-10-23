@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 use crate::ClientSettingsUpdate;
 use crate::ServerEvent;
 use crate::WireChunkData;
+use crate::events::EventSink;
 use crate::time::now_usec;
 
 /// Pause after a failed `accept`, so persistent failures (e.g. out of file
@@ -105,7 +106,10 @@ struct SessionContext {
     sessions: Mutex<HashMap<String, ActiveSession>>,
     next_generation: AtomicU64,
     shared_state: Arc<tokio::sync::Mutex<crate::state::ServerState>>,
+    /// The preferred default stream (the first configured one), used while
+    /// it is registered.
     default_stream: String,
+    events: EventSink,
 }
 
 /// Ownership record for a client's live session.
@@ -155,19 +159,29 @@ impl SessionContext {
 
         let (initial_settings, initial_routing, joins_new_group, snapshot) = {
             let mut s = self.shared_state.lock().await;
+            let default_stream = self.default_stream(&s).await;
             let c = s.get_or_create_client(client_id, &hello.host_name, &hello.mac);
             c.update_from_hello(hello, &peer.ip().to_string());
             c.connected = true;
             let joins_new_group = s.group_of(client_id).is_none();
-            s.group_for_client(client_id, &self.default_stream);
+            let group = s.group_for_client(client_id, &default_stream);
+            // A group left on a stream that is gone (removed, or no longer
+            // configured) plays the default one, as in C++ snapserver.
+            if !self
+                .codec_headers
+                .lock()
+                .await
+                .contains_key(&group.stream_id)
+            {
+                group.stream_id = default_stream.clone();
+            }
             let initial_settings = ClientSettingsUpdate::from_state(&s, client_id, self.buffer_ms)
                 .expect("client just registered");
-            let initial_routing =
-                Self::build_routing(&s, client_id).unwrap_or_else(|| SessionRouting {
-                    stream_id: self.default_stream.clone(),
-                    client_muted: false,
-                    group_muted: false,
-                });
+            let initial_routing = Self::build_routing(&s, client_id).unwrap_or(SessionRouting {
+                stream_id: default_stream,
+                client_muted: false,
+                group_muted: false,
+            });
             (
                 initial_settings,
                 initial_routing,
@@ -229,6 +243,35 @@ impl SessionContext {
         self.routing_senders.lock().await.remove(client_id);
         self.settings_senders.lock().await.remove(client_id);
         Some(snapshot)
+    }
+
+    /// End `client_id`'s session, if it has one, and drop its channels. The
+    /// session reports no disconnect: its client is no longer known.
+    async fn disconnect(&self, client_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.remove(client_id) else {
+            return;
+        };
+        tracing::info!(id = %client_id, "Client deleted, closing its session");
+        let _ = session.cancel.send(());
+        self.routing_senders.lock().await.remove(client_id);
+        self.settings_senders.lock().await.remove(client_id);
+    }
+
+    /// The stream new groups play: the configured default while it is
+    /// registered, else the first registered stream in `state`, else none
+    /// (empty). The caller holds the state lock.
+    async fn default_stream(&self, state: &crate::state::ServerState) -> String {
+        let headers = self.codec_headers.lock().await;
+        if headers.contains_key(&self.default_stream) {
+            return self.default_stream.clone();
+        }
+        state
+            .streams
+            .iter()
+            .find(|st| headers.contains_key(&st.id))
+            .map(|st| st.id.clone())
+            .unwrap_or_default()
     }
 
     /// Build routing for a single client from server state.
@@ -327,8 +370,11 @@ pub(crate) struct SessionServerConfig {
     pub default_stream: String,
     /// Whether muted clients still receive audio.
     pub send_audio_to_muted: bool,
-    /// Close a session that sends nothing for this long (`None` = never).
+    /// Close a session that sends nothing for this long, or whose writes
+    /// make no progress for this long (`None` = never).
     pub idle_timeout: Option<Duration>,
+    /// Events to the embedder.
+    pub events: EventSink,
 }
 
 impl SessionServer {
@@ -348,6 +394,7 @@ impl SessionServer {
                 next_generation: AtomicU64::new(0),
                 shared_state: config.shared_state,
                 default_stream: config.default_stream,
+                events: config.events,
             }),
         }
     }
@@ -374,6 +421,19 @@ impl SessionServer {
     /// ones are not sent again.
     pub async fn push_settings(&self, update: ClientSettingsUpdate) {
         self.ctx.set_settings(update, true).await;
+    }
+
+    /// End a deleted client's session (see [`ServerCommand::DeleteClient`]).
+    ///
+    /// [`ServerCommand::DeleteClient`]: crate::ServerCommand::DeleteClient
+    pub async fn disconnect_client(&self, client_id: &str) {
+        self.ctx.disconnect(client_id).await;
+    }
+
+    /// The stream new groups play (see [`SessionContext::default_stream`]).
+    /// The caller holds the state lock.
+    pub(crate) async fn default_stream(&self, state: &crate::state::ServerState) -> String {
+        self.ctx.default_stream(state).await
     }
 
     /// Update routing for a single client.
@@ -486,7 +546,8 @@ async fn handle_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(stream);
+    let mut writer = DeadlineWriter::new(writer, ctx.idle_timeout);
     let mut frames = FrameReader::new(reader);
     let hello_msg = within_idle_timeout(ctx, frames.next())
         .await
@@ -521,7 +582,7 @@ where
 
     let Registration {
         generation,
-        cancelled,
+        mut cancelled,
         settings_rx,
         routing_rx,
         initial_settings,
@@ -536,27 +597,36 @@ where
     // compared against it, so a stream switch before the session loop
     // starts still sends the new stream's codec header.
     let initial_routing = routing_rx.borrow().clone();
-    let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
-
-    // A client outside any group changes the topology. C++ snapserver
-    // announces that with Server.OnUpdate, and control clients such as
-    // Snapweb need it before Client.OnConnect to know about the client.
-    if joins_new_group {
-        let _ = event_tx.send(ServerEvent::ServerUpdated).await;
-    }
-    let _ = event_tx
-        .send(ServerEvent::ClientConnected {
-            id: client_id.clone(),
-            hello,
-        })
-        .await;
+    ctx.events.state_changed(snapshot);
 
     // From here on the session is registered, so every exit path must run
     // the release below. The watchdog runs beside the session rather than
-    // inside its loop, so it also fires while a write to a stalled peer is
-    // blocked (nothing is read meanwhile, so activity stops advancing).
+    // inside its loop, so it also covers announcing the client (an
+    // embedder may be slow to take events) and writes. It fires when
+    // nothing was received for the idle timeout; `DeadlineWriter` fails a
+    // write that makes no progress for that long, even while the peer
+    // keeps sending.
     let activity = Activity::new();
     let session = async {
+        let announce = async {
+            // A client outside any group changes the topology. C++
+            // snapserver announces that with Server.OnUpdate, and control
+            // clients such as Snapweb need it before Client.OnConnect to
+            // know about the client.
+            if joins_new_group {
+                let _ = event_tx.send(ServerEvent::ServerUpdated).await;
+            }
+            let _ = event_tx
+                .send(ServerEvent::ClientConnected {
+                    id: client_id.clone(),
+                    hello,
+                })
+                .await;
+        };
+        tokio::select! {
+            () = announce => {}
+            _ = &mut cancelled => return Ok(()),
+        }
         match send_initial_messages(
             &mut writer,
             ctx,
@@ -575,7 +645,6 @@ where
                     settings_rx,
                     routing: initial_routing,
                     routing_rx,
-                    event_tx: event_tx.clone(),
                     client_id: client_id.clone(),
                     cancelled,
                     activity: &activity,
@@ -595,7 +664,7 @@ where
     };
 
     if let Some(snapshot) = ctx.release_session(&client_id, generation).await {
-        let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
+        ctx.events.state_changed(snapshot);
         let _ = event_tx
             .send(ServerEvent::ClientDisconnected { id: client_id })
             .await;
@@ -699,13 +768,12 @@ async fn send_initial_messages<W: AsyncWrite + Unpin>(
 
 struct SessionLoop<'a, S> {
     frames: FrameReader<ReadHalf<S>>,
-    writer: WriteHalf<S>,
+    writer: DeadlineWriter<WriteHalf<S>>,
     chunk_rx: broadcast::Receiver<WireChunkData>,
     settings_rx: watch::Receiver<ClientSettingsUpdate>,
     /// The routing the client is set up for (its stream's codec header sent).
     routing: SessionRouting,
     routing_rx: watch::Receiver<SessionRouting>,
-    event_tx: mpsc::Sender<ServerEvent>,
     client_id: String,
     /// Resolves when a newer session for the same client id takes over.
     cancelled: oneshot::Receiver<()>,
@@ -725,7 +793,6 @@ where
         mut settings_rx,
         mut routing,
         mut routing_rx,
-        event_tx,
         client_id,
         mut cancelled,
         activity,
@@ -785,14 +852,16 @@ where
                             if let Some(settings) = settings {
                                 ctx.set_settings(settings, false).await;
                             }
-                            let _ = event_tx.try_send(ServerEvent::StateChanged(snapshot));
+                            ctx.events.state_changed(snapshot);
                             // The mute flag gates audio for this session.
                             ctx.push_routing(&client_id).await;
-                            let _ = event_tx.send(ServerEvent::ClientVolumeChanged {
+                            // Never waits: audio to this client must not
+                            // stall on a slow embedder.
+                            ctx.events.notify(ServerEvent::ClientVolumeChanged {
                                 client_id: client_id.clone(),
                                 volume: info.volume,
                                 muted: info.muted,
-                            }).await;
+                            });
                         }
                         _ => {}
                     }
@@ -1083,6 +1152,83 @@ async fn send_msg<W: AsyncWrite + Unpin>(
 ) -> Result<()> {
     let frame = serialize_msg(msg_type, payload, 0)?;
     write_frame(stream, &frame).await.context("write message")
+}
+
+/// A writer whose writes and flushes fail once they make no progress for
+/// `timeout`: a peer that stopped reading must not hold its session open
+/// longer than the idle timeout, even while it keeps sending.
+struct DeadlineWriter<W> {
+    inner: W,
+    timeout: Option<Duration>,
+    /// Armed while the inner writer is blocked.
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> DeadlineWriter<W> {
+    fn new(inner: W, timeout: Option<Duration>) -> Self {
+        Self {
+            inner,
+            timeout,
+            stalled: None,
+        }
+    }
+
+    /// Pass on `poll`'s result, failing it once blocked for `timeout`.
+    fn check<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        poll: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if poll.is_ready() {
+            self.stalled = None;
+            return poll;
+        }
+        let Some(timeout) = self.timeout else {
+            return Poll::Pending;
+        };
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("write stalled for {timeout:?}"),
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for DeadlineWriter<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.check(cx, poll)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_flush(cx);
+        this.check(cx, poll)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.check(cx, poll)
+    }
 }
 
 /// Write one complete frame and flush it.
@@ -1447,6 +1593,33 @@ mod tests {
         assert!(should_send_chunk(&chunk("z1"), &r_unmuted, false));
     }
 
+    // ── write deadline ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stalled_write_fails_after_the_timeout() {
+        let (inner, _peer) = tokio::io::duplex(64);
+        let mut writer = DeadlineWriter::new(inner, Some(Duration::from_millis(100)));
+        let start = tokio::time::Instant::now();
+        let err = writer.write_all(&[0; 1024]).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn slow_but_progressing_write_succeeds() {
+        let (inner, mut peer) = tokio::io::duplex(64);
+        let mut writer = DeadlineWriter::new(inner, Some(Duration::from_millis(100)));
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            // Each read makes room within the timeout, the whole write takes
+            // longer than it.
+            while peer.read(&mut buf).await.is_ok_and(|n| n > 0) {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        writer.write_all(&[0; 1024]).await.unwrap();
+    }
+
     // ── live sessions ─────────────────────────────────────────
 
     fn test_server(state: crate::state::ServerState) -> SessionServer {
@@ -1458,6 +1631,7 @@ mod tests {
             default_stream: "default".into(),
             send_audio_to_muted: false,
             idle_timeout: None,
+            events: EventSink::new(mpsc::channel(1).0),
         })
     }
 

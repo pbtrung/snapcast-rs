@@ -28,6 +28,8 @@ struct AppState {
     auth_config: Arc<AuthConfig>,
     cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
     client_acceptor: snapcast_server::ClientAcceptor,
+    /// Browser origins besides the server's own allowed to use `/jsonrpc`.
+    allowed_origins: Arc<Vec<String>>,
 }
 
 /// Configuration for the HTTP server.
@@ -42,6 +44,9 @@ pub(crate) struct HttpConfig {
     pub cmd_tx: mpsc::Sender<snapcast_server::ServerCommand>,
     /// Hands WebSocket streaming clients (`/stream`) to the audio server.
     pub client_acceptor: snapcast_server::ClientAcceptor,
+    /// Browser origins besides the server's own allowed to use `/jsonrpc`
+    /// (`*`: any).
+    pub allowed_origins: Vec<String>,
 }
 
 /// Run the HTTP server with JSON-RPC + WebSocket + optional Snapweb on
@@ -52,6 +57,7 @@ pub(crate) async fn serve(listener: tokio::net::TcpListener, cfg: HttpConfig) ->
         auth_config: cfg.auth_config,
         cmd_tx: cfg.cmd_tx,
         client_acceptor: cfg.client_acceptor,
+        allowed_origins: Arc::new(cfg.allowed_origins),
     };
     let app = router(app_state, cfg.doc_root.as_deref());
     axum::serve(
@@ -70,7 +76,11 @@ fn router(app_state: AppState, doc_root: Option<&str>) -> Router {
             "/jsonrpc",
             get(ws_handler)
                 .post(http_jsonrpc_handler)
-                .layer(DefaultBodyLimit::max(MAX_REQUEST_LEN)),
+                .layer(DefaultBodyLimit::max(MAX_REQUEST_LEN))
+                .layer(axum::middleware::from_fn_with_state(
+                    app_state.clone(),
+                    check_origin,
+                )),
         )
         .route("/stream", get(stream_ws_handler))
         .with_state(app_state);
@@ -81,6 +91,56 @@ fn router(app_state: AppState, doc_root: Option<&str>) -> Router {
         tracing::info!(doc_root = root, "Serving Snapweb");
     }
     app
+}
+
+/// Refuse control requests a web page on another origin makes through a
+/// visitor's browser: without authentication they would control the
+/// server, even one bound to loopback. Browsers send `Origin` with every
+/// cross-origin POST and WebSocket; other clients (snapcast controllers,
+/// curl) send none and pass, as does Snapweb served by this server.
+///
+/// DNS rebinding makes a hostile page look same-origin: enable
+/// authentication on a server browsers on untrusted pages can reach.
+async fn check_origin(
+    State(app): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .map(|v| v.to_str().unwrap_or("null"));
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    match origin {
+        Some(origin) if !origin_allowed(origin, host, &app.allowed_origins) => {
+            tracing::warn!(origin, "Rejecting a control request from another origin");
+            (
+                StatusCode::FORBIDDEN,
+                "origin not allowed (see [http] allowed_origins)",
+            )
+                .into_response()
+        }
+        _ => next.run(request).await,
+    }
+}
+
+/// Whether a request with `Origin: origin` and `Host: host` may use the
+/// control API: same-origin, or listed in `allowed` (`*`: any).
+fn origin_allowed(origin: &str, host: Option<&str>, allowed: &[String]) -> bool {
+    let origin = origin.trim_end_matches('/');
+    if allowed
+        .iter()
+        .any(|a| a == "*" || a.trim_end_matches('/').eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    // Same origin: the authority the page came from is this server's.
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    matches!((authority, host), (Some(a), Some(h)) if a.eq_ignore_ascii_case(h))
 }
 
 /// WebSocket upgrade handler at GET /stream: a streaming client speaking the
@@ -199,6 +259,7 @@ mod tests {
             client_acceptor: snapcast_server::SnapServer::new(Default::default())
                 .0
                 .client_acceptor(),
+            allowed_origins: Arc::new(vec!["http://snapweb.example".into()]),
         };
         (state, cmd_rx)
     }
@@ -228,13 +289,18 @@ mod tests {
 
     /// POST `body` to /jsonrpc and return (status code, response body).
     async fn post(port: u16, body: &str, auth: Option<&str>) -> (u16, String) {
+        let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+        post_with(port, body, &auth).await
+    }
+
+    /// POST `body` with `headers` (each line ending in CRLF) added.
+    async fn post_with(port: u16, body: &str, headers: &str) -> (u16, String) {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
         let request = format!(
-            "POST /jsonrpc HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
-             {auth}Connection: close\r\n\r\n{body}",
+            "POST /jsonrpc HTTP/1.1\r\nHost: localhost:{port}\r\nContent-Length: {}\r\n\
+             {headers}Connection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -314,6 +380,53 @@ mod tests {
             let reply: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(reply["result"]["major"], 2);
         }
+    }
+
+    /// Regression: a page on any origin could control an unauthenticated
+    /// server through a visitor's browser.
+    #[tokio::test]
+    async fn foreign_origins_are_refused() {
+        let (state, _c) = make_state(AuthConfig::default());
+        let port = serve(state).await;
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"Server.GetRPCVersion"}"#;
+        let with_origin =
+            |origin: &str| format!("Origin: {origin}\r\nContent-Type: text/plain\r\n");
+
+        let (status, _) = post_with(port, request, &with_origin("http://untrusted.invalid")).await;
+        assert_eq!(status, 403);
+        let (status, _) = post_with(port, request, &with_origin("null")).await;
+        assert_eq!(status, 403);
+        // Same origin (Snapweb served here), a listed origin, and clients
+        // that send no Origin pass.
+        for origin in [
+            format!("http://localhost:{port}"),
+            "http://snapweb.example".into(),
+        ] {
+            let (status, _) = post_with(port, request, &with_origin(&origin)).await;
+            assert_eq!(status, 200, "{origin}");
+        }
+        assert_eq!(post(port, request, None).await.0, 200);
+
+        // The WebSocket upgrade too.
+        let mut ws_request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                format!("ws://127.0.0.1:{port}/jsonrpc"),
+            )
+            .unwrap();
+        ws_request
+            .headers_mut()
+            .insert("Origin", "http://untrusted.invalid".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(ws_request).await.is_err());
+    }
+
+    #[test]
+    fn origin_matching() {
+        let allowed = ["https://ok.example/".to_string()];
+        assert!(origin_allowed("https://ok.example", None, &allowed));
+        assert!(origin_allowed("http://Host:1780", Some("host:1780"), &[]));
+        assert!(!origin_allowed("http://host:1781", Some("host:1780"), &[]));
+        assert!(!origin_allowed("http://evil", None, &allowed));
+        assert!(origin_allowed("http://evil", None, &["*".to_string()]));
     }
 
     /// Open a WebSocket control connection to /jsonrpc.

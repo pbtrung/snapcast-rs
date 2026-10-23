@@ -25,6 +25,9 @@ pub(crate) struct BinaryConfig {
     pub http_bind_address: String,
     /// HTTP port for JSON-RPC + Snapweb. Default: 1780.
     pub http_port: u16,
+    /// Browser origins besides the server's own allowed to use the HTTP
+    /// control API (`*`: any). Default: none.
+    pub http_allowed_origins: Vec<String>,
     /// TCP bind address for the binary audio protocol. Default: 0.0.0.0.
     pub stream_bind_address: String,
     /// TCP port for the binary audio protocol. Default: 1704.
@@ -50,6 +53,7 @@ impl Default for BinaryConfig {
             http_enabled: true,
             http_bind_address: snapcast_proto::DEFAULT_BIND_ADDRESS.into(),
             http_port: snapcast_proto::DEFAULT_HTTP_PORT,
+            http_allowed_origins: Vec::new(),
             stream_bind_address: snapcast_proto::DEFAULT_BIND_ADDRESS.into(),
             stream_port: snapcast_proto::DEFAULT_STREAM_PORT,
             doc_root: None,
@@ -74,57 +78,66 @@ fn default_sources() -> Vec<String> {
 }
 
 /// Parse a snapserver.conf INI file into a [`BinaryConfig`].
-pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
+///
+/// A missing file yields the defaults only when it was not `required` (the
+/// implicit default path); one the user named must exist. Any read or syntax
+/// error, and any invalid value, is an error: falling back to the defaults
+/// would silently drop settings such as `[auth]` and the bind addresses.
+pub(crate) fn parse_config_file(path: &str, required: bool) -> anyhow::Result<BinaryConfig> {
     let mut config = BinaryConfig::default();
 
     // No backslash escapes: like C++ snapserver, a value is taken verbatim,
     // so e.g. `C:\music` or a `\` in process params survives.
     let ini = match Ini::load_from_file_noescape(path) {
         Ok(ini) => ini,
-        Err(ini::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(ini::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound && !required => {
             tracing::info!(path, "Config file not found, using defaults");
-            return config;
+            return Ok(config);
         }
-        Err(e) => {
-            tracing::warn!(path, error = %e, "Could not read config file, using defaults");
-            return config;
-        }
+        Err(e) => anyhow::bail!("config file {path}: {e}"),
     };
 
     tracing::info!(path, "Loaded config file");
 
     if let Some(s) = ini.section(Some("http")) {
-        get_bool(s, "enabled", |v| config.http_enabled = v);
-        get_parsed(s, "port", |v| config.http_port = v);
+        get_bool(s, "enabled", |v| config.http_enabled = v)?;
+        get_parsed(s, "port", |v| config.http_port = v)?;
         get_bind_address(s, |v| config.http_bind_address = v.to_string());
         // Empty disables Snapweb, as in C++ snapserver (rather than serving
         // the working directory).
         get_str(s, "doc_root", |v| config.doc_root = non_empty(v));
+        get_str(s, "allowed_origins", |v| {
+            config.http_allowed_origins = v
+                .split([',', ' '])
+                .filter(|o| !o.is_empty())
+                .map(String::from)
+                .collect();
+        });
     }
 
     // Before C++ snapserver 0.31, [tcp-control] was [tcp], and the
     // [tcp-streaming] keys were in [stream]; configs written for those
     // versions still work there.
     if let Some(s) = section_or_legacy(&ini, "tcp-control", "tcp") {
-        get_bool(s, "enabled", |v| config.control_enabled = v);
-        get_parsed(s, "port", |v| config.control_port = v);
+        get_bool(s, "enabled", |v| config.control_enabled = v)?;
+        get_parsed(s, "port", |v| config.control_port = v)?;
         get_bind_address(s, |v| config.control_bind_address = v.to_string());
     }
 
     if let Some(s) = ini.section(Some("auth")) {
-        get_bool(s, "enabled", |v| config.auth.enabled = v);
+        get_bool(s, "enabled", |v| config.auth.enabled = v)?;
         get_str(s, "secret", |v| config.auth.secret = v.to_string());
         for v in s.get_all("user") {
-            match v.parse() {
-                Ok(user) => config.auth.users.push(user),
-                // Never log the value: it holds a password.
-                Err(e) => tracing::warn!("Ignoring invalid [auth] user: {e}"),
-            }
+            // Never put the value in the error: it holds a password.
+            let user = v
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid [auth] user: {e}"))?;
+            config.auth.users.push(user);
         }
     }
 
     if let Some(s) = section_or_legacy(&ini, "tcp-streaming", "stream") {
-        get_parsed(s, "port", |v| config.stream_port = v);
+        get_parsed(s, "port", |v| config.stream_port = v)?;
         get_bind_address(s, |v| config.stream_bind_address = v.to_string());
     }
 
@@ -137,21 +150,21 @@ pub(crate) fn parse_config_file(path: &str) -> BinaryConfig {
         get_str(s, "sampleformat", |v| {
             config.server.sample_format = v.to_string();
         });
-        get_parsed(s, "buffer", |v| config.server.buffer_ms = v);
-        get_parsed(s, "chunk_ms", |v| config.chunk_ms = Some(v));
+        get_parsed(s, "buffer", |v| config.server.buffer_ms = v)?;
+        get_parsed(s, "chunk_ms", |v| config.chunk_ms = Some(v))?;
         get_bool(s, "send_to_muted", |v| {
             config.server.send_audio_to_muted = v
-        });
+        })?;
     }
 
     if let Some(s) = ini.section(Some("streaming_client")) {
-        get_duration(s, "idle_timeout", |v| config.server.client_idle_timeout = v);
+        get_duration(s, "idle_timeout", |v| config.server.client_idle_timeout = v)?;
         get_duration(s, "remove_disconnected_after", |v| {
             config.server.remove_disconnected_clients_after = v;
-        });
+        })?;
     }
 
-    config
+    Ok(config)
 }
 
 /// Section `[name]`, or when there is none, the keys `[legacy]` held before
@@ -192,13 +205,12 @@ fn get_duration<F: FnOnce(Option<std::time::Duration>)>(
     section: &ini::Properties,
     key: &str,
     f: F,
-) {
+) -> anyhow::Result<()> {
     if let Some(v) = section.get(key) {
-        match parse_duration(v) {
-            Some(d) => f(d),
-            None => tracing::warn!(key, value = v, "Ignoring invalid duration"),
-        }
+        let d = parse_duration(v).ok_or_else(|| anyhow::anyhow!("invalid duration {key} = {v}"))?;
+        f(d);
     }
+    Ok(())
 }
 
 /// `value` trimmed, or `None` when that leaves nothing.
@@ -213,23 +225,30 @@ fn get_str<F: FnOnce(&str)>(section: &ini::Properties, key: &str, f: F) {
     }
 }
 
-fn get_parsed<T: std::str::FromStr, F: FnOnce(T)>(section: &ini::Properties, key: &str, f: F) {
+fn get_parsed<T: std::str::FromStr, F: FnOnce(T)>(
+    section: &ini::Properties,
+    key: &str,
+    f: F,
+) -> anyhow::Result<()> {
     if let Some(v) = section.get(key) {
-        match v.trim().parse() {
-            Ok(parsed) => f(parsed),
-            Err(_) => tracing::warn!(key, value = v, "Ignoring invalid config value"),
-        }
+        let parsed = v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid value {key} = {v}"))?;
+        f(parsed);
     }
+    Ok(())
 }
 
-fn get_bool<F: FnOnce(bool)>(section: &ini::Properties, key: &str, f: F) {
+fn get_bool<F: FnOnce(bool)>(section: &ini::Properties, key: &str, f: F) -> anyhow::Result<()> {
     if let Some(v) = section.get(key) {
         match v.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "on" | "1" => f(true),
             "false" | "no" | "off" | "0" => f(false),
-            _ => tracing::warn!(key, value = v, "Ignoring invalid boolean"),
+            _ => anyhow::bail!("invalid boolean {key} = {v}"),
         }
     }
+    Ok(())
 }
 
 fn get_bind_address<F: FnMut(&str)>(section: &ini::Properties, mut f: F) {
@@ -324,7 +343,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = parse_config_file(tmp.path().to_str().unwrap());
+        let config = parse_config_file(tmp.path().to_str().unwrap(), true).unwrap();
         assert_eq!(config.sources, vec!["pipe:///tmp/snapfifo?name=test"]);
         assert_eq!(config.http_bind_address, "::1");
         assert_eq!(config.http_port, 8080);
@@ -336,7 +355,7 @@ mod tests {
 
     #[test]
     fn missing_file_returns_defaults() {
-        let config = parse_config_file("/nonexistent/snapserver.conf");
+        let config = parse_config_file("/nonexistent/snapserver.conf", false).unwrap();
         assert_eq!(config.stream_port, 1704);
         // No built-in secret, auth off by default.
         assert!(!config.auth.enabled);
@@ -349,13 +368,13 @@ mod tests {
         writeln!(
             tmp,
             "[auth]\nenabled = true\nsecret = my-strong-secret\n\
-             user = alice:pa:ss=word\nuser = bob:hunter2\nuser = no-password"
+             user = alice:pa:ss=word\nuser = bob:hunter2"
         )
         .unwrap();
-        let config = parse_config_file(tmp.path().to_str().unwrap());
+        let config = parse_config_file(tmp.path().to_str().unwrap(), true).unwrap();
         assert!(config.auth.enabled);
         assert_eq!(config.auth.secret, "my-strong-secret");
-        // Split at the first ':'; the malformed entry is skipped.
+        // Split at the first ':'.
         let users: Vec<_> = config
             .auth
             .users
@@ -436,7 +455,17 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         write!(tmp, "{contents}").unwrap();
         tmp.flush().unwrap();
-        parse_config_file(tmp.path().to_str().unwrap())
+        parse_config_file(tmp.path().to_str().unwrap(), true).unwrap()
+    }
+
+    fn config_err(contents: &str) -> String {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        write!(tmp, "{contents}").unwrap();
+        tmp.flush().unwrap();
+        match parse_config_file(tmp.path().to_str().unwrap(), true) {
+            Ok(_) => panic!("config should be rejected: {contents:?}"),
+            Err(e) => e.to_string(),
+        }
     }
 
     // ---- Defaults ----
@@ -469,7 +498,7 @@ mod tests {
 
     #[test]
     fn missing_file_keeps_default_sources() {
-        let config = parse_config_file("/nonexistent/does/not/exist.conf");
+        let config = parse_config_file("/nonexistent/does/not/exist.conf", false).unwrap();
         assert_eq!(config.sources, default_sources());
         assert_eq!(config.http_port, 1780);
         assert_eq!(config.control_port, 1705);
@@ -559,19 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_duration_leaves_default() {
-        let config = config_from("[streaming_client]\nidle_timeout = soon\n");
-        assert_eq!(
-            config.server.client_idle_timeout,
-            Some(std::time::Duration::from_secs(10))
-        );
+    fn invalid_duration_is_rejected() {
+        config_err("[streaming_client]\nidle_timeout = soon\n");
     }
 
     #[test]
-    fn invalid_buffer_value_leaves_default() {
-        // Non-numeric buffer is ignored (with a warning).
-        let config = config_from("[stream]\nbuffer = notanumber\n");
-        assert_eq!(config.server.buffer_ms, 1000);
+    fn invalid_buffer_value_is_rejected() {
+        config_err("[stream]\nbuffer = notanumber\n");
     }
 
     // ---- Port parsing edge cases ----
@@ -583,23 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn port_above_u16_max_is_ignored() {
-        // 99999 > u16::MAX (65535) — parse fails, default retained.
-        let config = config_from("[http]\nport = 99999\n");
-        assert_eq!(config.http_port, 1780);
-    }
-
-    #[test]
-    fn non_numeric_port_is_ignored() {
-        let config = config_from("[tcp-control]\nport = abc\n");
-        assert_eq!(config.control_port, 1705);
-    }
-
-    #[test]
-    fn negative_port_is_ignored() {
-        // "-1" does not parse as u16.
-        let config = config_from("[tcp-streaming]\nport = -1\n");
-        assert_eq!(config.stream_port, 1704);
+    fn invalid_ports_are_rejected() {
+        // 99999 > u16::MAX; "-1" and "abc" do not parse as u16.
+        config_err("[http]\nport = 99999\n");
+        config_err("[tcp-control]\nport = abc\n");
+        config_err("[tcp-streaming]\nport = -1\n");
     }
 
     #[test]
@@ -654,11 +665,31 @@ mod tests {
     }
 
     #[test]
-    fn auth_enabled_ignores_unrecognized_value() {
-        // A garbage value leaves `enabled` at its default (false) — the closure
-        // is never called for unrecognized strings.
-        let config = config_from("[auth]\nenabled = maybe\n");
-        assert!(!config.auth.enabled);
+    fn auth_enabled_rejects_unrecognized_value() {
+        // Regression: a garbage value left auth at its default (disabled)
+        // after only a warning.
+        config_err("[auth]\nenabled = maybe\nsecret = s\nuser = a:b\n");
+    }
+
+    #[test]
+    fn malformed_auth_user_is_rejected_without_leaking_it() {
+        let err = config_err("[auth]\nuser = no-password-here\n");
+        assert!(!err.contains("no-password-here"), "{err}");
+    }
+
+    /// Regression: a syntax error anywhere in the file returned the default
+    /// config, silently disabling `[auth]` and binding every interface.
+    #[test]
+    fn syntax_error_is_rejected() {
+        config_err(
+            "[auth]\nenabled = true\nsecret = s\nuser = a:b\n\
+             [tcp-control]\nbind_to_address = 127.0.0.1\n[broken\n",
+        );
+    }
+
+    #[test]
+    fn missing_required_file_is_rejected() {
+        assert!(parse_config_file("/nonexistent/snapserver.conf", true).is_err());
     }
 
     #[test]
@@ -860,6 +891,13 @@ mod tests {
             },
         );
         assert_eq!(merged.doc_root, None);
+    }
+
+    #[test]
+    fn allowed_origins_are_listed() {
+        let config = config_from("[http]\nallowed_origins = http://a:1780, https://b\n");
+        assert_eq!(config.http_allowed_origins, ["http://a:1780", "https://b"]);
+        assert!(BinaryConfig::default().http_allowed_origins.is_empty());
     }
 
     #[test]

@@ -54,15 +54,31 @@ impl Encoder for PcmEncoder {
         // frame would shift channel interleaving for the rest of the stream.
         let frame_size = self.format.frame_size() as usize;
         data.truncate(data.len() - data.len() % frame_size);
-        if data.is_empty() {
-            return Ok(Vec::new());
+        if data.len() <= MAX_PACKET_BYTES {
+            if data.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![EncodedPacket {
+                data,
+                offset_frames: 0,
+            }]);
         }
-        Ok(vec![EncodedPacket {
-            data,
-            offset_frames: 0,
-        }])
+        // Split, or clients reject the chunk as over the payload limit.
+        let packet_bytes = MAX_PACKET_BYTES - MAX_PACKET_BYTES % frame_size;
+        Ok(data
+            .chunks(packet_bytes)
+            .enumerate()
+            .map(|(i, packet)| EncodedPacket {
+                data: packet.to_vec(),
+                offset_frames: (i * packet_bytes / frame_size) as i64,
+            })
+            .collect())
     }
 }
+
+/// Largest PCM packet: one WireChunk, with room for its timestamp and
+/// length, must stay within the payload size clients accept.
+const MAX_PACKET_BYTES: usize = snapcast_proto::DEFAULT_MAX_PAYLOAD_SIZE as usize - 64;
 
 fn build_wav_header(fmt: SampleFormat) -> Vec<u8> {
     let mut h = vec![0u8; 44];
@@ -123,6 +139,39 @@ mod tests {
         let result = enc.encode(AudioData::Pcm(vec![0u8; 4 * 10 + 2])).unwrap();
         assert_eq!(result[0].data.len(), 4 * 10);
         assert!(enc.encode(AudioData::Pcm(vec![0u8; 3])).unwrap().is_empty());
+    }
+
+    /// Regression: a large input went out as one packet, over the payload
+    /// size clients accept.
+    #[test]
+    fn large_input_is_split_within_the_payload_limit() {
+        let fmt = SampleFormat::new(96000, 32, 8);
+        let mut enc = PcmEncoder::new(fmt);
+        let frame_size = fmt.frame_size() as usize;
+        let input = vec![7u8; 96000 * frame_size]; // 1 s: 3,072,000 bytes
+        let packets = enc.encode(AudioData::Pcm(input.clone())).unwrap();
+        assert!(packets.len() > 1);
+        let mut frames = 0;
+        for p in &packets {
+            assert!(p.data.len() <= MAX_PACKET_BYTES);
+            assert_eq!(p.data.len() % frame_size, 0);
+            assert_eq!(p.offset_frames, frames);
+            frames += (p.data.len() / frame_size) as i64;
+        }
+        assert_eq!(frames, 96000);
+
+        // At the limit: one packet.
+        let at_limit = MAX_PACKET_BYTES - MAX_PACKET_BYTES % frame_size;
+        assert_eq!(
+            enc.encode(AudioData::Pcm(vec![0; at_limit])).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            enc.encode(AudioData::Pcm(vec![0; at_limit + frame_size]))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
